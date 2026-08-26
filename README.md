@@ -10,6 +10,7 @@ Tested exclusively on **Meta Quest 3**. Compatibility with other headsets is cur
 You can adjust the in-game VR resolution and FPS lock (not tested, i recommend leaving 90 FPS) in `sh3vr.ini` to better match different headsets.
 
 **Features in the current build:**
+- Unlocked 90 FPS
 - 6-DOF stereo rendering
 - Controller input (mapped for Quest 3 controllers)
 - Working UI and subtitles
