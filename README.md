@@ -2,6 +2,8 @@
 
 A mod for *Silent Hill 3* that brings fully working VR mode into the game.
 
+**WARNING: You must install Silent Hill 3 PC Fix by Steam006 to play this mod.**
+
 ### Current Status
 Tested exclusively on **Meta Quest 3**. Compatibility with other headsets is currently unknown. The mod currently works **only through Virtual Desktop**.
 
