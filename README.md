@@ -17,6 +17,9 @@ You can adjust the in-game VR resolution and FPS lock (not tested, i recommend l
 - Fully playable in the default camera mode
 
 ### Known Issues & Limitations
+- Some textures or models might be invisible in certain locations of the game
+- Intro cutscene has invisible enviroment
+- Sewer location has glitched water reflections
 - No motion controls
 - Missing shadows and enemy blood effects
 - Missing muzzle flash effects
