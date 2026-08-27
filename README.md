@@ -10,7 +10,7 @@ Tested exclusively on **Meta Quest 3**. Compatibility with other headsets is cur
 You can adjust the in-game VR resolution and FPS lock (not tested, i recommend leaving 90 FPS) in `sh3vr.ini` to better match different headsets.
 
 ### Installing
-You MUST download [Silent Hill 3 PC Fix by Steam00](https://community.pcgamingwiki.com/files/file/1331-silent-hill-3-pc-fix-by-steam006/). Then just drop the contents of Release to the game directory.
+You MUST download [Silent Hill 3 PC Fix by Steam006](https://community.pcgamingwiki.com/files/file/1331-silent-hill-3-pc-fix-by-steam006/). Then just drop the contents of Release to the game directory.
 
 **Features in the current build:**
 - Unlocked 90 FPS
