@@ -1,0 +1,55 @@
+# Visual Studio and CMake output
+.vs/
+**/Debug/
+**/Release/
+**/Win32/
+**/x64/
+**/build/
+**/build-*/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+*.obj
+*.iobj
+*.ipdb
+*.pdb
+*.ilk
+*.tlog/
+*.lastbuildstate
+*.recipe
+*.exp
+*.lib
+
+# Installed and runtime-generated files
+sh3vr.log
+sh3vr_host64.log
+sh3vr.ini
+sh3vr_host64.exe
+dinput8.dll
+*.dmp
+dist/
+
+# Local experiments, captures, reverse-engineering notes, and backups
+backups/
+**/backups/
+pcfix_disasm.txt
+sh3_disasm.txt
+SH3VR_AI_HANDOFF.md
+SH3VR_IMPLEMENTATION_GUIDE.md
+workflow.md
+vr-porting-guide/
+/*.txt
+*.png
+*.jpg
+*.jpeg
+
+# Temporary editor and operating-system files
+*.tmp
+*.bak
+*.swp
+.DS_Store
+Thumbs.db
+
+# Keep the checked-in configuration template visible
+!sh3vr.ini.example

@@ -1,0 +1,35 @@
+[OpenXR]
+; Set both to 0 to use the runtime recommendation.
+EyeWidth=1900
+EyeHeight=2076
+MSAASamples=1
+EnableFXAA=1
+TargetRefreshRate=90
+RequestRefreshRate=1
+
+[Image]
+; Keep the current per-eye post-process path enabled.
+EnableGamePostProcess=1
+GamePostProcessStrength=0.00
+GamePostProcessContrast=0.88
+GamePostProcessExposureStops=0.00
+EnableColorCorrection=1
+ExposureStops=1.5
+Contrast=1.0
+Saturation=1.0
+VignetteStrength=0.5
+
+[Timing]
+; Stable PC Fix timing path. Do not enable the experimental alternatives
+; unless you are testing a matching development build.
+UseThirteenAGFrameRateFix=1
+FixedStep90Test=0
+ProxyPresentationUnlock90Hz=0
+ProxyNativeTimingUnlock90Hz=0
+ProxyFrameTimeOverride90Hz=0
+ProxyVirtualFPSMode4=1
+
+[Stereo]
+EnablePerDrawReplay=1
+ReplayWorldOnly=0
+EnableFullPassStereo=0
