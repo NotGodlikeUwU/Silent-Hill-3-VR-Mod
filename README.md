@@ -17,6 +17,8 @@ You MUST install [Silent Hill 3 PC Fix by Steam006](https://community.pcgamingwi
 - 6-DOF stereo rendering
 - Controller input (mapped for Quest 3 controllers)
 - First Person using ZealotTormund's Camera mod
+- Roomscale
+- Player Height adaptation
 - Working UI and subtitles
 - Fully playable in the default camera mode
 
