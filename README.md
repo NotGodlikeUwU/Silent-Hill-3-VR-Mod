@@ -10,12 +10,13 @@ Tested exclusively on **Meta Quest 3**. Compatibility with other headsets is cur
 You can adjust the in-game VR resolution and FPS lock (not tested, i recommend leaving 90 FPS) in `sh3vr.ini` to better match different headsets.
 
 ### Installing
-You MUST install [Silent Hill 3 PC Fix by Steam006](https://community.pcgamingwiki.com/files/file/1331-silent-hill-3-pc-fix-by-steam006/). Then just drop the contents of Release to the game directory.
+You MUST install [Silent Hill 3 PC Fix by Steam006](https://community.pcgamingwiki.com/files/file/1331-silent-hill-3-pc-fix-by-steam006/) and [Silent Hill 3 Camera Mod](https://github.com/zealottormunds/sh3cammod). Install these mods and then just drop the contents of Release to the game directory. Then simply launch the game .exe
 
 **Features in the current build:**
 - Unlocked 90 FPS
 - 6-DOF stereo rendering
 - Controller input (mapped for Quest 3 controllers)
+- First Person using ZealotTormund's Camera mod
 - Working UI and subtitles
 - Fully playable in the default camera mode
 
