@@ -58,3 +58,7 @@ Roomscale is not yet implemented. Camera turning via controllers does not curren
 - Motion controls
 - Fixes for missing shadows and blood effects
 - SteamVR support
+
+### Credits
+
+ZealotTormunds for [Silent Hill 3 Camera Mod](https://github.com/zealottormunds/sh3cammod)
