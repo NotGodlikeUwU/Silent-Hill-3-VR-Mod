@@ -721,6 +721,9 @@ static float g_cameraModSnapTurnDegrees8 = 45.0f;
 static DWORD g_cameraModCharacterAlignMilliseconds8 = 34;
 static volatile LONG g_cameraModCharacterAlignEndTick8 = 0;
 static bool g_autoLoadCameraModFirstPerson8 = true;
+static DWORD g_cameraModAutoLoadDelaySeconds8 = 180;
+static ULONGLONG g_cameraModStartupTick8 = 0;
+static bool g_cameraModAutoLoadDelayLogged8 = false;
 static bool g_cameraModAutoLoadDone8 = false;
 static bool g_enableRoomscale8 = true;
 static float g_roomscalePlayerHeightMeters8 = 1.65f;
@@ -6080,6 +6083,24 @@ static void TryAutoLoadCameraModFirstPerson()
 {
     if (!g_autoLoadCameraModFirstPerson8 || g_cameraModAutoLoadDone8)
         return;
+
+    const ULONGLONG now = GetTickCount64();
+    if (g_cameraModStartupTick8 == 0)
+        g_cameraModStartupTick8 = now;
+    const ULONGLONG delayMilliseconds =
+        static_cast<ULONGLONG>(g_cameraModAutoLoadDelaySeconds8) * 1000u;
+    if (delayMilliseconds != 0 &&
+        now - g_cameraModStartupTick8 < delayMilliseconds)
+    {
+        if (!g_cameraModAutoLoadDelayLogged8)
+        {
+            g_cameraModAutoLoadDelayLogged8 = true;
+            Log("Camera Mod First Person auto-load delayed for %u seconds "
+                "to keep the startup/new-game cutscene in third person",
+                static_cast<unsigned>(g_cameraModAutoLoadDelaySeconds8));
+        }
+        return;
+    }
 
     Sh3VrHeadPose pose = {};
     if (!Interop8_ReadHeadPose(&pose) ||
@@ -12423,6 +12444,15 @@ bool D3D9Hook_Install()
         SH3VR_DEFAULT_WORLD_SCALE) / static_cast<float>(worldScale);
     g_autoLoadCameraModFirstPerson8 =
         ReadIniIntSetting("CameraMod", "AutoLoadFirstPerson", 1) != 0;
+    int cameraModAutoLoadDelaySeconds = ReadIniIntSetting("CameraMod",
+        "AutoLoadFirstPersonDelaySeconds", 180);
+    cameraModAutoLoadDelaySeconds = std::clamp(
+        cameraModAutoLoadDelaySeconds, 0, 600);
+    g_cameraModAutoLoadDelaySeconds8 = static_cast<DWORD>(
+        cameraModAutoLoadDelaySeconds);
+    g_cameraModStartupTick8 = GetTickCount64();
+    g_cameraModAutoLoadDelayLogged8 = false;
+    g_cameraModAutoLoadDone8 = false;
     g_enableCameraModSnapTurn8 =
         ReadInputSetting("EnableCameraModRightStick", 1) != 0;
     g_enableHeadTrackedFlashlight8 =
@@ -12538,6 +12568,8 @@ bool D3D9Hook_Install()
         g_enableHeadTrackedFlashlight8 ? "1" : "0");
     Log("Loaded [CameraMod] AutoLoadFirstPerson=%s",
         g_autoLoadCameraModFirstPerson8 ? "1" : "0");
+    Log("Loaded [CameraMod] AutoLoadFirstPersonDelaySeconds=%u",
+        static_cast<unsigned>(g_cameraModAutoLoadDelaySeconds8));
     Log("Loaded [Roomscale] Enable=%s; PlayerHeightCm=%d; "
         "FullSpeedCmPerSecond=%d; follow radius %d cm",
         g_enableRoomscale8 ? "1" : "0", roomscalePlayerHeightCm,
