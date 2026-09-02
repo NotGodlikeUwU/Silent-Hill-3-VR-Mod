@@ -5,6 +5,7 @@
 ; Position uses controller-local game units:
 ; X = right/left, Y = down/up, Z = forward/back.
 ; Rotation uses degrees around the controller-local axes.
+; Set ShowGuideDot=0 in an individual profile to hide its in-world guide dot.
 ; Firearms also support AimPitchDegrees and AimYawDegrees. A negative aim
 ; pitch lowers both the bullet ray and reticle; yaw adjusts them horizontally.
 
@@ -21,6 +22,7 @@ RotationYawDegrees=0
 RotationRollDegrees=0
 
 [Knife]
+ShowGuideDot=1
 ScalePercent=70
 PositionX=0
 PositionY=0
@@ -30,6 +32,7 @@ RotationYawDegrees=90
 RotationRollDegrees=45
 
 [Steel Pipe]
+ShowGuideDot=1
 ScalePercent=100
 PositionX=0
 PositionY=0
@@ -39,6 +42,7 @@ RotationYawDegrees=90
 RotationRollDegrees=45
 
 [Maul]
+ShowGuideDot=1
 ScalePercent=100
 PositionX=0
 PositionY=0
@@ -48,6 +52,7 @@ RotationYawDegrees=90
 RotationRollDegrees=45
 
 [Katana]
+ShowGuideDot=1
 ScalePercent=100
 PositionX=0
 PositionY=0

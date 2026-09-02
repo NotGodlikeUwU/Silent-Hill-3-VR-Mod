@@ -895,6 +895,7 @@ struct WeaponPoseProfile8
     float scale;
     float aimPitchRadians;
     float aimYawRadians;
+    bool showGuideDot;
 };
 
 // These mesh signatures come directly from the PC models in data/chrwp.arc.
@@ -1556,6 +1557,8 @@ static void LoadWeaponPoseProfiles8()
         const int scalePercent = std::clamp(ReadWeaponIniIntSetting(
             profile.section, "ScalePercent", defaultScale), 25, 200);
         const bool firearmProfile = index >= 4;
+        profile.showGuideDot = ReadWeaponIniIntSetting(profile.section,
+            "ShowGuideDot", 1) != 0;
         const int aimPitchDegrees = std::clamp(ReadWeaponIniIntSetting(
             profile.section, "AimPitchDegrees",
             firearmProfile ? -18 : 0), -90, 90);
@@ -10909,8 +10912,11 @@ static bool RenderFirearmReticleStereo8()
     if (!g_device8 || !g_haveProjection8)
         return false;
 
+    PollWeaponIniHotReload8();
     const int profileIndex = g_activeWeaponPoseProfile8;
     if (profileIndex < 0 || profileIndex >= SH3VR_WEAPON_PROFILE_COUNT8)
+        return false;
+    if (!g_weaponPoseProfiles8[profileIndex].showGuideDot)
         return false;
 
     float target[3] = {};
