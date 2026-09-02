@@ -10,7 +10,7 @@ Tested on **Meta Quest 3** through **Virtual Desktop**. Other headsets and runti
 You can adjust the in-game VR resolution and FPS lock (not tested, i recommend leaving 90 FPS) in `sh3vr.ini` to better match different headsets.
 
 ### Installing
-You MUST install [Silent Hill 3 PC Fix by Steam006](https://community.pcgamingwiki.com/files/file/1331-silent-hill-3-pc-fix-by-steam006/) and [Silent Hill 3 Camera Mod](https://github.com/zealottormunds/sh3cammod). Download the [Release](https://github.com/NotGodlikeUwU/Silent-Hill-3-VR-Mod/releases/tag/SH3VR), then copy its contents next to `sh3.exe`. The package includes `dinput8.dll`, `sh3vr_host64.exe`, `sh3vr.ini`, `sh3vr_weapons.ini`, and the `sh3vr_assets` folder.
+You MUST install [Silent Hill 3 PC Fix by Steam006](https://community.pcgamingwiki.com/files/file/1331-silent-hill-3-pc-fix-by-steam006/) and [Silent Hill 3 Camera Mod](https://github.com/zealottormunds/sh3cammod). Download the [Release](https://github.com/NotGodlikeUwU/Silent-Hill-3-VR-Mod/releases/tag/Beta_0.1), then copy its contents next to `sh3.exe`. The package includes `dinput8.dll`, `sh3vr_host64.exe`, `sh3vr.ini`, `sh3vr_weapons.ini`, and the `sh3vr_assets` folder.
 
 **Features in the current build:**
 - Unlocked 90 FPS
