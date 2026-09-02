@@ -725,6 +725,10 @@ static DWORD g_cameraModAutoLoadDelaySeconds8 = 180;
 static ULONGLONG g_cameraModStartupTick8 = 0;
 static bool g_cameraModAutoLoadDelayLogged8 = false;
 static bool g_cameraModAutoLoadDone8 = false;
+// Number of consecutive frames for which the normal immersive game camera
+// was submitted.  The startup movie/menu does not submit this projection;
+// using a short streak avoids touching Camera Mod while that state is live.
+static unsigned g_cameraModImmersiveFrameStreak8 = 0;
 static bool g_enableRoomscale8 = true;
 static float g_roomscalePlayerHeightMeters8 = 1.65f;
 static float g_roomscaleHeightScale8 = 1.0f;
@@ -6087,9 +6091,24 @@ static void TryAutoLoadCameraModFirstPerson()
     const ULONGLONG now = GetTickCount64();
     if (g_cameraModStartupTick8 == 0)
         g_cameraModStartupTick8 = now;
+
+    // Present runs before the per-frame flag is cleared below, so these
+    // values describe the frame that has just completed.  Wait for a few
+    // consecutive gameplay frames; this is the transition out of the intro
+    // cutscene and remains safe even when the user skips it immediately.
+    if (g_viewProjectionAppliedThisFrame8 || g_previousImmersiveFrame8)
+        g_cameraModImmersiveFrameStreak8 =
+            (std::min)(g_cameraModImmersiveFrameStreak8 + 1u, 8u);
+    else
+        g_cameraModImmersiveFrameStreak8 = 0;
+    const bool gameplayConfirmed = g_cameraModImmersiveFrameStreak8 >= 3u;
+
     const ULONGLONG delayMilliseconds =
         static_cast<ULONGLONG>(g_cameraModAutoLoadDelaySeconds8) * 1000u;
-    if (delayMilliseconds != 0 &&
+    // The configured delay is only a fallback for builds/scenes where the
+    // projection hook cannot observe gameplay.  Once gameplay is confirmed,
+    // never wait out the old three-minute startup delay.
+    if (!gameplayConfirmed && delayMilliseconds != 0 &&
         now - g_cameraModStartupTick8 < delayMilliseconds)
     {
         if (!g_cameraModAutoLoadDelayLogged8)
@@ -6140,8 +6159,9 @@ static void TryAutoLoadCameraModFirstPerson()
         pluginState[SH3VR_CAMERA_MOD_HIDE_PLAYER_OFFSET] != 0)
     {
         g_cameraModAutoLoadDone8 = true;
-        Log("Camera Mod First Person preset auto-loaded and Camera Mod "
-            "enabled");
+        Log("Camera Mod First Person preset auto-loaded after %u confirmed "
+            "immersive gameplay frames and Camera Mod enabled",
+            g_cameraModImmersiveFrameStreak8);
     }
 }
 
@@ -12453,6 +12473,7 @@ bool D3D9Hook_Install()
     g_cameraModStartupTick8 = GetTickCount64();
     g_cameraModAutoLoadDelayLogged8 = false;
     g_cameraModAutoLoadDone8 = false;
+    g_cameraModImmersiveFrameStreak8 = 0;
     g_enableCameraModSnapTurn8 =
         ReadInputSetting("EnableCameraModRightStick", 1) != 0;
     g_enableHeadTrackedFlashlight8 =

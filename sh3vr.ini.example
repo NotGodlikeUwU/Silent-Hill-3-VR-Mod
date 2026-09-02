@@ -38,8 +38,9 @@ EnableFullPassStereo=0
 ; Automatically load Camera Mod's built-in First Person preset and enable the
 ; camera mod after OpenXR tracking becomes active. Set to 0 to disable.
 AutoLoadFirstPerson=1
-; Keep Camera Mod in third person during the startup/new-game cutscene.
-; First Person is enabled automatically after this many seconds (0 = immediate).
+; Safety fallback used only if a build does not expose the normal gameplay
+; projection.  In the regular build First Person is enabled automatically
+; as soon as the startup/new-game cutscene ends.
 AutoLoadFirstPersonDelaySeconds=180
 
 [Roomscale]
