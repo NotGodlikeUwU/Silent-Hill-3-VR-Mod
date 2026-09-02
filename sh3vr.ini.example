@@ -33,3 +33,85 @@ ProxyVirtualFPSMode4=1
 EnablePerDrawReplay=1
 ReplayWorldOnly=0
 EnableFullPassStereo=0
+
+[CameraMod]
+; Automatically load Camera Mod's built-in First Person preset and enable the
+; camera mod after OpenXR tracking becomes active. Set to 0 to disable.
+AutoLoadFirstPerson=1
+
+[Roomscale]
+; Move Heather through Camera Mod's collision-aware movement controls when the
+; headset walks beyond the small physical lean radius.
+Enable=1
+; Normalize every standing player to Heather's canonical 165 cm body height.
+PlayerHeightCm=165
+; Perceived VR world size. 360 is the original calibrated size. Lower values
+; make the environment smaller; higher values make it larger. The physical
+; size and calibrated offsets of tracked hands and weapons remain unchanged.
+; Physical walking speed that maps to a continuously held movement key.
+; Increase this value if Heather still travels too far; decrease it if she
+; travels too little. The default is 150 centimetres per second.
+FullSpeedCmPerSecond=150
+
+[Input]
+; Experimental shader-based head-tracked flashlight. Disabled because the
+; visible flashlight follows Heather rather than the tested shader constants.
+HeadTrackedFlashlight=0
+; Apply horizontal snap turns to Camera Mod's own yaw while OTSMod.dll is
+; loaded. This keeps stereo rendering and character-relative movement aligned.
+EnableCameraModRightStick=1
+; Stick activation threshold expressed as a percentage from 20 to 95.
+CameraModSnapTurnActivation=65
+; Exact snap angle in degrees, independent of Camera Mod mouse sensitivity.
+CameraModSnapTurnDegrees=45
+; Duration of the brief forward alignment input sent after each Camera Mod
+; snap turn. It uses Camera Mod's regular 2D movement path to align Heather.
+CameraModCharacterAlignMilliseconds=34
+
+[MotionControls]
+; Hold the game's aim state automatically while the right trigger fires.
+; The left trigger remains available as a separate manual aim control.
+RightTriggerAutoAim=1
+; The mouse path rotates Camera Mod's view rather than the weapon, so it stays
+; disabled while the direct SH3 weapon-vector integration is developed.
+EnableRightHandAim=0
+; Mouse counts submitted for each degree of controller aim correction.
+; Increase only if the in-game weapon turns less than the controller.
+AimMouseCountsPerDegree=6
+; Disabled legacy read-only character-layout probe. The known PS2 layout does
+; not match the PC executable and enabling it can cause a multi-second hitch.
+WeaponScanDiagnostics=0
+; Temporary read-only render probe. Set to 1 only while identifying a weapon
+; model, then return it to 0. Press the right grip during active gameplay.
+WeaponRenderProbe=0
+; Experimental visual attachment for a verified melee model. It changes no
+; combat input. Keep this disabled unless the matching draw profile exists.
+EnableWeaponPosePrototype=0
+; Enable only after a validated per-weapon bone profile exists. The initial
+; safe prototype keeps this disabled to avoid stretching multi-bone meshes.
+WeaponPoseRotation=0
+; Do not enable until the complete hierarchy of the selected weapon is known.
+WeaponPoseRotateSecondaryBone=0
+; Use the right controller as the absolute visual root instead of layering its
+; movement over Heather's original weapon animation.
+WeaponPoseAbsolutePosition=1
+; Per-weapon size, position, and rotation are configured in
+; sh3vr_weapons.ini.
+; Detect right-hand grip velocity and inject one normal game attack pulse.
+; This uses SH3's own combat path and works with every equipped melee weapon.
+MeleeMotion=1
+; Minimum speed of the weapon's striking end in millimetres per second.
+; Both this speed and the travel distance below must be reached.
+MeleeSwingSpeedMmPerSecond=2800
+; Minimum path travelled by the striking end before an attack can trigger.
+; This rejects short controller twitches even if their peak speed is high.
+MeleeSwingMinTravelMm=300
+; Minimum straight-line displacement during the same swing. This prevents
+; shaking or circling the wrist in place from accumulating into an attack.
+MeleeSwingMinNetTravelMm=220
+; Minimum time between detected swings.
+MeleeSwingCooldownMs=280
+
+[Debug]
+; Draw controller P/Y/R after each completed OpenXR eye image.
+ControllerOrientationOverlay=0

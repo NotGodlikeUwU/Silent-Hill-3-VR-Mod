@@ -53,3 +53,11 @@ Thumbs.db
 
 # Keep the checked-in configuration template visible
 !sh3vr.ini.example
+!sh3vr_weapons.ini.example
+!sh3vr/sh3vr_assets/
+!sh3vr/sh3vr_assets/*.mesh
+!sh3vr/sh3vr_assets/*.png
+
+# Local source-analysis checkouts (not part of the SH3VR distribution)
+.tmp_*/
+third_party_analysis/

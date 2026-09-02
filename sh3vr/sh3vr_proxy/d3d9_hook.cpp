@@ -32,11 +32,13 @@
 #include <d3d9.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
+#include <wincodec.h>
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
 #include <cstring>
 #include <intrin.h>
+#include <string>
 #include <vector>
 #include "MinHook.h"
 #include "shared_frame.h"
@@ -46,15 +48,22 @@ struct IDirect3D8;
 struct IDirect3DDevice8;
 struct IDirect3DSurface8;
 struct IDirect3DBaseTexture8;
+struct IDirect3DTexture8;
 struct IDirect3DVertexBuffer8;
 
+#pragma comment(lib, "windowscodecs.lib")
+#pragma comment(lib, "ole32.lib")
+
 extern void Log(const char* format, ...);
+extern bool InputBridge_IsFlashlightEnabled();
+extern void InputBridge_ObserveFlashlightEnabled();
 
 // interop_d3d8.cpp
 extern void Interop8_GrabFrame(struct IDirect3DDevice8* device);
 extern void Interop8_OnDeviceReset();
 extern void Interop8_Shutdown();
 extern bool Interop8_ReadHeadPose(Sh3VrHeadPose* output);
+extern bool Interop8_ReadControllerState(Sh3VrControllerState* state);
 extern void Interop8_SetFrameRenderPose(const Sh3VrHeadPose& pose);
 extern void Interop8_SetRenderMode(std::uint32_t mode);
 extern void Interop8_SetRenderFlags(std::uint32_t flags);
@@ -68,6 +77,12 @@ extern void Interop8_SetD3D12EyeTextureHandles(HANDLE set0Left,
     std::uint32_t width, std::uint32_t height, std::uint32_t format);
 extern void Interop8_SetD3D12EyeTextureFrame(std::uint32_t activeSet,
     std::uint32_t frameSequence, const Sh3VrHeadPose& renderPose);
+extern void Interop8_SetWeaponDebugOrientation(bool valid,
+    std::int32_t profileIndex, float pitchDegrees, float yawDegrees,
+    float rollDegrees);
+extern void Interop8_SetLeftHandDebugOrientation(bool valid,
+    float pitchDegrees, float yawDegrees, float rollDegrees);
+extern bool Interop8_ReadProjectionUvRects(float eyeRects[2][4]);
 extern bool Interop8_GetRequestedEyeResolution(std::uint32_t* width,
     std::uint32_t* height, std::uint32_t* sampleCount);
 extern bool Interop8_CaptureStereoEye(IDirect3DDevice8* device,
@@ -106,6 +121,8 @@ enum
     VT8_Clear = 36,
     VT8_SetTransform = 37,
     VT8_SetRenderTarget = 31,
+    VT8_CreateImageSurface = 27,
+    VT8_CopyRects = 28,
     VT8_SetViewport = 40,
     VT8_SetRenderState = 50,
     VT8_GetRenderState = 51,
@@ -130,6 +147,7 @@ enum
 
 enum
 {
+    SH3VR_D3DTS_WORLD = 256,
     SH3VR_D3DTS_VIEW = 2,
     SH3VR_D3DTS_PROJECTION = 3
 };
@@ -160,6 +178,12 @@ typedef HRESULT(STDMETHODCALLTYPE* PFN8_CreateStateBlock)(IDirect3DDevice8*,
     DWORD, DWORD*);
 typedef HRESULT(STDMETHODCALLTYPE* PFN8_SetRenderState)(IDirect3DDevice8*,
     DWORD, DWORD);
+typedef HRESULT(STDMETHODCALLTYPE* PFN8_SetMaterial)(IDirect3DDevice8*,
+    const D3DMATERIAL9*);
+typedef HRESULT(STDMETHODCALLTYPE* PFN8_SetLight)(IDirect3DDevice8*, DWORD,
+    const D3DLIGHT9*);
+typedef HRESULT(STDMETHODCALLTYPE* PFN8_LightEnable)(IDirect3DDevice8*, DWORD,
+    BOOL);
 typedef HRESULT(STDMETHODCALLTYPE* PFN8_GetRenderState)(IDirect3DDevice8*,
     DWORD, DWORD*);
 typedef HRESULT(STDMETHODCALLTYPE* PFN8_GetTexture)(IDirect3DDevice8*, DWORD,
@@ -168,6 +192,18 @@ typedef HRESULT(STDMETHODCALLTYPE* PFN8_GetTextureStageState)(
     IDirect3DDevice8*, DWORD, DWORD, DWORD*);
 typedef HRESULT(STDMETHODCALLTYPE* PFN8_SetTextureStageState)(
     IDirect3DDevice8*, DWORD, DWORD, DWORD);
+typedef HRESULT(STDMETHODCALLTYPE* PFN8_CreateTexture)(IDirect3DDevice8*,
+    UINT, UINT, UINT, DWORD, DWORD, DWORD, IDirect3DTexture8**);
+typedef HRESULT(STDMETHODCALLTYPE* PFN8_CreateImageSurface)(IDirect3DDevice8*,
+    UINT, UINT, DWORD, IDirect3DSurface8**);
+typedef HRESULT(STDMETHODCALLTYPE* PFN8_CopyRects)(IDirect3DDevice8*,
+    IDirect3DSurface8*, const RECT*, UINT, IDirect3DSurface8*, const POINT*);
+typedef HRESULT(STDMETHODCALLTYPE* PFNS8_LockRect)(IDirect3DSurface8*,
+    D3DLOCKED_RECT*, const RECT*, DWORD);
+typedef HRESULT(STDMETHODCALLTYPE* PFNS8_UnlockRect)(IDirect3DSurface8*);
+typedef HRESULT(STDMETHODCALLTYPE* PFNT8_LockRect)(IDirect3DTexture8*, UINT,
+    D3DLOCKED_RECT*, const RECT*, DWORD);
+typedef HRESULT(STDMETHODCALLTYPE* PFNT8_UnlockRect)(IDirect3DTexture8*, UINT);
 typedef HRESULT(STDMETHODCALLTYPE* PFNV8_Lock)(IDirect3DVertexBuffer8*,
     UINT, UINT, BYTE**, DWORD);
 typedef HRESULT(STDMETHODCALLTYPE* PFNV8_Unlock)(IDirect3DVertexBuffer8*);
@@ -571,6 +607,7 @@ static bool g_transientEffectPresentPreviousFrame8 = false;
 static bool g_loggedTransientEyeFrameHeld8 = false;
 static bool g_loggedUiStereoOverlayFailure8 = false;
 static bool g_loggedFixedFunctionShadow8 = false;
+static bool g_previousImmersiveFrame8 = false;
 // The low D3D8 shader handles used by the game's screen-space lighting and
 // shadow passes overlap fixed-function FVF values. Keep this experimental
 // overlay disabled until a draw-site-specific UI discriminator is available.
@@ -585,6 +622,9 @@ static bool g_enableUiTrace8 = false;
 // This is deliberately opt-in because the pass is renderer-specific.
 static bool g_enableGamePostProcess8 = false;
 static bool g_loggedGamePostProcess8 = false;
+static float g_leftHandSceneLightScale8 = 1.0f;
+static float g_leftHandSceneLightColor8[3] = { 1.0f, 1.0f, 1.0f };
+static bool g_leftHandSceneLightValid8 = false;
 static bool g_loggedScreenSpaceState8[32] = {};
 static LONG g_screenSpaceStateLogCount8 = 0;
 static IDirect3DBaseTexture8* g_currentTextures8[8] = {};
@@ -675,6 +715,49 @@ static bool g_loggedGameplayTransformSet8 = false;
 static bool g_headOrientationReferenceValid8 = false;
 static float g_headOrientationReference8[4] = {};
 static float g_headPositionReference8[3] = {};
+static bool g_enableCameraModSnapTurn8 = true;
+static float g_cameraModSnapTurnActivation8 = 0.65f;
+static float g_cameraModSnapTurnDegrees8 = 45.0f;
+static DWORD g_cameraModCharacterAlignMilliseconds8 = 34;
+static volatile LONG g_cameraModCharacterAlignEndTick8 = 0;
+static bool g_autoLoadCameraModFirstPerson8 = true;
+static bool g_cameraModAutoLoadDone8 = false;
+static bool g_enableRoomscale8 = true;
+static float g_roomscalePlayerHeightMeters8 = 1.65f;
+static float g_roomscaleHeightScale8 = 1.0f;
+static float g_roomscaleFullKeySpeedMetersPerSecond8 = 1.50f;
+static float g_roomscaleMovementPulse8 = 0.0f;
+static std::int64_t g_roomscaleLastPoseTime8 = 0;
+static float g_roomscaleSmoothedVelocity8[2] = {};
+static volatile LONG g_roomscaleMovementMask8 = SH3VR_ROOMSCALE_NONE;
+static LONG g_roomscaleMovementLogCount8 = 0;
+static bool g_roomscaleHeightLogged8 = false;
+static bool g_enableHeadTrackedFlashlight8 = false;
+static D3DMATRIX g_flashlightBaseView8 = {};
+static D3DMATRIX g_flashlightVrView8 = {};
+static bool g_haveFlashlightViewPair8 = false;
+static float g_flashlightProjectionSource8[12] = {};
+static bool g_haveFlashlightProjectionSource8 = false;
+static LONG g_flashlightProjectionSeenFrame8 = -1000;
+static float g_flashlightProjectionStrength8 = 0.0f;
+static bool g_loggedLeftHandFlashlight8 = false;
+static LONG g_headTrackedFlashlightProjectionApplications8 = 0;
+static LONG g_headTrackedFlashlightProjectionRefreshes8 = 0;
+static bool g_cameraModSnapTurnLatched8 = false;
+static std::int64_t g_cameraModLastControllerTime8 = 0;
+static LONG g_cameraModSnapTurnCount8 = 0;
+static LONG g_cameraModLayoutLogState8 = 0;
+static constexpr DWORD SH3VR_CAMERA_MOD_SUPPORTED_TIMESTAMP = 0x66B9485Eu;
+static constexpr DWORD SH3VR_CAMERA_MOD_STATE_POINTER_RVA = 0x1173Cu;
+static constexpr DWORD SH3VR_CAMERA_MOD_GAME_MODULE_POINTER_RVA = 0x11744u;
+static constexpr DWORD SH3VR_CAMERA_MOD_LOAD_FPS_PRESET_RVA = 0x6D50u;
+static constexpr DWORD SH3VR_CAMERA_MOD_TOGGLE_RVA = 0x9060u;
+static constexpr DWORD SH3VR_CAMERA_MOD_ENABLED_OFFSET = 0x40Cu;
+static constexpr DWORD SH3VR_CAMERA_MOD_YAW_OFFSET = 0x41Cu;
+static constexpr DWORD SH3VR_CAMERA_MOD_HIDE_PLAYER_OFFSET = 0x442u;
+static constexpr float SH3VR_ROOMSCALE_FOLLOW_RADIUS_METERS = 0.08f;
+static constexpr float SH3VR_ROOMSCALE_START_SPEED_METERS_PER_SECOND = 0.08f;
+static constexpr float SH3VR_ROOMSCALE_TRACKING_JUMP_METERS = 0.35f;
 static LONG g_headPoseCalibrationStartFrame8 = -1;
 static constexpr LONG SH3VR_HEAD_POSE_CALIBRATION_FRAMES = 30;
 static Sh3VrHeadPose g_latchedFrameHeadPose8 = {};
@@ -704,8 +787,9 @@ static std::uint32_t g_loggedStereoDrawShaderCount8 = 0;
 // timewarp guard band without spending most eye-target pixels outside the
 // headset's visible FOV.
 static constexpr float SH3VR_IMMERSIVE_VERTICAL_SCALE = 0.5773502692f;
-static constexpr float SH3VR_GAME_UNITS_PER_METER = 380.0f;
+static constexpr float SH3VR_DEFAULT_WORLD_SCALE = 360.0f;
 static constexpr float SH3VR_IPD_METERS = 0.064f;
+static float g_worldScale8 = SH3VR_DEFAULT_WORLD_SCALE;
 static constexpr LONGLONG SH3VR_TARGET_GAME_FPS = 90;
 static LONGLONG g_framePacingFrequency8 = 0;
 static LONGLONG g_framePacingDeadline8 = 0;
@@ -756,12 +840,422 @@ static bool g_loggedUpDrawStack8 = false;
 static LONG g_vertexShaderChangesThisFrame8 = 0;
 static LONG g_vertexShaderConstantCallsThisFrame8 = 0;
 static bool g_loggedGameplayShaderSet8 = false;
+// A bounded, read-only capture around the right-grip press. It is used to
+// identify the actual D3D8 draw signature of the equipped weapon before
+// attempting any controller-driven visual transform.
+static bool g_enableWeaponRenderProbe8 = false;
+// Visual controller attachment for the normal Heather weapon set. It never
+// generates an attack; combat remains driven by the original game input while
+// the visual poses are calibrated independently.
+static bool g_enableWeaponPosePrototype8 = false;
+static bool g_enableWeaponPoseRotation8 = false;
+static bool g_enableControllerOrientationOverlay8 = false;
+static bool g_weaponPoseRotateSecondaryBone8 = false;
+static float g_weaponPoseOffset8[3] = {};
+static float g_weaponPoseBoneA8[12] = {};
+static float g_weaponPoseBoneB8[12] = {};
+static BYTE g_weaponPoseBoneAMask8 = 0;
+static BYTE g_weaponPoseBoneBMask8 = 0;
+static DWORD g_weaponPoseConstantsShader8 = 0;
+static constexpr DWORD SH3VR_WEAPON_PALETTE_START8 = 48;
+static constexpr DWORD SH3VR_WEAPON_PALETTE_BONE_COUNT8 = 16;
+static float g_weaponPosePalette8[SH3VR_WEAPON_PALETTE_BONE_COUNT8][12] = {};
+static BYTE g_weaponPosePaletteMasks8[SH3VR_WEAPON_PALETTE_BONE_COUNT8] = {};
+static float g_weaponPoseBaselinePalette8[SH3VR_WEAPON_PALETTE_BONE_COUNT8][12] = {};
+static BYTE g_weaponPoseBaselinePaletteMasks8[SH3VR_WEAPON_PALETTE_BONE_COUNT8] = {};
+static bool g_weaponPoseBaselinePaletteValid8 = false;
+static DWORD g_weaponPoseDebugReferenceBone8 = 0;
+static float g_weaponPoseBaselinePivot8[3] = {};
+static bool g_weaponPoseBaselineGripPointValid8 = false;
+static float g_weaponPoseBaselineGripPoint8[3] = {};
+static bool g_weaponPoseAbsolutePosition8 = true;
+static bool g_weaponPoseWorldReferenceValid8 = false;
+static float g_weaponPoseBaselineHandWorldRotation8[3][3] = {};
+static float g_weaponPoseGripPitchRadians8 = 0.0f;
+static float g_weaponPoseGripYawRadians8 = 1.57079632679f;
+static float g_weaponPoseGripRollRadians8 = 1.30899693899f;
+static float g_weaponPoseScale8 = 0.90f;
+static float g_weaponPoseMinimumForward8 = 0.0f;
+static bool g_weaponPoseDisableClipping8 = true;
+static bool g_weaponPoseBaselineValid8 = false;
+static float g_weaponPoseBaselineOrientation8[4] = {};
+static float g_weaponPoseBaselinePosition8[3] = {};
+static LONG g_weaponPoseApplications8 = 0;
+struct WeaponPoseProfile8
+{
+    const char* section;
+    const char* displayName;
+    UINT vertexCount[2];
+    UINT primitiveCount[2];
+    UINT signatureCount;
+    float position[3];
+    float pitchRadians;
+    float yawRadians;
+    float rollRadians;
+    float scale;
+    float aimPitchRadians;
+    float aimYawRadians;
+};
+
+// These mesh signatures come directly from the PC models in data/chrwp.arc.
+// Katana is the only listed weapon split across two indexed mesh draws.
+static WeaponPoseProfile8 g_weaponPoseProfiles8[] = {
+    { "Knife", "Knife", { 166u, 0u }, { 334u, 0u }, 1u },
+    { "Steel Pipe", "Steel Pipe", { 172u, 0u }, { 294u, 0u }, 1u },
+    { "Maul", "Maul", { 208u, 0u }, { 426u, 0u }, 1u },
+    { "Katana", "Katana", { 69u, 72u }, { 122u, 114u }, 2u },
+    { "Stun Gun", "Stun Gun", { 132u, 0u }, { 226u, 0u }, 1u },
+    { "Handgun", "Handgun", { 368u, 0u }, { 610u, 0u }, 1u },
+    { "Shotgun", "Shotgun", { 290u, 0u }, { 490u, 0u }, 1u },
+    { "Submachine Gun", "Submachine Gun", { 557u, 0u }, { 890u, 0u }, 1u }
+};
+static constexpr int SH3VR_WEAPON_PROFILE_COUNT8 =
+    static_cast<int>(sizeof(g_weaponPoseProfiles8) /
+        sizeof(g_weaponPoseProfiles8[0]));
+struct WeaponPoseBaselineCache8
+{
+    bool valid;
+    float palette[SH3VR_WEAPON_PALETTE_BONE_COUNT8][12];
+    BYTE paletteMasks[SH3VR_WEAPON_PALETTE_BONE_COUNT8];
+    float pivot[3];
+    bool gripPointValid;
+    float gripPoint[3];
+    bool relativeBaselineValid;
+    float relativeOrientation[4];
+    float relativePosition[3];
+};
+static WeaponPoseBaselineCache8
+    g_weaponPoseBaselineCaches8[SH3VR_WEAPON_PROFILE_COUNT8] = {};
+static int g_activeWeaponPoseProfile8 = -1;
+static volatile LONG g_activeWeaponPoseSeenPresent8 = -1000;
+static LONG g_firearmReticleRenderedPresent8 = -1;
+static bool g_firearmReticleLogged8 = false;
+static ULONGLONG g_weaponIniLastPollTick8 = 0;
+static ULONGLONG g_weaponIniReloadAfterTick8 = 0;
+static FILETIME g_weaponIniObservedWriteTime8 = {};
+static bool g_weaponIniObservedWriteTimeValid8 = false;
+static bool g_weaponIniReloadPending8 = false;
+
+struct LeftHandPoseProfile8
+{
+    bool enabled;
+    float position[3];
+    float pitchRadians;
+    float yawRadians;
+    float rollRadians;
+    float scale;
+};
+
+struct LeftHandDiskVertex8
+{
+    float position[3];
+    float normal[3];
+    float texcoord[2];
+};
+
+struct LeftHandVertex8
+{
+    float position[3];
+    float normal[3];
+    DWORD diffuse;
+    float texcoord[2];
+};
+
+// Pre-transformed hand vertices bypass D3D8's camera near-plane clip. This
+// keeps a tracked hand intact when it is brought right up to the headset,
+// while retaining a depth value compatible with the game's eye target.
+struct LeftHandScreenVertex8
+{
+    float positionRhw[4];
+    DWORD diffuse;
+    float texcoord[2];
+};
+
+struct LeftHandClipVertex8
+{
+    float clip[4];
+    float color[3];
+    float texcoord[2];
+};
+
+struct LeftHandMeshPart8
+{
+    std::vector<LeftHandVertex8> vertices;
+    std::vector<std::uint16_t> indices;
+    UINT materialIndex;
+};
+
+static LeftHandPoseProfile8 g_leftHandPoseProfile8 = {};
+static std::vector<LeftHandMeshPart8> g_leftHandMeshParts8;
+static IDirect3DBaseTexture8* g_leftHandTextures8[2] = {};
+static IDirect3DDevice8* g_leftHandResourceDevice8 = nullptr;
+static IDirect3DSurface8* g_leftHandLightSampleSurface8 = nullptr;
+static bool g_leftHandResourcesLoaded8 = false;
+static bool g_leftHandResourcesAttempted8 = false;
+static bool g_leftHandRenderLogged8 = false;
+static bool g_leftHandResourceFailureLogged8 = false;
+static LONG g_leftHandRenderedPresent8 = -1;
+static bool g_leftHandPoseFailureLogged8 = false;
+static bool g_leftHandStereoFailureLogged8 = false;
+static bool g_leftHandStateFailureLogged8 = false;
+static bool g_leftHandDrawFailureLogged8 = false;
+static bool g_leftHandDesktopRenderLogged8 = false;
+static bool g_leftHandDesktopFailureLogged8 = false;
+static IDirect3DSurface8* g_leftHandDesktopDepth8 = nullptr;
+static IDirect3DSurface8* g_leftHandDesktopWeaponDepth8 = nullptr;
+static LONG g_leftHandDesktopWeaponDepthPresent8 = -1;
+static UINT g_leftHandDesktopDepthWidth8 = 0;
+static UINT g_leftHandDesktopDepthHeight8 = 0;
+static DWORD g_leftHandDesktopDepthSamples8 = 0;
+static LONG g_motionWeaponDrawCaptureFrames8 = 0;
+static LONG g_motionWeaponDrawCaptureRecords8 = 0;
+static LONG g_motionWeaponConstantCaptureRecords8 = 0;
+static bool g_motionWeaponRightGripWasDown8 = false;
+static LONG g_motionWeaponDrawCaptureSerial8 = 0;
 
 static void LogRenderCallStack(const char* operation);
 static void LogFirstStereoDrawForShader(const char* method, DWORD primitiveType,
     UINT primitiveCount, bool indexed, bool vertexBufferDraw);
 static bool HookOne(const char* name, void* target, void* detour,
     void** original);
+static void CaptureWeaponPoseConstants8(DWORD startRegister,
+    const void* data, DWORD registerCount);
+static bool BuildWeaponPoseDelta8(float rotation[3][3], float translation[3]);
+static bool IsWeaponAffineBone8(const float matrix[12]);
+static bool CaptureWeaponGripPointFromGeometry8(IDirect3DDevice8* device,
+    UINT minIndex, UINT vertexCount);
+static int FindWeaponPoseProfile8(UINT vertexCount, UINT primitiveCount);
+static void ActivateWeaponPoseProfile8(int profileIndex);
+static void LoadLeftHandPoseProfile8();
+static bool RenderLeftHandStereo8();
+static bool RenderFirearmReticleStereo8();
+static void ReleaseLeftHandResources8();
+static void CaptureLeftHandDesktopWeaponDepth8();
+static bool CaptureWeaponGripPointFromGeometry8(IDirect3DDevice8* device,
+    UINT minIndex, UINT vertexCount)
+{
+    if (!device || vertexCount == 0 || vertexCount > 2048u ||
+        !g_weaponPoseBaselinePaletteValid8)
+    {
+        return false;
+    }
+
+    void** deviceVtable = *reinterpret_cast<void***>(device);
+    const auto getStreamSource = reinterpret_cast<PFN8_GetStreamSource>(
+        deviceVtable[VT8_GetStreamSource]);
+    IDirect3DVertexBuffer8* vertexBuffer = nullptr;
+    UINT stride = 0;
+    if (!getStreamSource || FAILED(getStreamSource(device, 0, &vertexBuffer,
+        &stride)) || !vertexBuffer || stride != 48u)
+    {
+        if (vertexBuffer)
+        {
+            void** bufferVtable = *reinterpret_cast<void***>(vertexBuffer);
+            reinterpret_cast<PFNV8_Release>(bufferVtable[2])(vertexBuffer);
+        }
+        return false;
+    }
+
+    float points[2048][3] = {};
+    UINT pointCount = 0;
+    BYTE* locked = nullptr;
+    void** bufferVtable = *reinterpret_cast<void***>(vertexBuffer);
+    const auto lock = reinterpret_cast<PFNV8_Lock>(bufferVtable[11]);
+    const auto unlock = reinterpret_cast<PFNV8_Unlock>(bufferVtable[12]);
+    const auto release = reinterpret_cast<PFNV8_Release>(bufferVtable[2]);
+    const UINT byteOffset = minIndex * stride;
+    const UINT byteCount = vertexCount * stride;
+    if (lock && unlock && SUCCEEDED(lock(vertexBuffer, byteOffset, byteCount,
+        &locked, 0x00000010u)) && locked)
+    {
+        for (UINT vertexIndex = 0; vertexIndex < vertexCount; ++vertexIndex)
+        {
+            const BYTE* vertex = locked + vertexIndex * stride;
+            float sourcePosition[3] = {};
+            float weights[4] = {};
+            std::memcpy(sourcePosition, vertex, sizeof(sourcePosition));
+            std::memcpy(weights, vertex + 12u, 3u * sizeof(float));
+            weights[3] = 1.0f - weights[0] - weights[1] - weights[2];
+            const BYTE* boneIndices = vertex + 24u;
+            float skinned[3] = {};
+            float totalWeight = 0.0f;
+            for (int influence = 0; influence < 4; ++influence)
+            {
+                const float weight = weights[influence];
+                if (!std::isfinite(weight) || weight <= 0.0001f)
+                    continue;
+
+                DWORD bone = boneIndices[influence];
+                if (bone >= SH3VR_WEAPON_PALETTE_BONE_COUNT8 ||
+                    g_weaponPoseBaselinePaletteMasks8[bone] != 0x07u)
+                {
+                    if (bone % 3u != 0u)
+                        continue;
+                    bone /= 3u;
+                }
+                if (bone >= SH3VR_WEAPON_PALETTE_BONE_COUNT8 ||
+                    g_weaponPoseBaselinePaletteMasks8[bone] != 0x07u)
+                {
+                    continue;
+                }
+
+                const float* matrix = g_weaponPoseBaselinePalette8[bone];
+                for (int row = 0; row < 3; ++row)
+                {
+                    skinned[row] += weight * (
+                        matrix[row * 4 + 0] * sourcePosition[0] +
+                        matrix[row * 4 + 1] * sourcePosition[1] +
+                        matrix[row * 4 + 2] * sourcePosition[2] +
+                        matrix[row * 4 + 3]);
+                }
+                totalWeight += weight;
+            }
+            if (totalWeight <= 0.5f)
+                continue;
+            for (int axis = 0; axis < 3; ++axis)
+                points[pointCount][axis] = skinned[axis] / totalWeight;
+            ++pointCount;
+        }
+        unlock(vertexBuffer);
+    }
+    release(vertexBuffer);
+    if (pointCount < 16u)
+        return false;
+
+    float mean[3] = {};
+    for (UINT index = 0; index < pointCount; ++index)
+        for (int axis = 0; axis < 3; ++axis)
+            mean[axis] += points[index][axis];
+    for (int axis = 0; axis < 3; ++axis)
+        mean[axis] /= static_cast<float>(pointCount);
+
+    float covariance[3][3] = {};
+    for (UINT index = 0; index < pointCount; ++index)
+    {
+        float centered[3] = {
+            points[index][0] - mean[0],
+            points[index][1] - mean[1],
+            points[index][2] - mean[2]
+        };
+        for (int row = 0; row < 3; ++row)
+            for (int column = 0; column < 3; ++column)
+                covariance[row][column] +=
+                    centered[row] * centered[column];
+    }
+
+    float principalAxis[3] = { 1.0f, 0.0f, 0.0f };
+    for (int iteration = 0; iteration < 16; ++iteration)
+    {
+        float next[3] = {};
+        for (int row = 0; row < 3; ++row)
+            for (int column = 0; column < 3; ++column)
+                next[row] += covariance[row][column] *
+                    principalAxis[column];
+        const float length = std::sqrt(next[0] * next[0] +
+            next[1] * next[1] + next[2] * next[2]);
+        if (!std::isfinite(length) || length < 0.0001f)
+            return false;
+        for (int axis = 0; axis < 3; ++axis)
+            principalAxis[axis] = next[axis] / length;
+    }
+
+    float projectionMin = FLT_MAX;
+    float projectionMax = -FLT_MAX;
+    for (UINT index = 0; index < pointCount; ++index)
+    {
+        const float projection =
+            (points[index][0] - mean[0]) * principalAxis[0] +
+            (points[index][1] - mean[1]) * principalAxis[1] +
+            (points[index][2] - mean[2]) * principalAxis[2];
+        projectionMin = (std::min)(projectionMin, projection);
+        projectionMax = (std::max)(projectionMax, projection);
+    }
+    const float projectionRange = projectionMax - projectionMin;
+    if (!std::isfinite(projectionRange) || projectionRange < 0.001f)
+        return false;
+
+    float endCentroids[2][3] = {};
+    float endRadialSquared[2] = {};
+    UINT endCounts[2] = {};
+    const float segmentFraction = 0.38f;
+    const float lowThreshold = projectionMin +
+        projectionRange * segmentFraction;
+    const float highThreshold = projectionMax -
+        projectionRange * segmentFraction;
+    for (UINT index = 0; index < pointCount; ++index)
+    {
+        const float centered[3] = {
+            points[index][0] - mean[0],
+            points[index][1] - mean[1],
+            points[index][2] - mean[2]
+        };
+        const float projection = centered[0] * principalAxis[0] +
+            centered[1] * principalAxis[1] +
+            centered[2] * principalAxis[2];
+        int end = -1;
+        if (projection <= lowThreshold)
+            end = 0;
+        else if (projection >= highThreshold)
+            end = 1;
+        if (end < 0)
+            continue;
+        for (int axis = 0; axis < 3; ++axis)
+            endCentroids[end][axis] += points[index][axis];
+        const float centeredLengthSquared = centered[0] * centered[0] +
+            centered[1] * centered[1] + centered[2] * centered[2];
+        endRadialSquared[end] += centeredLengthSquared -
+            projection * projection;
+        ++endCounts[end];
+    }
+    if (endCounts[0] == 0u || endCounts[1] == 0u)
+        return false;
+    for (int end = 0; end < 2; ++end)
+    {
+        for (int axis = 0; axis < 3; ++axis)
+            endCentroids[end][axis] /= static_cast<float>(endCounts[end]);
+        endRadialSquared[end] /= static_cast<float>(endCounts[end]);
+    }
+    const float lowScore = static_cast<float>(endCounts[0]) *
+        (1.0f + endRadialSquared[0]);
+    const float highScore = static_cast<float>(endCounts[1]) *
+        (1.0f + endRadialSquared[1]);
+    const int handleEnd = highScore > lowScore ? 1 : 0;
+    std::memcpy(g_weaponPoseBaselineGripPoint8,
+        endCentroids[handleEnd], sizeof(g_weaponPoseBaselineGripPoint8));
+    g_weaponPoseBaselineGripPointValid8 = true;
+    const char* weaponName = g_activeWeaponPoseProfile8 >= 0
+        ? g_weaponPoseProfiles8[g_activeWeaponPoseProfile8].displayName
+        : "weapon";
+    Log("MotionControls: automatic %s grip point captured from %u vertices; handle end %s, endpoint counts %u/%u, radial x1000 %d/%d, grip x1000 %d/%d/%d",
+        weaponName, static_cast<unsigned>(pointCount),
+        handleEnd == 0 ? "low" : "high",
+        static_cast<unsigned>(endCounts[0]),
+        static_cast<unsigned>(endCounts[1]),
+        static_cast<int>(std::lround(endRadialSquared[0] * 1000.0f)),
+        static_cast<int>(std::lround(endRadialSquared[1] * 1000.0f)),
+        static_cast<int>(std::lround(g_weaponPoseBaselineGripPoint8[0] *
+            1000.0f)),
+        static_cast<int>(std::lround(g_weaponPoseBaselineGripPoint8[1] *
+            1000.0f)),
+        static_cast<int>(std::lround(g_weaponPoseBaselineGripPoint8[2] *
+            1000.0f)));
+    return true;
+}
+
+int D3D9Hook_GetActiveMeleeWeaponProfile()
+{
+    const LONG present = InterlockedCompareExchange(&c_present8, 0, 0);
+    const LONG seen = InterlockedCompareExchange(
+        &g_activeWeaponPoseSeenPresent8, 0, 0);
+    const int profile = g_activeWeaponPoseProfile8;
+    return profile >= 0 && profile < 4 && present - seen >= 0 &&
+        present - seen <= 2 ? profile : -1;
+}
+
+static void ApplyWeaponPoseDeltaToBone8(const float source[12],
+    const float rotation[3][3], const float pivot[3],
+    const float translation[3], float output[12]);
+static bool InvertD3D8Matrix(const D3DMATRIX& input, D3DMATRIX& output);
 
 static void PaceGameFrame()
 {
@@ -1001,6 +1495,374 @@ static bool ReadStereoReplayWorldOnlySetting()
         iniPath) != 0;
 }
 
+static int ReadIniIntSetting(const char* section, const char* key,
+    int defaultValue)
+{
+    char iniPath[MAX_PATH] = {};
+    if (GetModuleFileNameA(nullptr, iniPath,
+        static_cast<DWORD>(sizeof(iniPath))) == 0)
+    {
+        return defaultValue;
+    }
+
+    char* finalSlash = strrchr(iniPath, '\\');
+    if (!finalSlash)
+        return defaultValue;
+    strcpy_s(finalSlash + 1,
+        static_cast<size_t>(iniPath + sizeof(iniPath) - (finalSlash + 1)),
+        "sh3vr.ini");
+    return GetPrivateProfileIntA(section, key, defaultValue, iniPath);
+}
+
+static bool GetWeaponIniPath8(char iniPath[MAX_PATH])
+{
+    if (GetModuleFileNameA(nullptr, iniPath,
+        MAX_PATH) == 0)
+    {
+        return false;
+    }
+
+    char* finalSlash = strrchr(iniPath, '\\');
+    if (!finalSlash)
+        return false;
+    strcpy_s(finalSlash + 1,
+        static_cast<size_t>(iniPath + MAX_PATH - (finalSlash + 1)),
+        "sh3vr_weapons.ini");
+    return true;
+}
+
+static int ReadWeaponIniIntSetting(const char* section, const char* key,
+    int defaultValue)
+{
+    char iniPath[MAX_PATH] = {};
+    if (!GetWeaponIniPath8(iniPath))
+        return defaultValue;
+    return GetPrivateProfileIntA(section, key, defaultValue, iniPath);
+}
+
+static void LoadWeaponPoseProfiles8()
+{
+    constexpr float degreesToRadians = 0.01745329251994329577f;
+    for (int index = 0; index < SH3VR_WEAPON_PROFILE_COUNT8; ++index)
+    {
+        WeaponPoseProfile8& profile = g_weaponPoseProfiles8[index];
+        const int defaultScale = index == 0 ? 70 : 100;
+        const int pitchDegrees = std::clamp(ReadWeaponIniIntSetting(
+            profile.section, "RotationPitchDegrees", 90), -180, 180);
+        const int yawDegrees = std::clamp(ReadWeaponIniIntSetting(
+            profile.section, "RotationYawDegrees", 90), -180, 180);
+        const int rollDegrees = std::clamp(ReadWeaponIniIntSetting(
+            profile.section, "RotationRollDegrees", 45), -180, 180);
+        const int scalePercent = std::clamp(ReadWeaponIniIntSetting(
+            profile.section, "ScalePercent", defaultScale), 25, 200);
+        const bool firearmProfile = index >= 4;
+        const int aimPitchDegrees = std::clamp(ReadWeaponIniIntSetting(
+            profile.section, "AimPitchDegrees",
+            firearmProfile ? -18 : 0), -90, 90);
+        const int aimYawDegrees = std::clamp(ReadWeaponIniIntSetting(
+            profile.section, "AimYawDegrees", 0), -90, 90);
+        profile.position[0] = static_cast<float>(std::clamp(
+            ReadWeaponIniIntSetting(profile.section, "PositionX", 0),
+            -300, 300));
+        profile.position[1] = static_cast<float>(std::clamp(
+            ReadWeaponIniIntSetting(profile.section, "PositionY", 0),
+            -300, 300));
+        profile.position[2] = static_cast<float>(std::clamp(
+            ReadWeaponIniIntSetting(profile.section, "PositionZ", 0),
+            -300, 300));
+        profile.pitchRadians = static_cast<float>(pitchDegrees) *
+            degreesToRadians;
+        profile.yawRadians = static_cast<float>(yawDegrees) *
+            degreesToRadians;
+        profile.rollRadians = static_cast<float>(rollDegrees) *
+            degreesToRadians;
+        profile.scale = static_cast<float>(scalePercent) / 100.0f;
+        profile.aimPitchRadians = static_cast<float>(aimPitchDegrees) *
+            degreesToRadians;
+        profile.aimYawRadians = static_cast<float>(aimYawDegrees) *
+            degreesToRadians;
+    }
+}
+
+static void LoadLeftHandPoseProfile8()
+{
+    constexpr float degreesToRadians = 0.01745329251994329577f;
+    LeftHandPoseProfile8& profile = g_leftHandPoseProfile8;
+    profile.enabled = ReadWeaponIniIntSetting("LeftHand", "Enabled", 1) != 0;
+    profile.position[0] = static_cast<float>(std::clamp(
+        ReadWeaponIniIntSetting("LeftHand", "PositionX", 0), -300, 300));
+    profile.position[1] = static_cast<float>(std::clamp(
+        ReadWeaponIniIntSetting("LeftHand", "PositionY", 0), -300, 300));
+    profile.position[2] = static_cast<float>(std::clamp(
+        ReadWeaponIniIntSetting("LeftHand", "PositionZ", 0), -300, 300));
+    const int pitchDegrees = std::clamp(ReadWeaponIniIntSetting(
+        "LeftHand", "RotationPitchDegrees", 0), -180, 180);
+    const int yawDegrees = std::clamp(ReadWeaponIniIntSetting(
+        "LeftHand", "RotationYawDegrees", 0), -180, 180);
+    const int rollDegrees = std::clamp(ReadWeaponIniIntSetting(
+        "LeftHand", "RotationRollDegrees", 0), -180, 180);
+    const int scalePercent = std::clamp(ReadWeaponIniIntSetting(
+        "LeftHand", "ScalePercent", 100), 25, 200);
+    profile.pitchRadians = static_cast<float>(pitchDegrees) * degreesToRadians;
+    profile.yawRadians = static_cast<float>(yawDegrees) * degreesToRadians;
+    profile.rollRadians = static_cast<float>(rollDegrees) * degreesToRadians;
+    profile.scale = static_cast<float>(scalePercent) / 100.0f;
+}
+
+static void ApplyActiveWeaponPoseProfileValues8()
+{
+    if (g_activeWeaponPoseProfile8 < 0 ||
+        g_activeWeaponPoseProfile8 >= SH3VR_WEAPON_PROFILE_COUNT8)
+    {
+        return;
+    }
+
+    const WeaponPoseProfile8& profile =
+        g_weaponPoseProfiles8[g_activeWeaponPoseProfile8];
+    std::memcpy(g_weaponPoseOffset8, profile.position,
+        sizeof(g_weaponPoseOffset8));
+    g_weaponPoseGripPitchRadians8 = profile.pitchRadians;
+    g_weaponPoseGripYawRadians8 = profile.yawRadians;
+    g_weaponPoseGripRollRadians8 = profile.rollRadians;
+    g_weaponPoseScale8 = profile.scale;
+}
+
+static bool ReadWeaponIniWriteTime8(FILETIME* writeTime)
+{
+    if (!writeTime)
+        return false;
+
+    char iniPath[MAX_PATH] = {};
+    WIN32_FILE_ATTRIBUTE_DATA attributes = {};
+    if (!GetWeaponIniPath8(iniPath) ||
+        !GetFileAttributesExA(iniPath, GetFileExInfoStandard, &attributes))
+    {
+        return false;
+    }
+    *writeTime = attributes.ftLastWriteTime;
+    return true;
+}
+
+static void InitializeWeaponIniHotReload8()
+{
+    g_weaponIniObservedWriteTimeValid8 = ReadWeaponIniWriteTime8(
+        &g_weaponIniObservedWriteTime8);
+    g_weaponIniReloadPending8 = false;
+    g_weaponIniLastPollTick8 = GetTickCount64();
+}
+
+static void PollWeaponIniHotReload8()
+{
+    const ULONGLONG now = GetTickCount64();
+    if (now - g_weaponIniLastPollTick8 < 100u)
+        return;
+    g_weaponIniLastPollTick8 = now;
+
+    FILETIME currentWriteTime = {};
+    if (!ReadWeaponIniWriteTime8(&currentWriteTime))
+        return;
+
+    if (!g_weaponIniObservedWriteTimeValid8)
+    {
+        g_weaponIniObservedWriteTime8 = currentWriteTime;
+        g_weaponIniObservedWriteTimeValid8 = true;
+        return;
+    }
+
+    if (CompareFileTime(&currentWriteTime,
+        &g_weaponIniObservedWriteTime8) != 0)
+    {
+        g_weaponIniObservedWriteTime8 = currentWriteTime;
+        g_weaponIniReloadPending8 = true;
+        g_weaponIniReloadAfterTick8 = now + 200u;
+        return;
+    }
+
+    if (!g_weaponIniReloadPending8 || now < g_weaponIniReloadAfterTick8)
+        return;
+
+    g_weaponIniReloadPending8 = false;
+    LoadWeaponPoseProfiles8();
+    LoadLeftHandPoseProfile8();
+    ApplyActiveWeaponPoseProfileValues8();
+
+    if (g_activeWeaponPoseProfile8 >= 0 &&
+        g_activeWeaponPoseProfile8 < SH3VR_WEAPON_PROFILE_COUNT8)
+    {
+        const WeaponPoseProfile8& profile =
+            g_weaponPoseProfiles8[g_activeWeaponPoseProfile8];
+        constexpr float radiansToDegrees = 57.295779513082320876f;
+        Log("MotionControls: live-reloaded sh3vr_weapons.ini; active %s "
+            "scale %d%% position %d/%d/%d rotation %d/%d/%d aim %d/%d",
+            profile.displayName,
+            static_cast<int>(std::lround(profile.scale * 100.0f)),
+            static_cast<int>(profile.position[0]),
+            static_cast<int>(profile.position[1]),
+            static_cast<int>(profile.position[2]),
+            static_cast<int>(std::lround(profile.pitchRadians *
+                radiansToDegrees)),
+            static_cast<int>(std::lround(profile.yawRadians *
+                radiansToDegrees)),
+            static_cast<int>(std::lround(profile.rollRadians *
+                radiansToDegrees)),
+            static_cast<int>(std::lround(profile.aimPitchRadians *
+                radiansToDegrees)),
+            static_cast<int>(std::lround(profile.aimYawRadians *
+                radiansToDegrees)));
+    }
+    else
+    {
+        Log("MotionControls: live-reloaded sh3vr_weapons.ini; no active "
+            "weapon profile");
+    }
+}
+
+static void ResetWeaponPoseProfileState8()
+{
+    Interop8_SetWeaponDebugOrientation(false, -1, 0.0f, 0.0f, 0.0f);
+    std::memset(g_weaponPoseBaselinePalette8, 0,
+        sizeof(g_weaponPoseBaselinePalette8));
+    std::memset(g_weaponPoseBaselinePaletteMasks8, 0,
+        sizeof(g_weaponPoseBaselinePaletteMasks8));
+    std::memset(g_weaponPoseBaselinePivot8, 0,
+        sizeof(g_weaponPoseBaselinePivot8));
+    std::memset(g_weaponPoseBaselineGripPoint8, 0,
+        sizeof(g_weaponPoseBaselineGripPoint8));
+    std::memset(g_weaponPoseBaselineOrientation8, 0,
+        sizeof(g_weaponPoseBaselineOrientation8));
+    std::memset(g_weaponPoseBaselinePosition8, 0,
+        sizeof(g_weaponPoseBaselinePosition8));
+    g_weaponPoseBaselinePaletteValid8 = false;
+    g_weaponPoseDebugReferenceBone8 = 0;
+    g_weaponPoseBaselineGripPointValid8 = false;
+    g_weaponPoseBaselineValid8 = false;
+    InterlockedExchange(&g_weaponPoseApplications8, 0);
+}
+
+static void SaveWeaponPoseBaselineCache8(int profileIndex)
+{
+    if (profileIndex < 0 || profileIndex >= SH3VR_WEAPON_PROFILE_COUNT8 ||
+        !g_weaponPoseBaselinePaletteValid8)
+    {
+        return;
+    }
+
+    WeaponPoseBaselineCache8& cache =
+        g_weaponPoseBaselineCaches8[profileIndex];
+    std::memcpy(cache.palette, g_weaponPoseBaselinePalette8,
+        sizeof(cache.palette));
+    std::memcpy(cache.paletteMasks, g_weaponPoseBaselinePaletteMasks8,
+        sizeof(cache.paletteMasks));
+    std::memcpy(cache.pivot, g_weaponPoseBaselinePivot8,
+        sizeof(cache.pivot));
+    cache.gripPointValid = g_weaponPoseBaselineGripPointValid8;
+    std::memcpy(cache.gripPoint, g_weaponPoseBaselineGripPoint8,
+        sizeof(cache.gripPoint));
+    cache.relativeBaselineValid = g_weaponPoseBaselineValid8;
+    std::memcpy(cache.relativeOrientation, g_weaponPoseBaselineOrientation8,
+        sizeof(cache.relativeOrientation));
+    std::memcpy(cache.relativePosition, g_weaponPoseBaselinePosition8,
+        sizeof(cache.relativePosition));
+    cache.valid = true;
+}
+
+static bool RestoreWeaponPoseBaselineCache8(int profileIndex)
+{
+    if (profileIndex < 0 || profileIndex >= SH3VR_WEAPON_PROFILE_COUNT8)
+        return false;
+
+    const WeaponPoseBaselineCache8& cache =
+        g_weaponPoseBaselineCaches8[profileIndex];
+    if (!cache.valid)
+        return false;
+
+    std::memcpy(g_weaponPoseBaselinePalette8, cache.palette,
+        sizeof(g_weaponPoseBaselinePalette8));
+    std::memcpy(g_weaponPoseBaselinePaletteMasks8, cache.paletteMasks,
+        sizeof(g_weaponPoseBaselinePaletteMasks8));
+    std::memcpy(g_weaponPoseBaselinePivot8, cache.pivot,
+        sizeof(g_weaponPoseBaselinePivot8));
+    g_weaponPoseBaselineGripPointValid8 = cache.gripPointValid;
+    std::memcpy(g_weaponPoseBaselineGripPoint8, cache.gripPoint,
+        sizeof(g_weaponPoseBaselineGripPoint8));
+    g_weaponPoseBaselineValid8 = cache.relativeBaselineValid;
+    std::memcpy(g_weaponPoseBaselineOrientation8,
+        cache.relativeOrientation, sizeof(g_weaponPoseBaselineOrientation8));
+    std::memcpy(g_weaponPoseBaselinePosition8,
+        cache.relativePosition, sizeof(g_weaponPoseBaselinePosition8));
+    g_weaponPoseBaselinePaletteValid8 = true;
+    InterlockedExchange(&g_weaponPoseApplications8, 0);
+    return true;
+}
+
+static int FindWeaponPoseProfile8(UINT vertexCount, UINT primitiveCount)
+{
+    for (int profileIndex = 0;
+        profileIndex < SH3VR_WEAPON_PROFILE_COUNT8; ++profileIndex)
+    {
+        const WeaponPoseProfile8& profile =
+            g_weaponPoseProfiles8[profileIndex];
+        for (UINT signature = 0; signature < profile.signatureCount;
+            ++signature)
+        {
+            if (profile.vertexCount[signature] == vertexCount &&
+                profile.primitiveCount[signature] == primitiveCount)
+            {
+                return profileIndex;
+            }
+        }
+    }
+    return -1;
+}
+
+static void ActivateWeaponPoseProfile8(int profileIndex)
+{
+    if (profileIndex < 0 || profileIndex >= SH3VR_WEAPON_PROFILE_COUNT8 ||
+        profileIndex == g_activeWeaponPoseProfile8)
+    {
+        return;
+    }
+
+    SaveWeaponPoseBaselineCache8(g_activeWeaponPoseProfile8);
+    g_activeWeaponPoseProfile8 = profileIndex;
+    const WeaponPoseProfile8& profile =
+        g_weaponPoseProfiles8[profileIndex];
+    ApplyActiveWeaponPoseProfileValues8();
+    const bool restoredBaseline =
+        RestoreWeaponPoseBaselineCache8(profileIndex);
+    if (!restoredBaseline)
+        ResetWeaponPoseProfileState8();
+    Log("MotionControls: activated %s pose profile (scale %d%%, local position %d/%d/%d, baseline %s)",
+        profile.displayName,
+        static_cast<int>(std::lround(profile.scale * 100.0f)),
+        static_cast<int>(profile.position[0]),
+        static_cast<int>(profile.position[1]),
+        static_cast<int>(profile.position[2]),
+        restoredBaseline ? "restored" : "new");
+}
+
+static int ReadInputSetting(const char* key, int defaultValue)
+{
+    return ReadIniIntSetting("Input", key, defaultValue);
+}
+
+std::uint32_t D3D9Hook_GetRoomscaleMovementMask()
+{
+    return static_cast<std::uint32_t>(InterlockedCompareExchange(
+        &g_roomscaleMovementMask8, SH3VR_ROOMSCALE_NONE,
+        SH3VR_ROOMSCALE_NONE));
+}
+
+bool D3D9Hook_GetCameraModCharacterAlignForward()
+{
+    const DWORD endTick = static_cast<DWORD>(InterlockedCompareExchange(
+        &g_cameraModCharacterAlignEndTick8, 0, 0));
+    const DWORD now = GetTickCount();
+    if (static_cast<LONG>(endTick - now) <= 0)
+        return false;
+    return true;
+}
+
 static bool ReadProcessBytes(const BYTE* address, BYTE* output, SIZE_T size)
 {
     SIZE_T bytesRead = 0;
@@ -1067,6 +1929,21 @@ static void UpdateGamePostProcessState8()
 
     const float blend = active
         ? static_cast<float>(intensity) / 255.0f : 0.0f;
+    // Reuse the location-specific game color multiplier for the separately
+    // rendered hand. This keeps it dark in rooms whose native post-process is
+    // dark instead of behaving like an emissive overlay.
+    const float postProcessLight = active
+        ? (scale[0] + scale[1] + scale[2]) / 3.0f : 1.0f;
+    // Until the first small backbuffer lighting sample is available, retain
+    // the location-specific post-process multiplier as a conservative
+    // fallback. Afterwards the hand follows the actual illuminated scene.
+    if (!g_leftHandSceneLightValid8)
+    {
+        g_leftHandSceneLightScale8 = (std::min)(1.0f,
+            (std::max)(0.0f, postProcessLight));
+        for (float& channel : g_leftHandSceneLightColor8)
+            channel = g_leftHandSceneLightScale8;
+    }
     Interop8_SetGamePostProcess(active, scale, blend, source, intensity);
 
     struct DiagnosticSnapshot
@@ -1942,6 +2819,7 @@ static void LogFirstGameplayShaderSet(LONG frame)
     {
         return;
     }
+
 
     g_loggedGameplayShaderSet8 = true;
     Log("=== D3D8 first gameplay vertex shader set at frame %d ===", frame);
@@ -3177,26 +4055,31 @@ static bool ShouldReplayStereoDraw(DWORD shader, bool indexed,
 
     // SH3 submits the real room, actor, weapon, and water-surface geometry
     // from vertex buffers. Shader handles and individual mesh sizes vary with
-    // load order, so both are unsuitable identifiers. Screen-space effects,
-    // shadows, blur, decals, and UI use the separate *UP paths and remain
-    // governed by the strict allowlist. Tiny buffered strips are billboards
-    // or composites and stay excluded as well.
-    return primitiveCount >= (indexed ? 16u : 32u);
+    // load order, so both are unsuitable identifiers. Small city-sector and
+    // actor material batches can contain fewer than the old 16/32 primitive
+    // limits and vanished after loading a save with a different shader order.
+    // Screen-space effects, shadows, blur, decals, and UI use the separate UP
+    // paths; buffered full-screen quads contain only two primitives. Accept
+    // every non-quad 3D strip/list so distant room pieces survive in VR.
+    return primitiveCount >= 3u;
 }
 
 static bool IsHeavySceneDynamicReplayDraw(DWORD shader, bool indexed,
     DWORD primitiveType, UINT primitiveCount, bool vertexBufferDraw)
 {
-    // The batched heavy-scene pass reproduces static world geometry. Dynamic
-    // actor lists are consumed by SH3's first composite call, so preserve the
-    // small actor/material variants from that original pass. Shader 0x2F is a
-    // high-volume room/emissive material family in the bakery (650 draws in a
-    // single frame); replaying it per draw consumes the bounded budget before
-    // Heather and enemy draws are reached. The full-scene pass renders 0x2F
-    // once per eye, so it must stay out of the dynamic replay budget.
-    if (shader == 0x2F)
+    // The heavy full-scene pass reproduces the non-indexed room/material
+    // batches itself. Shader handles are allocation-order dependent: in the
+    // bakery the same high-volume family appeared as 0xD1 rather than the
+    // previously observed 0x2F and exhausted the replay budget before the
+    // held weapon was submitted. Classify by draw topology instead. SH3's
+    // skinned actors and held weapons use indexed draws, while the bakery's
+    // 676-draw room burst is non-indexed. Preserve every selected indexed draw
+    // from the original composite and let the per-eye full-scene pass restore
+    // all non-indexed geometry. This keeps weapon/actor state without relying
+    // on unstable shader IDs and avoids replaying the room three times.
+    if (!indexed)
         return false;
-    return shader != 0x2D && ShouldReplayStereoDraw(shader, indexed,
+    return ShouldReplayStereoDraw(shader, indexed,
         primitiveType, primitiveCount, vertexBufferDraw);
 }
 
@@ -3233,6 +4116,16 @@ static void LogFirstStereoDrawForShader(const char* method, DWORD primitiveType,
 
 static HRESULT WINAPI hk_D3D8_SetVertexShader(IDirect3DDevice8* device, DWORD shader)
 {
+    if (g_enableWeaponPosePrototype8 && shader != g_weaponPoseConstantsShader8)
+    {
+        // Bone constants are shader-local state. Never carry a palette from a
+        // previous shader into a verified weapon draw after a scene change.
+        g_weaponPoseConstantsShader8 = shader;
+        g_weaponPoseBoneAMask8 = 0;
+        g_weaponPoseBoneBMask8 = 0;
+        std::memset(g_weaponPosePaletteMasks8, 0,
+            sizeof(g_weaponPosePaletteMasks8));
+    }
     g_currentVertexShader8 = shader;
     ++g_vertexShaderChangesThisFrame8;
     return o_D3D8_SetVertexShader(device, shader);
@@ -3273,11 +4166,433 @@ static IDirect3DBaseTexture8* FirstBoundTexture8(DWORD* stage)
     return nullptr;
 }
 
+static void UpdateMotionWeaponDrawCapture8()
+{
+    if (!g_enableWeaponRenderProbe8)
+    {
+        g_motionWeaponRightGripWasDown8 = false;
+        g_motionWeaponDrawCaptureFrames8 = 0;
+        return;
+    }
+
+    Sh3VrControllerState controller = {};
+    if (!Interop8_ReadControllerState(&controller))
+        return;
+
+    const bool rightGripDown =
+        (controller.buttons & SH3VR_BUTTON_RIGHT_GRIP) != 0;
+    if (rightGripDown && !g_motionWeaponRightGripWasDown8)
+    {
+        // Streaming and menu fades can occupy the next few game frames. Keep
+        // the read-only window long enough to observe the weapon geometry
+        // after the grip press without altering any render state.
+        g_motionWeaponDrawCaptureFrames8 = 180;
+        g_motionWeaponDrawCaptureRecords8 = 0;
+        g_motionWeaponConstantCaptureRecords8 = 0;
+        const LONG serial = InterlockedIncrement(&g_motionWeaponDrawCaptureSerial8);
+        Log("MotionControls: weapon render probe %d armed by the right grip "
+            "for the next 180 game frames", serial);
+    }
+    else if (g_motionWeaponDrawCaptureFrames8 > 0)
+    {
+        --g_motionWeaponDrawCaptureFrames8;
+        if (g_motionWeaponDrawCaptureFrames8 == 0)
+        {
+            Log("MotionControls: weapon draw capture complete: %d render "
+                "records", g_motionWeaponDrawCaptureRecords8);
+        }
+    }
+    g_motionWeaponRightGripWasDown8 = rightGripDown;
+}
+
+static void LogMotionWeaponVertexConstants8(DWORD startRegister,
+    const void* data, DWORD registerCount)
+{
+    // The probe records source constants around a candidate weapon draw
+    // without changing any game state.
+    if (g_motionWeaponDrawCaptureFrames8 <= 0 ||
+        g_currentVertexShader8 != 0x00000089u || !data ||
+        registerCount == 0 || g_motionWeaponConstantCaptureRecords8 >= 64)
+    {
+        return;
+    }
+
+    const float* values = static_cast<const float*>(data);
+    const DWORD rows = (std::min)(registerCount, static_cast<DWORD>(4));
+    const LONG record = ++g_motionWeaponConstantCaptureRecords8;
+    Log("MotionControls: candidate weapon constants %d: shader 0x%08X, c%u, count %u",
+        record, g_currentVertexShader8, static_cast<unsigned>(startRegister),
+        static_cast<unsigned>(registerCount));
+    for (DWORD row = 0; row < rows; ++row)
+    {
+        const float* vector = values + static_cast<std::size_t>(row) * 4u;
+        Log("  c%u x1000 [%d %d %d %d]",
+            static_cast<unsigned>(startRegister + row),
+            static_cast<int>(std::lround(vector[0] * 1000.0f)),
+            static_cast<int>(std::lround(vector[1] * 1000.0f)),
+            static_cast<int>(std::lround(vector[2] * 1000.0f)),
+            static_cast<int>(std::lround(vector[3] * 1000.0f)));
+    }
+}
+
+static void CaptureWeaponPoseConstantRange8(DWORD startRegister,
+    const float* values, DWORD registerCount, DWORD targetRegister,
+    float target[12], BYTE* mask)
+{
+    if (!values || !target || !mask)
+        return;
+
+    const DWORD endRegister = startRegister + registerCount;
+    const DWORD targetEnd = targetRegister + 3;
+    const DWORD copyStart = (std::max)(startRegister, targetRegister);
+    const DWORD copyEnd = (std::min)(endRegister, targetEnd);
+    if (copyStart >= copyEnd)
+        return;
+
+    for (DWORD registerIndex = copyStart; registerIndex < copyEnd;
+        ++registerIndex)
+    {
+        const DWORD sourceIndex = registerIndex - startRegister;
+        const DWORD targetIndex = registerIndex - targetRegister;
+        std::memcpy(target + targetIndex * 4u, values + sourceIndex * 4u,
+            4u * sizeof(float));
+        *mask |= static_cast<BYTE>(1u << targetIndex);
+    }
+}
+
+static void CaptureWeaponPoseConstants8(DWORD startRegister,
+    const void* data, DWORD registerCount)
+{
+    if (!g_enableWeaponPosePrototype8 || !data || registerCount == 0)
+    {
+        return;
+    }
+
+    const float* values = static_cast<const float*>(data);
+    CaptureWeaponPoseConstantRange8(startRegister, values, registerCount, 48,
+        g_weaponPoseBoneA8, &g_weaponPoseBoneAMask8);
+    CaptureWeaponPoseConstantRange8(startRegister, values, registerCount, 51,
+        g_weaponPoseBoneB8, &g_weaponPoseBoneBMask8);
+    for (DWORD bone = 0; bone < SH3VR_WEAPON_PALETTE_BONE_COUNT8; ++bone)
+    {
+        CaptureWeaponPoseConstantRange8(startRegister, values, registerCount,
+            SH3VR_WEAPON_PALETTE_START8 + bone * 3u,
+            g_weaponPosePalette8[bone], &g_weaponPosePaletteMasks8[bone]);
+    }
+}
+
+static void LogMotionWeaponDrawCapture8(IDirect3DDevice8* device,
+    const char* method, DWORD primitiveType, UINT primitiveCount,
+    bool indexed, UINT firstArgument, UINT secondArgument, UINT thirdArgument,
+    UINT sourceStride, const void* caller)
+{
+    if (g_motionWeaponDrawCaptureFrames8 <= 0 ||
+        g_motionWeaponDrawCaptureRecords8 >= 512 || !device)
+    {
+        return;
+    }
+
+    const LONG record = ++g_motionWeaponDrawCaptureRecords8;
+    DWORD textureStage = 0;
+    const IDirect3DBaseTexture8* texture = FirstBoundTexture8(&textureStage);
+    IDirect3DVertexBuffer8* vertexBuffer = nullptr;
+    UINT vertexStride = sourceStride;
+    if (sourceStride == 0)
+    {
+        void** deviceVtable = *reinterpret_cast<void***>(device);
+        const auto getStreamSource = reinterpret_cast<PFN8_GetStreamSource>(
+            deviceVtable[VT8_GetStreamSource]);
+        const HRESULT streamResult = getStreamSource(device, 0, &vertexBuffer,
+            &vertexStride);
+        if (FAILED(streamResult))
+        {
+            vertexBuffer = nullptr;
+            vertexStride = 0;
+        }
+    }
+
+    // The equipment meshes observed so far are indexed vertex-buffer draws.
+    // Excluding screen-space UP passes keeps the extended diagnostic capture
+    // concise and avoids mistaking post-process quads for weapon geometry.
+    if (!indexed || !vertexBuffer || vertexStride < 12 || vertexStride > 256)
+    {
+        if (vertexBuffer)
+        {
+            void** bufferVtable = *reinterpret_cast<void***>(vertexBuffer);
+            const auto release = reinterpret_cast<PFNV8_Release>(bufferVtable[2]);
+            release(vertexBuffer);
+        }
+        return;
+    }
+
+    HMODULE gameModule = GetModuleHandleA(nullptr);
+    const UINT_PTR callerAddress = reinterpret_cast<UINT_PTR>(caller);
+    const UINT_PTR gameBase = reinterpret_cast<UINT_PTR>(gameModule);
+    const UINT_PTR callerRva = gameModule && callerAddress >= gameBase
+        ? callerAddress - gameBase : 0;
+    float boundsMin[3] = { FLT_MAX, FLT_MAX, FLT_MAX };
+    float boundsMax[3] = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
+    bool haveBounds = false;
+    // The indexed actor candidate exposes a small, readable vertex range.
+    // Inspect only that bounded range; never lock arbitrary scene buffers.
+    if (secondArgument > 0 && secondArgument <= 2048u)
+    {
+        const std::size_t byteCount = static_cast<std::size_t>(secondArgument) *
+            static_cast<std::size_t>(vertexStride);
+        BYTE* locked = nullptr;
+        void** bufferVtable = *reinterpret_cast<void***>(vertexBuffer);
+        const auto lock = reinterpret_cast<PFNV8_Lock>(bufferVtable[11]);
+        const auto unlock = reinterpret_cast<PFNV8_Unlock>(bufferVtable[12]);
+        if (SUCCEEDED(lock(vertexBuffer, 0, static_cast<UINT>(byteCount),
+            &locked, 0x00000010u)) && locked)
+        {
+            for (UINT index = 0; index < secondArgument; ++index)
+            {
+                const BYTE* vertex = locked +
+                    static_cast<std::size_t>(index) * vertexStride;
+                float position[3] = {};
+                std::memcpy(position, vertex, sizeof(position));
+                if (!std::isfinite(position[0]) ||
+                    !std::isfinite(position[1]) ||
+                    !std::isfinite(position[2]) ||
+                    std::fabs(position[0]) > 100000.0f ||
+                    std::fabs(position[1]) > 100000.0f ||
+                    std::fabs(position[2]) > 100000.0f)
+                {
+                    continue;
+                }
+                haveBounds = true;
+                for (int axis = 0; axis < 3; ++axis)
+                {
+                    boundsMin[axis] = (std::min)(boundsMin[axis],
+                        position[axis]);
+                    boundsMax[axis] = (std::max)(boundsMax[axis],
+                        position[axis]);
+                }
+            }
+            unlock(vertexBuffer);
+        }
+    }
+    Log("MotionControls: weapon draw %d: %s, shader/FVF 0x%08X, indexed %u, "
+        "primitive %u x %u, args %u/%u/%u, stream 0x%08X stride %u, "
+        "texture stage %u 0x%08X %ux%u, bounds x1000 "
+        "%d/%d y1000 %d/%d z1000 %d/%d, caller RVA 0x%08X",
+        record, method, g_currentVertexShader8, indexed ? 1u : 0u,
+        static_cast<unsigned>(primitiveType), static_cast<unsigned>(primitiveCount),
+        static_cast<unsigned>(firstArgument), static_cast<unsigned>(secondArgument),
+        static_cast<unsigned>(thirdArgument),
+        static_cast<unsigned>(reinterpret_cast<UINT_PTR>(vertexBuffer)),
+        static_cast<unsigned>(vertexStride), static_cast<unsigned>(textureStage),
+        static_cast<unsigned>(reinterpret_cast<UINT_PTR>(texture)),
+        textureStage < _countof(g_currentTextureWidths8)
+            ? g_currentTextureWidths8[textureStage] : 0u,
+        textureStage < _countof(g_currentTextureHeights8)
+            ? g_currentTextureHeights8[textureStage] : 0u,
+        haveBounds ? static_cast<int>(std::lround(boundsMin[0] * 1000.0f)) : 0,
+        haveBounds ? static_cast<int>(std::lround(boundsMax[0] * 1000.0f)) : 0,
+        haveBounds ? static_cast<int>(std::lround(boundsMin[1] * 1000.0f)) : 0,
+        haveBounds ? static_cast<int>(std::lround(boundsMax[1] * 1000.0f)) : 0,
+        haveBounds ? static_cast<int>(std::lround(boundsMin[2] * 1000.0f)) : 0,
+        haveBounds ? static_cast<int>(std::lround(boundsMax[2] * 1000.0f)) : 0,
+        static_cast<unsigned>(callerRva));
+
+    if (vertexBuffer)
+    {
+        void** bufferVtable = *reinterpret_cast<void***>(vertexBuffer);
+        const auto release = reinterpret_cast<PFNV8_Release>(bufferVtable[2]);
+        release(vertexBuffer);
+    }
+}
+
+static float DotFlashlightVector8(const float a[3], const float b[3])
+{
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+static bool NormalizeFlashlightVector8(float vector[3])
+{
+    const float lengthSquared = DotFlashlightVector8(vector, vector);
+    if (!std::isfinite(lengthSquared) || lengthSquared < 0.000001f)
+        return false;
+    const float inverseLength = 1.0f / std::sqrt(lengthSquared);
+    vector[0] *= inverseLength;
+    vector[1] *= inverseLength;
+    vector[2] *= inverseLength;
+    return true;
+}
+
+static bool ReadFlashlightViewBasis8(const D3DMATRIX& view, bool useColumns,
+    float basis[3][3])
+{
+    for (int axis = 0; axis < 3; ++axis)
+    {
+        for (int component = 0; component < 3; ++component)
+        {
+            basis[axis][component] = useColumns
+                ? view.m[component][axis]
+                : view.m[axis][component];
+        }
+        if (!NormalizeFlashlightVector8(basis[axis]))
+            return false;
+    }
+    return true;
+}
+
+static bool IsFlashlightProjectionShader8(DWORD shader)
+{
+    switch (shader)
+    {
+    case 0x0000000Fu:
+    case 0x00000015u:
+    case 0x00000019u:
+    case 0x0000002Du:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool ApplyHeadTrackedFlashlightProjection8(const float source[12],
+    float output[12])
+{
+    if (!g_enableHeadTrackedFlashlight8 || !g_haveFlashlightViewPair8 ||
+        !source || !output)
+    {
+        return false;
+    }
+
+    float baseBasis[3][3] = {};
+    float vrBasis[3][3] = {};
+    if (!ReadFlashlightViewBasis8(g_flashlightBaseView8, false, baseBasis) ||
+        !ReadFlashlightViewBasis8(g_flashlightVrView8, false, vrBasis))
+    {
+        return false;
+    }
+
+    for (int projectionAxis = 0; projectionAxis < 3; ++projectionAxis)
+    {
+        float gameAxis[3] = {
+            source[projectionAxis * 4 + 0],
+            source[projectionAxis * 4 + 1],
+            source[projectionAxis * 4 + 2]
+        };
+        const float axisLengthSquared = DotFlashlightVector8(gameAxis,
+            gameAxis);
+        if (!std::isfinite(axisLengthSquared) ||
+            axisLengthSquared < 0.000001f)
+        {
+            return false;
+        }
+        const float axisLength = std::sqrt(axisLengthSquared);
+        if (!NormalizeFlashlightVector8(gameAxis))
+            return false;
+
+        const float localAxis[3] = {
+            DotFlashlightVector8(gameAxis, baseBasis[0]),
+            DotFlashlightVector8(gameAxis, baseBasis[1]),
+            DotFlashlightVector8(gameAxis, baseBasis[2])
+        };
+        float headAxis[3] = {};
+        for (int component = 0; component < 3; ++component)
+        {
+            headAxis[component] =
+                localAxis[0] * vrBasis[0][component] +
+                localAxis[1] * vrBasis[1][component] +
+                localAxis[2] * vrBasis[2][component];
+        }
+        if (!NormalizeFlashlightVector8(headAxis))
+            return false;
+
+        output[projectionAxis * 4 + 0] = headAxis[0] * axisLength;
+        output[projectionAxis * 4 + 1] = headAxis[1] * axisLength;
+        output[projectionAxis * 4 + 2] = headAxis[2] * axisLength;
+        output[projectionAxis * 4 + 3] = source[projectionAxis * 4 + 3];
+    }
+
+    if (InterlockedIncrement(
+            &g_headTrackedFlashlightProjectionApplications8) == 1)
+    {
+        Log("Head tracking applied to the SH3 flashlight projection matrix "
+            "in vertex constants c80-c82");
+    }
+    return true;
+}
+
+static void RefreshHeadTrackedFlashlightProjection8(IDirect3DDevice8* device)
+{
+    if (!device || !g_haveFlashlightProjectionSource8)
+        return;
+
+    float headProjection[12] = {};
+    if (!ApplyHeadTrackedFlashlightProjection8(
+            g_flashlightProjectionSource8, headProjection))
+    {
+        return;
+    }
+
+    if (FAILED(o_D3D8_SetVertexShaderConstant(device, 80,
+            headProjection, 3)))
+    {
+        return;
+    }
+
+    const LONG refreshCount = InterlockedIncrement(
+        &g_headTrackedFlashlightProjectionRefreshes8);
+    if (refreshCount == 1)
+    {
+        Log("Head-tracked flashlight projection c80-c82 is refreshed with "
+            "every VR view update");
+    }
+}
+
 static HRESULT WINAPI hk_D3D8_SetVertexShaderConstant(IDirect3DDevice8* device,
     DWORD startRegister, const void* data, DWORD registerCount)
 {
+    LogMotionWeaponVertexConstants8(startRegister, data, registerCount);
+    CaptureWeaponPoseConstants8(startRegister, data, registerCount);
     if (g_enableRuntimeDiagnostics8)
         CaptureD3D8ShaderConstants(startRegister, data, registerCount);
+
+    constexpr DWORD flashlightProjectionRegister = 80;
+    constexpr DWORD flashlightProjectionRegisterCount = 3;
+    if (data && IsFlashlightProjectionShader8(g_currentVertexShader8) &&
+        startRegister <= flashlightProjectionRegister &&
+        startRegister + registerCount >= flashlightProjectionRegister +
+            flashlightProjectionRegisterCount &&
+        registerCount <= 96u)
+    {
+        float modifiedConstants[96u * 4u] = {};
+        std::memcpy(modifiedConstants, data,
+            static_cast<std::size_t>(registerCount) * 4u * sizeof(float));
+        float* projection = modifiedConstants +
+            static_cast<std::size_t>(flashlightProjectionRegister -
+                startRegister) * 4u;
+        std::memcpy(g_flashlightProjectionSource8, projection,
+            sizeof(g_flashlightProjectionSource8));
+        g_haveFlashlightProjectionSource8 = true;
+        float projectionStrengthSquared = 0.0f;
+        for (int row = 0; row < 3; ++row)
+            for (int column = 0; column < 3; ++column)
+                projectionStrengthSquared +=
+                    projection[row * 4 + column] *
+                    projection[row * 4 + column];
+        g_flashlightProjectionStrength8 =
+            std::isfinite(projectionStrengthSquared)
+            ? std::sqrt(projectionStrengthSquared) : 0.0f;
+        if (g_flashlightProjectionStrength8 > 0.001f)
+        {
+            g_flashlightProjectionSeenFrame8 =
+                InterlockedCompareExchange(&c_present8, 0, 0);
+        }
+        float headProjection[12] = {};
+        if (ApplyHeadTrackedFlashlightProjection8(projection,
+                headProjection))
+        {
+            std::memcpy(projection, headProjection, sizeof(headProjection));
+            return o_D3D8_SetVertexShaderConstant(device, startRegister,
+                modifiedConstants, registerCount);
+        }
+    }
 
     if (g_enableViewProjectionHeadRotation8 && data &&
         startRegister == 2 && registerCount == 4 && g_haveProjection8)
@@ -3343,6 +4658,8 @@ static HRESULT WINAPI hk_D3D8_DrawPrimitive(IDirect3DDevice8* device,
     LogFirstStereoDrawForShader("DrawPrimitive", primitiveType, primitiveCount,
         false, true);
     const void* caller = _ReturnAddress();
+    LogMotionWeaponDrawCapture8(device, "DrawPrimitive", primitiveType,
+        primitiveCount, false, startVertex, 0, 0, 0, caller);
     const bool lightCompositeCandidate =
         g_enableUiStereoOverlay8 && g_perDrawStereoProbeActive8 &&
         !g_fullSceneStereoReplayActive8 &&
@@ -3442,10 +4759,242 @@ static HRESULT WINAPI hk_D3D8_DrawIndexedPrimitive(IDirect3DDevice8* device,
     CaptureD3D8ShaderDraw(true, primitiveCount);
     LogFirstStereoDrawForShader("DrawIndexedPrimitive", primitiveType,
         primitiveCount, true, true);
+    const void* caller = _ReturnAddress();
+    LogMotionWeaponDrawCapture8(device, "DrawIndexedPrimitive", primitiveType,
+        primitiveCount, true, minIndex, vertexCount, startIndex, 0, caller);
+
+    HMODULE gameModule = GetModuleHandleA(nullptr);
+    const UINT_PTR callerAddress = reinterpret_cast<UINT_PTR>(caller);
+    const UINT_PTR gameBase = reinterpret_cast<UINT_PTR>(gameModule);
+    const UINT_PTR callerRva = gameModule && callerAddress >= gameBase
+        ? callerAddress - gameBase : 0;
+    // Shader IDs are allocated dynamically and change between levels. The
+    // indexed mesh dimensions come from the PC weapon models themselves and,
+    // together with the common model-render caller, distinguish every normal
+    // Heather weapon without touching actor or room geometry.
+    const bool weaponDrawShape = g_enableWeaponPosePrototype8 &&
+        primitiveType == 5u &&
+        callerRva == 0x0005F518u &&
+        g_weaponPoseConstantsShader8 == g_currentVertexShader8;
+    const int weaponProfileIndex = weaponDrawShape
+        ? FindWeaponPoseProfile8(vertexCount, primitiveCount) : -1;
+    if (weaponProfileIndex >= 0)
+        ActivateWeaponPoseProfile8(weaponProfileIndex);
+    const bool weaponCandidate = weaponProfileIndex >= 0;
+    if (weaponCandidate)
+    {
+        InterlockedExchange(&g_activeWeaponPoseSeenPresent8,
+            InterlockedCompareExchange(&c_present8, 0, 0));
+    }
+    struct WeaponPaletteUpdate
+    {
+        DWORD startRegister;
+        float original[12];
+    };
+    WeaponPaletteUpdate weaponPaletteUpdates[SH3VR_WEAPON_PALETTE_BONE_COUNT8] = {};
+    DWORD weaponPaletteUpdateCount = 0;
+    bool weaponPoseApplied = false;
+    if (weaponCandidate)
+    {
+        // Katana mesh 0 exposes only bone 0. Mesh 1 exposes the complete
+        // two-bone palette shared by the blade and handle, so defer the frozen
+        // baseline until that second draw. On following frames the completed
+        // palette is applied to both draws.
+        const bool incompleteKatanaPalette = weaponProfileIndex == 3 &&
+            vertexCount == 69u && primitiveCount == 122u;
+        if (!g_weaponPoseBaselinePaletteValid8 &&
+            !incompleteKatanaPalette)
+        {
+            DWORD capturedBones = 0;
+            for (DWORD bone = 0;
+                bone < SH3VR_WEAPON_PALETTE_BONE_COUNT8; ++bone)
+            {
+                if (g_weaponPosePaletteMasks8[bone] != 0x07u ||
+                    !IsWeaponAffineBone8(g_weaponPosePalette8[bone]))
+                {
+                    continue;
+                }
+                std::memcpy(g_weaponPoseBaselinePalette8[bone],
+                    g_weaponPosePalette8[bone],
+                    sizeof(g_weaponPoseBaselinePalette8[bone]));
+                g_weaponPoseBaselinePaletteMasks8[bone] = 0x07u;
+                if (capturedBones == 0)
+                {
+                    g_weaponPoseBaselinePivot8[0] =
+                        g_weaponPosePalette8[bone][3];
+                    g_weaponPoseBaselinePivot8[1] =
+                        g_weaponPosePalette8[bone][7];
+                    g_weaponPoseBaselinePivot8[2] =
+                        g_weaponPosePalette8[bone][11];
+                }
+                ++capturedBones;
+            }
+            // Bone 1 is the stable equipment-side pivot in the SH3 weapon
+            // models. Using it also prevents long weapons from orbiting around
+            // the blade or barrel end.
+            if (g_weaponPoseBaselinePaletteMasks8[1] == 0x07u)
+            {
+                g_weaponPoseBaselinePivot8[0] =
+                    g_weaponPoseBaselinePalette8[1][3];
+                g_weaponPoseBaselinePivot8[1] =
+                    g_weaponPoseBaselinePalette8[1][7];
+                g_weaponPoseBaselinePivot8[2] =
+                    g_weaponPoseBaselinePalette8[1][11];
+            }
+            g_weaponPoseBaselinePaletteValid8 = capturedBones > 0;
+            if (g_weaponPoseBaselinePaletteValid8)
+            {
+                const char* weaponName = g_activeWeaponPoseProfile8 >= 0
+                    ? g_weaponPoseProfiles8[g_activeWeaponPoseProfile8].displayName
+                    : "weapon";
+                Log("MotionControls: frozen %s palette captured with %u affine bones",
+                    weaponName, static_cast<unsigned>(capturedBones));
+            }
+        }
+        if (g_weaponPoseBaselinePaletteValid8 &&
+            !g_weaponPoseBaselineGripPointValid8)
+        {
+            CaptureWeaponGripPointFromGeometry8(device, minIndex, vertexCount);
+        }
+
+        float rotation[3][3] = {};
+        float translation[3] = {};
+        if (g_weaponPoseBaselinePaletteValid8 &&
+            BuildWeaponPoseDelta8(rotation, translation))
+        {
+            if (g_weaponPoseAbsolutePosition8)
+            {
+                // BuildWeaponPoseDelta8 returns the desired controller-space
+                // root position in absolute mode. Convert it to the uniform
+                // delta consumed by the common-pivot transform.
+                for (int axis = 0; axis < 3; ++axis)
+                    translation[axis] -= g_weaponPoseBaselinePivot8[axis];
+                if (g_weaponPoseBaselineGripPointValid8)
+                {
+                    const float gripFromPivot[3] = {
+                        g_weaponPoseBaselineGripPoint8[0] -
+                            g_weaponPoseBaselinePivot8[0],
+                        g_weaponPoseBaselineGripPoint8[1] -
+                            g_weaponPoseBaselinePivot8[1],
+                        g_weaponPoseBaselineGripPoint8[2] -
+                            g_weaponPoseBaselinePivot8[2]
+                    };
+                    for (int row = 0; row < 3; ++row)
+                    {
+                        translation[row] -=
+                            rotation[row][0] * gripFromPivot[0] +
+                            rotation[row][1] * gripFromPivot[1] +
+                            rotation[row][2] * gripFromPivot[2];
+                    }
+                }
+            }
+            for (DWORD bone = 0; bone < SH3VR_WEAPON_PALETTE_BONE_COUNT8;
+                ++bone)
+            {
+                if (g_weaponPosePaletteMasks8[bone] != 0x07u ||
+                    g_weaponPoseBaselinePaletteMasks8[bone] != 0x07u)
+                {
+                    continue;
+                }
+
+                WeaponPaletteUpdate& update = weaponPaletteUpdates[
+                    weaponPaletteUpdateCount];
+                update.startRegister = SH3VR_WEAPON_PALETTE_START8 +
+                    bone * 3u;
+                std::memcpy(update.original, g_weaponPosePalette8[bone],
+                    sizeof(update.original));
+                float modified[12] = {};
+                ApplyWeaponPoseDeltaToBone8(
+                    g_weaponPoseBaselinePalette8[bone], rotation,
+                    g_weaponPoseBaselinePivot8, translation, modified);
+                if (bone == g_weaponPoseDebugReferenceBone8)
+                {
+                    // Read orientation from the exact affine matrix that is
+                    // about to be submitted for the visible model. Remove
+                    // uniform scale first, then decompose its actual basis.
+                    float modelBasis[3][3] = {
+                        { modified[0], modified[1], modified[2] },
+                        { modified[4], modified[5], modified[6] },
+                        { modified[8], modified[9], modified[10] }
+                    };
+                    bool validBasis = true;
+                    for (int row = 0; row < 3; ++row)
+                    {
+                        const float length = std::sqrt(
+                            modelBasis[row][0] * modelBasis[row][0] +
+                            modelBasis[row][1] * modelBasis[row][1] +
+                            modelBasis[row][2] * modelBasis[row][2]);
+                        if (!std::isfinite(length) || length < 0.0001f)
+                        {
+                            validBasis = false;
+                            break;
+                        }
+                        for (int column = 0; column < 3; ++column)
+                            modelBasis[row][column] /= length;
+                    }
+                    if (validBasis)
+                    {
+                        constexpr float radiansToDegrees =
+                            57.29577951308232f;
+                        const float modelPitch = std::atan2(
+                            modelBasis[2][1], modelBasis[2][2]) *
+                            radiansToDegrees;
+                        const float modelYaw = std::asin((std::max)(-1.0f,
+                            (std::min)(1.0f, -modelBasis[2][0]))) *
+                            radiansToDegrees;
+                        const float modelRoll = std::atan2(
+                            modelBasis[1][0], modelBasis[0][0]) *
+                            radiansToDegrees;
+                        Interop8_SetWeaponDebugOrientation(true,
+                            g_activeWeaponPoseProfile8, modelPitch,
+                            modelYaw, modelRoll);
+                    }
+                }
+                if (FAILED(o_D3D8_SetVertexShaderConstant(device,
+                        update.startRegister, modified, 3)))
+                {
+                    break;
+                }
+                ++weaponPaletteUpdateCount;
+            }
+            weaponPoseApplied = weaponPaletteUpdateCount > 0;
+            if (!weaponPoseApplied)
+            {
+                const char* weaponName = g_activeWeaponPoseProfile8 >= 0
+                    ? g_weaponPoseProfiles8[g_activeWeaponPoseProfile8].displayName
+                    : "weapon";
+                Log("MotionControls: %s draw matched, but no affine bone palette was available for a safe pose update",
+                    weaponName);
+            }
+        }
+    }
+    PFN8_SetRenderState weaponSetRenderState = nullptr;
+    DWORD originalWeaponClipping = TRUE;
+    bool weaponClippingChanged = false;
+    if (weaponPoseApplied && g_weaponPoseDisableClipping8)
+    {
+        void** deviceVtable = *reinterpret_cast<void***>(device);
+        const auto weaponGetRenderState = reinterpret_cast<PFN8_GetRenderState>(
+            deviceVtable[VT8_GetRenderState]);
+        weaponSetRenderState = reinterpret_cast<PFN8_SetRenderState>(
+            deviceVtable[VT8_SetRenderState]);
+        constexpr DWORD kD3D8RenderStateClipping = 136u;
+        if (weaponGetRenderState && weaponSetRenderState &&
+            SUCCEEDED(weaponGetRenderState(device,
+                kD3D8RenderStateClipping, &originalWeaponClipping)) &&
+            SUCCEEDED(weaponSetRenderState(device,
+                kD3D8RenderStateClipping, FALSE)))
+        {
+            weaponClippingChanged = true;
+        }
+    }
     const HRESULT result = o_D3D8_DrawIndexedPrimitive(device, primitiveType,
         minIndex, vertexCount, startIndex, primitiveCount);
+    if (SUCCEEDED(result) && weaponPoseApplied &&
+        !g_fullSceneStereoReplayActive8)
+        CaptureLeftHandDesktopWeaponDepth8();
     TraceScreenSpaceDraw("DrawIndexedPrimitive", true, primitiveType,
-        primitiveCount, 0, _ReturnAddress());
+        primitiveCount, 0, caller);
     DWORD renderTargetTextureStage = 0;
     UINT renderTargetTextureWidth = 0;
     UINT renderTargetTextureHeight = 0;
@@ -3481,6 +5030,21 @@ static HRESULT WINAPI hk_D3D8_DrawIndexedPrimitive(IDirect3DDevice8* device,
         DuplicateIndexedPrimitiveForStereoProbe(primitiveType, minIndex,
             vertexCount, startIndex, primitiveCount);
     }
+    if (weaponPoseApplied)
+    {
+        for (DWORD index = 0; index < weaponPaletteUpdateCount; ++index)
+        {
+            o_D3D8_SetVertexShaderConstant(device,
+                weaponPaletteUpdates[index].startRegister,
+                weaponPaletteUpdates[index].original, 3);
+        }
+    }
+    if (weaponClippingChanged && weaponSetRenderState)
+    {
+        constexpr DWORD kD3D8RenderStateClipping = 136u;
+        weaponSetRenderState(device, kD3D8RenderStateClipping,
+            originalWeaponClipping);
+    }
     return result;
 }
 
@@ -3492,6 +5056,8 @@ static HRESULT WINAPI hk_D3D8_DrawPrimitiveUP(IDirect3DDevice8* device,
     LogFirstStereoDrawForShader("DrawPrimitiveUP", primitiveType,
         primitiveCount, false, false);
     const void* caller = _ReturnAddress();
+    LogMotionWeaponDrawCapture8(device, "DrawPrimitiveUP", primitiveType,
+        primitiveCount, false, 0, 0, 0, stride, caller);
     const HRESULT result = o_D3D8_DrawPrimitiveUP(device, primitiveType,
         primitiveCount, vertices, stride);
     TraceScreenSpaceDraw("DrawPrimitiveUP", false, primitiveType,
@@ -3564,11 +5130,14 @@ static HRESULT WINAPI hk_D3D8_DrawIndexedPrimitiveUP(IDirect3DDevice8* device,
     CaptureD3D8ShaderDraw(true, primitiveCount);
     LogFirstStereoDrawForShader("DrawIndexedPrimitiveUP", primitiveType,
         primitiveCount, true, false);
+    const void* caller = _ReturnAddress();
+    LogMotionWeaponDrawCapture8(device, "DrawIndexedPrimitiveUP", primitiveType,
+        primitiveCount, true, minIndex, vertexCount, 0, stride, caller);
     const HRESULT result = o_D3D8_DrawIndexedPrimitiveUP(device, primitiveType,
         minIndex, vertexCount, primitiveCount, indices, indexFormat, vertices,
         stride);
     TraceScreenSpaceDraw("DrawIndexedPrimitiveUP", true, primitiveType,
-        primitiveCount, stride, _ReturnAddress());
+        primitiveCount, stride, caller);
     if (SUCCEEDED(result) && g_enableUiStereoOverlay8 &&
         g_perDrawStereoProbeActive8 &&
         !g_fullSceneStereoReplayActive8 &&
@@ -3671,6 +5240,23 @@ static void MultiplyQuaternions(const float a[4], const float b[4], float output
     output[3] = a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2];
 }
 
+static bool ExtractYawQuaternion(const float orientation[4], float output[4])
+{
+    const float x = orientation[0];
+    const float y = orientation[1];
+    const float z = orientation[2];
+    const float w = orientation[3];
+    const float yaw = std::atan2(
+        2.0f * (w * y + x * z),
+        1.0f - 2.0f * (y * y + z * z));
+    const float halfYaw = yaw * 0.5f;
+    output[0] = 0.0f;
+    output[1] = std::sin(halfYaw);
+    output[2] = 0.0f;
+    output[3] = std::cos(halfYaw);
+    return NormalizeQuaternion(output);
+}
+
 static void RotateVectorByQuaternion(const float quaternion[4],
     const float input[3], float output[3])
 {
@@ -3716,6 +5302,1090 @@ static void BuildD3D8HeadViewRotation(const float quaternion[4], D3DMATRIX& outp
     output.m[3][3] = 1.0f;
 }
 
+static bool ReadControllerRelativePoseForWeapon8(int handIndex,
+    float orientation[4], float position[3], bool useAimPose = false)
+{
+    if (handIndex < 0 || handIndex > 1 || !orientation || !position)
+        return false;
+
+    Sh3VrControllerState controller = {};
+    Sh3VrHeadPose head = {};
+    if (!Interop8_ReadControllerState(&controller) ||
+        !Interop8_ReadHeadPose(&head) ||
+        ((useAimPose ? controller.aimPose[handIndex].flags :
+            controller.gripPose[handIndex].flags) &
+            (SH3VR_POSE_POSITION_VALID |
+            SH3VR_POSE_ORIENTATION_VALID)) !=
+            (SH3VR_POSE_POSITION_VALID | SH3VR_POSE_ORIENTATION_VALID) ||
+        (head.flags & (SH3VR_POSE_POSITION_VALID |
+            SH3VR_POSE_ORIENTATION_VALID)) !=
+            (SH3VR_POSE_POSITION_VALID | SH3VR_POSE_ORIENTATION_VALID))
+    {
+        return false;
+    }
+
+    float headOrientation[4] = {
+        head.orientation[0], head.orientation[1], head.orientation[2],
+        head.orientation[3]
+    };
+    const Sh3VrControllerPose& trackedPose = useAimPose
+        ? controller.aimPose[handIndex] : controller.gripPose[handIndex];
+    float handOrientation[4] = {
+        trackedPose.orientation[0],
+        trackedPose.orientation[1],
+        trackedPose.orientation[2],
+        trackedPose.orientation[3]
+    };
+    if (!NormalizeQuaternion(headOrientation) ||
+        !NormalizeQuaternion(handOrientation))
+    {
+        return false;
+    }
+
+    const float inverseHead[4] = {
+        -headOrientation[0], -headOrientation[1], -headOrientation[2],
+        headOrientation[3]
+    };
+    float relativeOrientation[4] = {};
+    MultiplyQuaternions(inverseHead, handOrientation, relativeOrientation);
+    if (!NormalizeQuaternion(relativeOrientation))
+        return false;
+
+    const float handOffset[3] = {
+        trackedPose.position[0] - head.position[0],
+        trackedPose.position[1] - head.position[1],
+        trackedPose.position[2] - head.position[2]
+    };
+    float relativePosition[3] = {};
+    RotateVectorByQuaternion(inverseHead, handOffset, relativePosition);
+
+    // OpenXR local space is +X right, +Y up, -Z forward. The D3D8 game
+    // convention used by the VR camera is +X right, +Y down, +Z forward.
+    orientation[0] = relativeOrientation[0];
+    orientation[1] = -relativeOrientation[1];
+    orientation[2] = -relativeOrientation[2];
+    orientation[3] = relativeOrientation[3];
+    position[0] = relativePosition[0] * g_worldScale8;
+    position[1] = -relativePosition[1] * g_worldScale8;
+    position[2] = -relativePosition[2] * g_worldScale8;
+    return NormalizeQuaternion(orientation);
+}
+
+static bool ReadRightHandRelativePoseForWeapon8(float orientation[4],
+    float position[3])
+{
+    return ReadControllerRelativePoseForWeapon8(1, orientation, position);
+}
+
+static bool ReadRightHandRelativeAimPose8(float orientation[4],
+    float position[3])
+{
+    return ReadControllerRelativePoseForWeapon8(1, orientation, position,
+        true);
+}
+
+static void BuildQuaternionRotation3x3(const float quaternion[4],
+    float matrix[3][3])
+{
+    const float x = quaternion[0];
+    const float y = quaternion[1];
+    const float z = quaternion[2];
+    const float w = quaternion[3];
+    matrix[0][0] = 1.0f - 2.0f * (y * y + z * z);
+    matrix[0][1] = 2.0f * (x * y - z * w);
+    matrix[0][2] = 2.0f * (x * z + y * w);
+    matrix[1][0] = 2.0f * (x * y + z * w);
+    matrix[1][1] = 1.0f - 2.0f * (x * x + z * z);
+    matrix[1][2] = 2.0f * (y * z - x * w);
+    matrix[2][0] = 2.0f * (x * z - y * w);
+    matrix[2][1] = 2.0f * (y * z + x * w);
+    matrix[2][2] = 1.0f - 2.0f * (x * x + y * y);
+}
+
+static void ApplyWeaponPoseDeltaToBone8(const float source[12],
+    const float rotation[3][3], const float pivot[3],
+    const float translation[3], float output[12])
+{
+    for (int row = 0; row < 3; ++row)
+    {
+        for (int column = 0; column < 3; ++column)
+        {
+            output[row * 4 + column] =
+                rotation[row][0] * source[column] +
+                rotation[row][1] * source[4 + column] +
+                rotation[row][2] * source[8 + column];
+        }
+        const float relativeOrigin[3] = {
+            source[3] - pivot[0],
+            source[7] - pivot[1],
+            source[11] - pivot[2]
+        };
+        output[row * 4 + 3] = pivot[row] +
+            rotation[row][0] * relativeOrigin[0] +
+            rotation[row][1] * relativeOrigin[1] +
+            rotation[row][2] * relativeOrigin[2] + translation[row];
+    }
+}
+
+static bool IsWeaponAffineBone8(const float matrix[12])
+{
+    if (!matrix)
+        return false;
+
+    for (int row = 0; row < 3; ++row)
+    {
+        const float x = matrix[row * 4 + 0];
+        const float y = matrix[row * 4 + 1];
+        const float z = matrix[row * 4 + 2];
+        const float lengthSquared = x * x + y * y + z * z;
+        if (!std::isfinite(lengthSquared) ||
+            std::fabs(lengthSquared - 1.0f) > 0.08f ||
+            !std::isfinite(matrix[row * 4 + 3]))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool BuildWeaponPoseDelta8(float rotation[3][3], float translation[3])
+{
+    PollWeaponIniHotReload8();
+    if (!g_enableWeaponPosePrototype8 || !rotation || !translation)
+        return false;
+
+    float orientation[4] = {};
+    float position[3] = {};
+    if (!ReadRightHandRelativePoseForWeapon8(orientation, position))
+        return false;
+
+    if (g_weaponPoseAbsolutePosition8)
+    {
+        if (!g_haveFlashlightViewPair8)
+            return false;
+
+        D3DMATRIX inverseVrView = {};
+        if (!InvertD3D8Matrix(g_flashlightVrView8, inverseVrView))
+            return false;
+
+        const bool rowVectorView = IsMainCameraView(g_flashlightVrView8);
+        float localPosition[3] = {
+            position[0], position[1], position[2]
+        };
+        // Weapon INI position is controller-local. Rotating the offset by the
+        // tracked grip orientation keeps manual calibration attached to the
+        // physical handle instead of the camera axes.
+        const float weaponWorldCompensation = g_worldScale8 /
+            SH3VR_DEFAULT_WORLD_SCALE;
+        const float compensatedWeaponOffset[3] = {
+            g_weaponPoseOffset8[0] * weaponWorldCompensation,
+            g_weaponPoseOffset8[1] * weaponWorldCompensation,
+            g_weaponPoseOffset8[2] * weaponWorldCompensation
+        };
+        float cameraGripOffset[3] = {};
+        RotateVectorByQuaternion(orientation, compensatedWeaponOffset,
+            cameraGripOffset);
+        for (int axis = 0; axis < 3; ++axis)
+            localPosition[axis] += cameraGripOffset[axis];
+        // Keep the grip just beyond the VR near plane. The blade is still
+        // free to approach the headset, but the entire weapon no longer gets
+        // clipped away when the controller touches the face.
+        localPosition[2] = (std::max)(localPosition[2],
+            g_weaponPoseMinimumForward8);
+        for (int component = 0; component < 3; ++component)
+        {
+            translation[component] = rowVectorView
+                ? localPosition[0] * inverseVrView.m[0][component] +
+                    localPosition[1] * inverseVrView.m[1][component] +
+                    localPosition[2] * inverseVrView.m[2][component] +
+                    inverseVrView.m[3][component]
+                : inverseVrView.m[component][0] * localPosition[0] +
+                    inverseVrView.m[component][1] * localPosition[1] +
+                    inverseVrView.m[component][2] * localPosition[2] +
+                    inverseVrView.m[component][3];
+        }
+
+        float localHandRotation[3][3] = {};
+        BuildQuaternionRotation3x3(orientation, localHandRotation);
+        float handWorldRotation[3][3] = {};
+        for (int row = 0; row < 3; ++row)
+        {
+            for (int column = 0; column < 3; ++column)
+            {
+                for (int k = 0; k < 3; ++k)
+                {
+                    handWorldRotation[row][column] += rowVectorView
+                        ? inverseVrView.m[k][row] *
+                            localHandRotation[k][column]
+                        : inverseVrView.m[row][k] *
+                            localHandRotation[k][column];
+                }
+            }
+        }
+
+        std::memset(rotation, 0, 9u * sizeof(float));
+        if (g_enableWeaponPoseRotation8)
+        {
+            float calibratedHandWorld[3][3] = {};
+            // Rotate the captured long knife axis onto the controller's
+            // forward axis. This is a per-weapon grip calibration, not part of
+            // the tracked controller orientation.
+            const float gripYawCos = std::cos(g_weaponPoseGripYawRadians8);
+            const float gripYawSin = std::sin(g_weaponPoseGripYawRadians8);
+            const float gripPitchCos = std::cos(
+                g_weaponPoseGripPitchRadians8);
+            const float gripPitchSin = std::sin(
+                g_weaponPoseGripPitchRadians8);
+            const float gripRollCos = std::cos(
+                g_weaponPoseGripRollRadians8);
+            const float gripRollSin = std::sin(
+                g_weaponPoseGripRollRadians8);
+            // Apply roll in controller-local space after mapping the model's
+            // long axis onto the controller. This aligns the visual handle
+            // with the physical Quest controller handle.
+            const float rollYaw[3][3] = {
+                { gripRollCos * gripYawCos, -gripRollSin,
+                    gripRollCos * gripYawSin },
+                { gripRollSin * gripYawCos, gripRollCos,
+                    gripRollSin * gripYawSin },
+                { -gripYawSin, 0.0f, gripYawCos }
+            };
+            const float gripCalibration[3][3] = {
+                { rollYaw[0][0],
+                    rollYaw[0][1] * gripPitchCos +
+                        rollYaw[0][2] * gripPitchSin,
+                    -rollYaw[0][1] * gripPitchSin +
+                        rollYaw[0][2] * gripPitchCos },
+                { rollYaw[1][0],
+                    rollYaw[1][1] * gripPitchCos +
+                        rollYaw[1][2] * gripPitchSin,
+                    -rollYaw[1][1] * gripPitchSin +
+                        rollYaw[1][2] * gripPitchCos },
+                { rollYaw[2][0],
+                    rollYaw[2][1] * gripPitchCos +
+                        rollYaw[2][2] * gripPitchSin,
+                    -rollYaw[2][1] * gripPitchSin +
+                        rollYaw[2][2] * gripPitchCos }
+            };
+            for (int row = 0; row < 3; ++row)
+            {
+                for (int column = 0; column < 3; ++column)
+                {
+                    for (int k = 0; k < 3; ++k)
+                    {
+                        calibratedHandWorld[row][column] +=
+                            handWorldRotation[row][k] *
+                            gripCalibration[k][column];
+                    }
+                }
+            }
+            // Convert the desired absolute controller orientation into the
+            // delta consumed by ApplyWeaponPoseDeltaToBone8. Using the
+            // controller orientation from the first rendered frame as the
+            // reference made identical INI values produce a different pose
+            // on every launch. The frozen weapon pivot bone is deterministic
+            // and also preserves relationships between multi-part weapons.
+            DWORD referenceBone =
+                g_weaponPoseBaselinePaletteMasks8[1] == 0x07u ? 1u : 0u;
+            if (g_weaponPoseBaselinePaletteMasks8[referenceBone] != 0x07u)
+            {
+                for (DWORD bone = 0;
+                    bone < SH3VR_WEAPON_PALETTE_BONE_COUNT8; ++bone)
+                {
+                    if (g_weaponPoseBaselinePaletteMasks8[bone] == 0x07u)
+                    {
+                        referenceBone = bone;
+                        break;
+                    }
+                }
+            }
+            g_weaponPoseDebugReferenceBone8 = referenceBone;
+            const float* baselineRotation =
+                g_weaponPoseBaselinePalette8[referenceBone];
+            for (int row = 0; row < 3; ++row)
+            {
+                for (int column = 0; column < 3; ++column)
+                {
+                    for (int k = 0; k < 3; ++k)
+                    {
+                        rotation[row][column] +=
+                            calibratedHandWorld[row][k] *
+                            baselineRotation[column * 4 + k];
+                    }
+                }
+            }
+        }
+        else
+        {
+            rotation[0][0] = 1.0f;
+            rotation[1][1] = 1.0f;
+            rotation[2][2] = 1.0f;
+        }
+        // WorldScale changes the stereo scale of the scene. Counter-scale the
+        // game-unit weapon mesh so its physical size remains identical to the
+        // calibrated size in sh3vr_weapons.ini while only the world changes.
+        const float compensatedWeaponScale = g_weaponPoseScale8 *
+            weaponWorldCompensation;
+        for (int row = 0; row < 3; ++row)
+            for (int column = 0; column < 3; ++column)
+                rotation[row][column] *= compensatedWeaponScale;
+
+        if (InterlockedIncrement(&g_weaponPoseApplications8) == 1)
+        {
+            Log("MotionControls: controller pose is being applied in game-world space to the frozen melee palette");
+        }
+        return true;
+    }
+
+    if (!g_weaponPoseBaselineValid8)
+    {
+        std::memcpy(g_weaponPoseBaselineOrientation8, orientation,
+            sizeof(g_weaponPoseBaselineOrientation8));
+        std::memcpy(g_weaponPoseBaselinePosition8, position,
+            sizeof(g_weaponPoseBaselinePosition8));
+        g_weaponPoseBaselineValid8 = true;
+        Log("MotionControls: melee weapon pose baseline captured; move and rotate the right controller to test the visual attachment");
+        return false;
+    }
+
+    const float inverseBaseline[4] = {
+        -g_weaponPoseBaselineOrientation8[0],
+        -g_weaponPoseBaselineOrientation8[1],
+        -g_weaponPoseBaselineOrientation8[2],
+        g_weaponPoseBaselineOrientation8[3]
+    };
+    float rotationQuaternion[4] = {};
+    MultiplyQuaternions(orientation, inverseBaseline, rotationQuaternion);
+    if (!NormalizeQuaternion(rotationQuaternion))
+        return false;
+
+    std::memset(rotation, 0, 9u * sizeof(float));
+    if (g_enableWeaponPoseRotation8)
+    {
+        BuildQuaternionRotation3x3(rotationQuaternion, rotation);
+    }
+    else
+    {
+        rotation[0][0] = 1.0f;
+        rotation[1][1] = 1.0f;
+        rotation[2][2] = 1.0f;
+    }
+    for (int axis = 0; axis < 3; ++axis)
+    {
+        translation[axis] = position[axis] -
+            g_weaponPoseBaselinePosition8[axis] + g_weaponPoseOffset8[axis];
+    }
+
+    if (InterlockedIncrement(&g_weaponPoseApplications8) == 1)
+    {
+        Log("MotionControls: controller pose is being applied to every affine bone in the active weapon palette");
+    }
+    return true;
+}
+
+bool D3D9Hook_GetMeleeWeaponHitbox(std::uint8_t gameWeapon,
+    float gripWorld[4], float tipWorld[4], float* radiusGameUnits)
+{
+    if (!gripWorld || !tipWorld || !radiusGameUnits)
+        return false;
+
+    int profileIndex = -1;
+    float reachMeters = 0.0f;
+    float radiusMeters = 0.0f;
+    switch (gameWeapon)
+    {
+    case 4u: // Knife
+        profileIndex = 0;
+        reachMeters = 0.38f;
+        radiusMeters = 0.10f;
+        break;
+    case 5u: // Steel Pipe
+        profileIndex = 1;
+        reachMeters = 0.82f;
+        radiusMeters = 0.14f;
+        break;
+    case 6u: // Katana
+        profileIndex = 3;
+        reachMeters = 0.95f;
+        radiusMeters = 0.12f;
+        break;
+    case 7u: // Maul
+        profileIndex = 2;
+        reachMeters = 0.76f;
+        radiusMeters = 0.22f;
+        break;
+    default:
+        return false;
+    }
+
+    PollWeaponIniHotReload8();
+    float orientation[4] = {};
+    float localPosition[3] = {};
+    if (!ReadRightHandRelativePoseForWeapon8(orientation, localPosition))
+    {
+        return false;
+    }
+
+    // Input is polled before the next frame establishes its view matrix.
+    // g_flashlightVrView8 intentionally retains the previous completed
+    // frame, which is the stable game-world transform needed by combat.
+    D3DMATRIX inverseVrView = {};
+    if (!InvertD3D8Matrix(g_flashlightVrView8, inverseVrView))
+        return false;
+    const bool rowVectorView = IsMainCameraView(g_flashlightVrView8);
+
+    // Use the same controller-local calibration as the visible model, but
+    // build the combat capsule independently of captured draw calls or mesh
+    // visibility. Weapon switching and render culling therefore cannot turn
+    // melee collision off.
+    const WeaponPoseProfile8& profile = g_weaponPoseProfiles8[profileIndex];
+    const float weaponWorldCompensation = g_worldScale8 /
+        SH3VR_DEFAULT_WORLD_SCALE;
+    const float calibratedOffset[3] = {
+        profile.position[0] * weaponWorldCompensation,
+        profile.position[1] * weaponWorldCompensation,
+        profile.position[2] * weaponWorldCompensation
+    };
+    float rotatedOffset[3] = {};
+    RotateVectorByQuaternion(orientation, calibratedOffset, rotatedOffset);
+    for (int axis = 0; axis < 3; ++axis)
+        localPosition[axis] += rotatedOffset[axis];
+
+    const float controllerForward[3] = { 0.0f, 0.0f, 1.0f };
+    float localForward[3] = {};
+    RotateVectorByQuaternion(orientation, controllerForward, localForward);
+    float worldForward[3] = {};
+    for (int component = 0; component < 3; ++component)
+    {
+        gripWorld[component] = rowVectorView
+            ? localPosition[0] * inverseVrView.m[0][component] +
+                localPosition[1] * inverseVrView.m[1][component] +
+                localPosition[2] * inverseVrView.m[2][component] +
+                inverseVrView.m[3][component]
+            : inverseVrView.m[component][0] * localPosition[0] +
+                inverseVrView.m[component][1] * localPosition[1] +
+                inverseVrView.m[component][2] * localPosition[2] +
+                inverseVrView.m[component][3];
+        worldForward[component] = rowVectorView
+            ? localForward[0] * inverseVrView.m[0][component] +
+                localForward[1] * inverseVrView.m[1][component] +
+                localForward[2] * inverseVrView.m[2][component]
+            : inverseVrView.m[component][0] * localForward[0] +
+                inverseVrView.m[component][1] * localForward[1] +
+                inverseVrView.m[component][2] * localForward[2];
+    }
+    const float forwardLength = std::sqrt(
+        worldForward[0] * worldForward[0] +
+        worldForward[1] * worldForward[1] +
+        worldForward[2] * worldForward[2]);
+    if (!std::isfinite(forwardLength) || forwardLength < 0.001f)
+        return false;
+    for (int axis = 0; axis < 3; ++axis)
+        worldForward[axis] /= forwardLength;
+
+    gripWorld[3] = 1.0f;
+    const float reachGameUnits = reachMeters * g_worldScale8;
+    for (int axis = 0; axis < 3; ++axis)
+        tipWorld[axis] = gripWorld[axis] +
+            worldForward[axis] * reachGameUnits;
+    tipWorld[3] = 1.0f;
+    *radiusGameUnits = radiusMeters * g_worldScale8;
+    return true;
+}
+
+static int FirearmProfileIndex8(std::uint8_t gameWeapon)
+{
+    switch (gameWeapon)
+    {
+    case 0u: return 5; // Handgun
+    case 1u: return 6; // Shotgun
+    case 2u: return 7; // Submachine Gun
+    case 3u: return 4; // Stun Gun
+    default: return -1;
+    }
+}
+
+bool D3D9Hook_GetFirearmAimRay(std::uint8_t gameWeapon,
+    float muzzleWorld[4], float rayEndWorld[4])
+{
+    if (!muzzleWorld || !rayEndWorld)
+        return false;
+
+    const int profileIndex = FirearmProfileIndex8(gameWeapon);
+    if (profileIndex < 0)
+        return false;
+
+    PollWeaponIniHotReload8();
+    float orientation[4] = {};
+    float localPosition[3] = {};
+    if (!ReadRightHandRelativePoseForWeapon8(orientation, localPosition) ||
+        !g_haveFlashlightViewPair8)
+    {
+        return false;
+    }
+
+    D3DMATRIX inverseVrView = {};
+    if (!InvertD3D8Matrix(g_flashlightVrView8, inverseVrView))
+        return false;
+    const bool rowVectorView = IsMainCameraView(g_flashlightVrView8);
+
+    const WeaponPoseProfile8& profile = g_weaponPoseProfiles8[profileIndex];
+    const float weaponWorldCompensation = g_worldScale8 /
+        SH3VR_DEFAULT_WORLD_SCALE;
+    const float calibratedOffset[3] = {
+        profile.position[0] * weaponWorldCompensation,
+        profile.position[1] * weaponWorldCompensation,
+        profile.position[2] * weaponWorldCompensation
+    };
+    float rotatedOffset[3] = {};
+    RotateVectorByQuaternion(orientation, calibratedOffset, rotatedOffset);
+    for (int axis = 0; axis < 3; ++axis)
+        localPosition[axis] += rotatedOffset[axis];
+
+    // Grip pose owns the rendered handle and its calibrated position. OpenXR
+    // aim pose owns the pointing ray; on Quest controllers these axes are not
+    // interchangeable.
+    float aimOrientation[4] = {};
+    float unusedAimPosition[3] = {};
+    if (!ReadRightHandRelativeAimPose8(aimOrientation,
+        unusedAimPosition))
+    {
+        return false;
+    }
+    // Quest's OpenXR aim pose is intentionally independent from the rendered
+    // grip pose, but its factory pointing axis sits above SH3's visible gun
+    // barrels. Apply a controller-local calibration before rotating the ray.
+    // In the game's camera convention +Y points down, so a negative pitch
+    // lowers the ray and reticle. The same corrected ray feeds native damage
+    // and the stereo dot, keeping the two results exactly aligned.
+    const float pitch = profile.aimPitchRadians;
+    const float yaw = profile.aimYawRadians;
+    const float controllerForward[3] = {
+        std::sin(yaw) * std::cos(pitch),
+        -std::sin(pitch),
+        std::cos(yaw) * std::cos(pitch)
+    };
+    float localForward[3] = {};
+    RotateVectorByQuaternion(aimOrientation, controllerForward,
+        localForward);
+    const float localForwardLength = std::sqrt(
+        localForward[0] * localForward[0] +
+        localForward[1] * localForward[1] +
+        localForward[2] * localForward[2]);
+    if (!std::isfinite(localForwardLength) || localForwardLength < 0.001f)
+        return false;
+    for (int axis = 0; axis < 3; ++axis)
+        localForward[axis] /= localForwardLength;
+
+    // Start the native ray at the visible barrel rather than at Heather's
+    // old animation socket. Distances are intentionally independent of mesh
+    // scale and only follow the game's metres-to-world-units conversion.
+    const float muzzleForwardMeters = gameWeapon == 3u ? 0.18f :
+        (gameWeapon == 0u ? 0.26f : (gameWeapon == 1u ? 0.78f : 0.48f));
+    for (int axis = 0; axis < 3; ++axis)
+    {
+        localPosition[axis] += localForward[axis] *
+            muzzleForwardMeters * g_worldScale8;
+    }
+
+    float worldForward[3] = {};
+    for (int component = 0; component < 3; ++component)
+    {
+        muzzleWorld[component] = rowVectorView
+            ? localPosition[0] * inverseVrView.m[0][component] +
+                localPosition[1] * inverseVrView.m[1][component] +
+                localPosition[2] * inverseVrView.m[2][component] +
+                inverseVrView.m[3][component]
+            : inverseVrView.m[component][0] * localPosition[0] +
+                inverseVrView.m[component][1] * localPosition[1] +
+                inverseVrView.m[component][2] * localPosition[2] +
+                inverseVrView.m[component][3];
+        worldForward[component] = rowVectorView
+            ? localForward[0] * inverseVrView.m[0][component] +
+                localForward[1] * inverseVrView.m[1][component] +
+                localForward[2] * inverseVrView.m[2][component]
+            : inverseVrView.m[component][0] * localForward[0] +
+                inverseVrView.m[component][1] * localForward[1] +
+                inverseVrView.m[component][2] * localForward[2];
+    }
+    const float worldForwardLength = std::sqrt(
+        worldForward[0] * worldForward[0] +
+        worldForward[1] * worldForward[1] +
+        worldForward[2] * worldForward[2]);
+    if (!std::isfinite(worldForwardLength) || worldForwardLength < 0.001f)
+        return false;
+    for (int axis = 0; axis < 3; ++axis)
+        worldForward[axis] /= worldForwardLength;
+
+    const float rangeMeters = gameWeapon == 3u ? 2.5f : 60.0f;
+    muzzleWorld[3] = 1.0f;
+    for (int axis = 0; axis < 3; ++axis)
+    {
+        rayEndWorld[axis] = muzzleWorld[axis] + worldForward[axis] *
+            rangeMeters * g_worldScale8;
+    }
+    rayEndWorld[3] = 1.0f;
+    return true;
+}
+
+bool D3D9Hook_GetActiveFirearmAimRay(float muzzleWorld[4],
+    float rayEndWorld[4])
+{
+    // The visual signature is already the authoritative weapon identity for
+    // motion attachment. Unlike SH3's transient gameplay byte, it remains
+    // stable across animation phases and weapon changes.
+    const int profileIndex = g_activeWeaponPoseProfile8;
+    std::uint8_t canonicalWeapon = 0xFFu;
+    switch (profileIndex)
+    {
+    case 4: canonicalWeapon = 3u; break; // Stun Gun
+    case 5: canonicalWeapon = 0u; break; // Handgun
+    case 6: canonicalWeapon = 1u; break; // Shotgun
+    case 7: canonicalWeapon = 2u; break; // Submachine Gun
+    default: return false;
+    }
+    return D3D9Hook_GetFirearmAimRay(canonicalWeapon, muzzleWorld,
+        rayEndWorld);
+}
+
+static bool IsWritableMemoryRange(void* address, SIZE_T size)
+{
+    if (!address || size == 0)
+        return false;
+
+    MEMORY_BASIC_INFORMATION memory = {};
+    if (VirtualQuery(address, &memory, sizeof(memory)) == 0 ||
+        memory.State != MEM_COMMIT ||
+        (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0)
+    {
+        return false;
+    }
+
+    const DWORD protection = memory.Protect & 0xFFu;
+    const bool writable =
+        protection == PAGE_READWRITE ||
+        protection == PAGE_WRITECOPY ||
+        protection == PAGE_EXECUTE_READWRITE ||
+        protection == PAGE_EXECUTE_WRITECOPY;
+    if (!writable)
+        return false;
+
+    const auto rangeStart = reinterpret_cast<std::uintptr_t>(address);
+    const auto rangeEnd = rangeStart + size;
+    const auto regionStart =
+        reinterpret_cast<std::uintptr_t>(memory.BaseAddress);
+    const auto regionEnd = regionStart + memory.RegionSize;
+    return rangeEnd >= rangeStart && rangeEnd <= regionEnd;
+}
+
+static bool GetSupportedCameraModState(BYTE** moduleBaseOutput,
+    BYTE** pluginStateOutput)
+{
+    HMODULE cameraMod = GetModuleHandleA("OTSMod.dll");
+    if (!cameraMod)
+        return false;
+
+    auto* moduleBase = reinterpret_cast<BYTE*>(cameraMod);
+    const auto* dosHeader = reinterpret_cast<const IMAGE_DOS_HEADER*>(moduleBase);
+    if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE)
+        return false;
+    const auto* ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+        moduleBase + dosHeader->e_lfanew);
+    if (ntHeaders->Signature != IMAGE_NT_SIGNATURE ||
+        ntHeaders->FileHeader.TimeDateStamp !=
+            SH3VR_CAMERA_MOD_SUPPORTED_TIMESTAMP ||
+        ntHeaders->OptionalHeader.SizeOfImage <
+            SH3VR_CAMERA_MOD_GAME_MODULE_POINTER_RVA + sizeof(void*))
+    {
+        if (InterlockedCompareExchange(&g_cameraModLayoutLogState8, -1, 0) == 0)
+        {
+            Log("Camera Mod integration disabled: unsupported OTSMod.dll "
+                "layout");
+        }
+        return false;
+    }
+
+    auto** pluginStatePointer = reinterpret_cast<BYTE**>(
+        moduleBase + SH3VR_CAMERA_MOD_STATE_POINTER_RVA);
+    BYTE* pluginState = *pluginStatePointer;
+    if (!pluginState)
+        return false;
+
+    if (moduleBaseOutput)
+        *moduleBaseOutput = moduleBase;
+    if (pluginStateOutput)
+        *pluginStateOutput = pluginState;
+
+    if (InterlockedCompareExchange(&g_cameraModLayoutLogState8, 1, 0) == 0)
+    {
+        Log("Camera Mod memory integration active for the supported "
+            "OTSMod.dll build");
+    }
+    return true;
+}
+
+static bool ApplyCameraModYawDelta(float degrees, float* updatedYaw)
+{
+    BYTE* pluginState = nullptr;
+    if (!GetSupportedCameraModState(nullptr, &pluginState))
+        return false;
+
+    float* cameraYaw = reinterpret_cast<float*>(
+        pluginState + SH3VR_CAMERA_MOD_YAW_OFFSET);
+    if (!IsWritableMemoryRange(cameraYaw, sizeof(*cameraYaw)) ||
+        !std::isfinite(*cameraYaw) || std::fabs(*cameraYaw) > 100000.0f)
+    {
+        return false;
+    }
+
+    float yaw = *cameraYaw + degrees;
+    while (yaw > 180.0f)
+        yaw -= 360.0f;
+    while (yaw < -180.0f)
+        yaw += 360.0f;
+    *cameraYaw = yaw;
+    if (updatedYaw)
+        *updatedYaw = yaw;
+    return true;
+}
+
+static bool ReadCameraModYaw(float* yawOutput)
+{
+    if (!yawOutput)
+        return false;
+
+    BYTE* pluginState = nullptr;
+    if (!GetSupportedCameraModState(nullptr, &pluginState) ||
+        pluginState[SH3VR_CAMERA_MOD_ENABLED_OFFSET] == 0)
+    {
+        return false;
+    }
+
+    float* cameraYaw = reinterpret_cast<float*>(
+        pluginState + SH3VR_CAMERA_MOD_YAW_OFFSET);
+    if (!IsWritableMemoryRange(cameraYaw, sizeof(*cameraYaw)) ||
+        !std::isfinite(*cameraYaw) || std::fabs(*cameraYaw) > 100000.0f)
+    {
+        return false;
+    }
+
+    *yawOutput = *cameraYaw;
+    return true;
+}
+
+static void TryAutoLoadCameraModFirstPerson()
+{
+    if (!g_autoLoadCameraModFirstPerson8 || g_cameraModAutoLoadDone8)
+        return;
+
+    Sh3VrHeadPose pose = {};
+    if (!Interop8_ReadHeadPose(&pose) ||
+        (pose.flags & SH3VR_POSE_ORIENTATION_VALID) == 0)
+    {
+        return;
+    }
+
+    BYTE* moduleBase = nullptr;
+    BYTE* pluginState = nullptr;
+    if (!GetSupportedCameraModState(&moduleBase, &pluginState))
+        return;
+
+    BYTE* settingsStart = pluginState + SH3VR_CAMERA_MOD_ENABLED_OFFSET;
+    const SIZE_T settingsSize =
+        SH3VR_CAMERA_MOD_HIDE_PLAYER_OFFSET -
+        SH3VR_CAMERA_MOD_ENABLED_OFFSET + sizeof(BYTE);
+    if (!IsWritableMemoryRange(settingsStart, settingsSize))
+        return;
+
+    auto** gameModulePointer = reinterpret_cast<BYTE**>(
+        moduleBase + SH3VR_CAMERA_MOD_GAME_MODULE_POINTER_RVA);
+    if (*gameModulePointer == nullptr)
+        return;
+
+    using CameraModAction = void(__cdecl*)();
+    const auto loadFirstPersonPreset = reinterpret_cast<CameraModAction>(
+        moduleBase + SH3VR_CAMERA_MOD_LOAD_FPS_PRESET_RVA);
+    const auto toggleCameraMod = reinterpret_cast<CameraModAction>(
+        moduleBase + SH3VR_CAMERA_MOD_TOGGLE_RVA);
+
+    loadFirstPersonPreset();
+    if (pluginState[SH3VR_CAMERA_MOD_ENABLED_OFFSET] == 0)
+        toggleCameraMod();
+
+    if (pluginState[SH3VR_CAMERA_MOD_ENABLED_OFFSET] != 0 &&
+        pluginState[SH3VR_CAMERA_MOD_HIDE_PLAYER_OFFSET] != 0)
+    {
+        g_cameraModAutoLoadDone8 = true;
+        Log("Camera Mod First Person preset auto-loaded and Camera Mod "
+            "enabled");
+    }
+}
+
+static void ResetRoomscaleMovement(const Sh3VrHeadPose* pose)
+{
+    InterlockedExchange(&g_roomscaleMovementMask8, SH3VR_ROOMSCALE_NONE);
+    g_roomscaleLastPoseTime8 = 0;
+    g_roomscaleMovementPulse8 = 0.0f;
+    g_roomscaleSmoothedVelocity8[0] = 0.0f;
+    g_roomscaleSmoothedVelocity8[1] = 0.0f;
+    if (pose && g_headOrientationReferenceValid8)
+    {
+        g_headPositionReference8[0] = pose->position[0];
+        g_headPositionReference8[2] = pose->position[2];
+    }
+}
+
+static void UpdateRoomscaleMovement(bool immersive)
+{
+    Sh3VrHeadPose pose = {};
+    const bool havePose = Interop8_ReadHeadPose(&pose) &&
+        (pose.flags & SH3VR_POSE_POSITION_VALID) != 0 &&
+        (pose.flags & SH3VR_POSE_ORIENTATION_VALID) != 0;
+    if (!g_enableRoomscale8 || !immersive ||
+        !g_headOrientationReferenceValid8 || !havePose)
+    {
+        ResetRoomscaleMovement(havePose ? &pose : nullptr);
+        return;
+    }
+
+    float cameraModYawDegrees = 0.0f;
+    if (!ReadCameraModYaw(&cameraModYawDegrees))
+    {
+        ResetRoomscaleMovement(&pose);
+        return;
+    }
+
+    if (pose.predictedDisplayTime == g_roomscaleLastPoseTime8)
+        return;
+
+    if (g_roomscaleLastPoseTime8 == 0)
+    {
+        g_roomscaleLastPoseTime8 = pose.predictedDisplayTime;
+        InterlockedExchange(&g_roomscaleMovementMask8,
+            SH3VR_ROOMSCALE_NONE);
+        return;
+    }
+
+    const double elapsedSeconds = static_cast<double>(
+        pose.predictedDisplayTime - g_roomscaleLastPoseTime8) * 1.0e-9;
+    g_roomscaleLastPoseTime8 = pose.predictedDisplayTime;
+    if (!(elapsedSeconds > 0.0 && elapsedSeconds < 0.25))
+    {
+        ResetRoomscaleMovement(&pose);
+        return;
+    }
+
+    const float stageOffsetX =
+        pose.position[0] - g_headPositionReference8[0];
+    const float stageOffsetZ =
+        pose.position[2] - g_headPositionReference8[2];
+    const float stageDistance = std::sqrt(
+        stageOffsetX * stageOffsetX + stageOffsetZ * stageOffsetZ);
+    if (!std::isfinite(stageDistance) ||
+        stageDistance > SH3VR_ROOMSCALE_TRACKING_JUMP_METERS)
+    {
+        Log("Roomscale tracking discontinuity ignored; horizontal origin "
+            "was recentered");
+        ResetRoomscaleMovement(&pose);
+        return;
+    }
+
+    float consumedStageX = 0.0f;
+    float consumedStageZ = 0.0f;
+    if (stageDistance > SH3VR_ROOMSCALE_FOLLOW_RADIUS_METERS)
+    {
+        const float consumedFraction =
+            (stageDistance - SH3VR_ROOMSCALE_FOLLOW_RADIUS_METERS) /
+            stageDistance;
+        consumedStageX = stageOffsetX * consumedFraction;
+        consumedStageZ = stageOffsetZ * consumedFraction;
+        g_headPositionReference8[0] += consumedStageX;
+        g_headPositionReference8[2] += consumedStageZ;
+    }
+
+    const float inverseReference[4] = {
+        -g_headOrientationReference8[0],
+        -g_headOrientationReference8[1],
+        -g_headOrientationReference8[2],
+         g_headOrientationReference8[3]
+    };
+    const float consumedStage[3] = {
+        consumedStageX, 0.0f, consumedStageZ
+    };
+    float consumedReferenceLocal[3] = {};
+    RotateVectorByQuaternion(inverseReference, consumedStage,
+        consumedReferenceLocal);
+
+    const float rawRightVelocity = consumedReferenceLocal[0] /
+        static_cast<float>(elapsedSeconds);
+    const float rawForwardVelocity = -consumedReferenceLocal[2] /
+        static_cast<float>(elapsedSeconds);
+    const float smoothing = std::clamp(
+        static_cast<float>(elapsedSeconds) * 14.0f, 0.0f, 1.0f);
+    g_roomscaleSmoothedVelocity8[0] += smoothing *
+        (rawRightVelocity - g_roomscaleSmoothedVelocity8[0]);
+    g_roomscaleSmoothedVelocity8[1] += smoothing *
+        (rawForwardVelocity - g_roomscaleSmoothedVelocity8[1]);
+
+    float current[4] = {
+        pose.orientation[0], pose.orientation[1],
+        pose.orientation[2], pose.orientation[3]
+    };
+    if (!NormalizeQuaternion(current))
+    {
+        InterlockedExchange(&g_roomscaleMovementMask8,
+            SH3VR_ROOMSCALE_NONE);
+        return;
+    }
+    float relativeOrientation[4] = {};
+    MultiplyQuaternions(inverseReference, current, relativeOrientation);
+    if (!NormalizeQuaternion(relativeOrientation))
+    {
+        InterlockedExchange(&g_roomscaleMovementMask8,
+            SH3VR_ROOMSCALE_NONE);
+        return;
+    }
+
+    const float x = relativeOrientation[0];
+    const float y = relativeOrientation[1];
+    const float z = relativeOrientation[2];
+    const float w = relativeOrientation[3];
+    const float openXrYaw = std::atan2(
+        2.0f * (w * y + x * z),
+        1.0f - 2.0f * (y * y + z * z));
+    constexpr float degreesToRadians = 0.01745329251994329577f;
+    const float virtualRightYaw =
+        cameraModYawDegrees * degreesToRadians - openXrYaw;
+    const float yawCos = std::cos(virtualRightYaw);
+    const float yawSin = std::sin(virtualRightYaw);
+    // OpenXR stage translation and Camera Mod movement use opposite signs on
+    // both horizontal axes. Negate the final camera-relative vector so a real
+    // step and Heather's movement always point in the same direction.
+    const float cameraForwardVelocity = -(
+        g_roomscaleSmoothedVelocity8[1] * yawCos +
+        g_roomscaleSmoothedVelocity8[0] * yawSin);
+    const float cameraRightVelocity = -(
+        g_roomscaleSmoothedVelocity8[0] * yawCos -
+        g_roomscaleSmoothedVelocity8[1] * yawSin);
+    const float speed = std::sqrt(
+        cameraForwardVelocity * cameraForwardVelocity +
+        cameraRightVelocity * cameraRightVelocity);
+
+    std::uint32_t movementMask = SH3VR_ROOMSCALE_NONE;
+    if (std::isfinite(speed) &&
+        speed >= SH3VR_ROOMSCALE_START_SPEED_METERS_PER_SECOND)
+    {
+        constexpr float directionThreshold = 0.32f;
+        const float componentThreshold = speed * directionThreshold;
+        if (cameraForwardVelocity > componentThreshold)
+            movementMask |= SH3VR_ROOMSCALE_FORWARD;
+        else if (cameraForwardVelocity < -componentThreshold)
+            movementMask |= SH3VR_ROOMSCALE_BACKWARD;
+        if (cameraRightVelocity > componentThreshold)
+            movementMask |= SH3VR_ROOMSCALE_RIGHT;
+        else if (cameraRightVelocity < -componentThreshold)
+            movementMask |= SH3VR_ROOMSCALE_LEFT;
+    }
+    // Camera Mod exposes digital movement keys, while OpenXR reports analog
+    // physical velocity. Pulse the digital keys proportionally instead of
+    // holding them continuously for every movement above the dead zone. This
+    // keeps slow physical steps from producing a full-speed in-game stride.
+    float movementDuty = 0.0f;
+    if (movementMask != SH3VR_ROOMSCALE_NONE)
+    {
+        movementDuty = std::clamp(
+            speed * g_roomscaleHeightScale8 /
+                g_roomscaleFullKeySpeedMetersPerSecond8,
+            0.0f, 1.0f);
+        g_roomscaleMovementPulse8 += movementDuty;
+        if (g_roomscaleMovementPulse8 >= 1.0f)
+            g_roomscaleMovementPulse8 -= 1.0f;
+        else
+            movementMask = SH3VR_ROOMSCALE_NONE;
+    }
+    else
+    {
+        g_roomscaleMovementPulse8 = 0.0f;
+    }
+
+    InterlockedExchange(&g_roomscaleMovementMask8,
+        static_cast<LONG>(movementMask));
+
+    if (movementMask != SH3VR_ROOMSCALE_NONE)
+    {
+        const LONG count = InterlockedIncrement(&g_roomscaleMovementLogCount8);
+        if (count <= 8 || count % 900 == 0)
+        {
+            Log("Roomscale movement %d: mask 0x%X, speed cm/s %d, duty "
+                "x1000 %d, height scale x1000 %d", count, movementMask,
+                static_cast<int>(std::lround(speed * 100.0f)),
+                static_cast<int>(std::lround(movementDuty * 1000.0f)),
+                static_cast<int>(std::lround(
+                    g_roomscaleHeightScale8 * 1000.0f)));
+        }
+    }
+}
+
+static void UpdateCameraModSnapTurn()
+{
+    if (!g_enableCameraModSnapTurn8 ||
+        GetModuleHandleA("OTSMod.dll") == nullptr)
+    {
+        InterlockedExchange(&g_cameraModCharacterAlignEndTick8, 0);
+        return;
+    }
+
+    Sh3VrControllerState controller = {};
+    if (!Interop8_ReadControllerState(&controller) || controller.active == 0 ||
+        controller.predictedDisplayTime == g_cameraModLastControllerTime8)
+    {
+        return;
+    }
+    g_cameraModLastControllerTime8 = controller.predictedDisplayTime;
+
+    const float axis = controller.thumbstick[1][0];
+    const float magnitude = axis < 0.0f ? -axis : axis;
+    constexpr float releaseThreshold = 0.35f;
+    if (magnitude <= releaseThreshold)
+    {
+        g_cameraModSnapTurnLatched8 = false;
+        return;
+    }
+    if (g_cameraModSnapTurnLatched8 ||
+        magnitude < g_cameraModSnapTurnActivation8)
+    {
+        return;
+    }
+
+    g_cameraModSnapTurnLatched8 = true;
+    // Camera Mod stores horizontal yaw in degrees. Updating its own state keeps
+    // character-relative movement, the game camera and both stereo eyes in the
+    // same coordinate system. Its positive yaw follows positive stick X.
+    const float yawDelta = axis < 0.0f
+        ? -g_cameraModSnapTurnDegrees8
+        : g_cameraModSnapTurnDegrees8;
+    float cameraModYaw = 0.0f;
+    if (!ApplyCameraModYawDelta(yawDelta, &cameraModYaw))
+        return;
+
+    // Camera Mod rotates only its detached camera. A short forward pulse uses
+    // the mod's proven 2D movement path so the game can align Heather without
+    // writing to an unverified player-orientation address.
+    InterlockedExchange(&g_cameraModCharacterAlignEndTick8,
+        static_cast<LONG>(GetTickCount() +
+            g_cameraModCharacterAlignMilliseconds8));
+
+    const LONG count = InterlockedIncrement(&g_cameraModSnapTurnCount8);
+    if (count <= 16 || count % 100 == 0)
+    {
+        Log("Camera Mod snap turn %d: %s, Camera Mod yaw x10 %d, "
+            "Heather alignment pulse %u ms",
+            count, axis < 0.0f ? "left" : "right",
+            static_cast<int>(std::lround(cameraModYaw * 10.0f)),
+            g_cameraModCharacterAlignMilliseconds8);
+    }
+}
+
 static bool ReadRelativeHeadPose(float orientation[4], float position[3])
 {
     Sh3VrHeadPose pose = {};
@@ -3747,7 +6417,8 @@ static bool ReadRelativeHeadPose(float orientation[4], float position[3])
         if (g_headPoseCalibrationStartFrame8 < 0)
         {
             g_headPoseCalibrationStartFrame8 = presentFrame;
-            Log("6-DOF head pose calibration started; keep the headset level");
+            Log("6-DOF yaw calibration started; headset pitch and roll will "
+                "be leveled automatically");
             return false;
         }
         if (presentFrame - g_headPoseCalibrationStartFrame8 <
@@ -3756,12 +6427,41 @@ static bool ReadRelativeHeadPose(float orientation[4], float position[3])
             return false;
         }
 
-        std::memcpy(g_headOrientationReference8, current,
-            sizeof(g_headOrientationReference8));
+        // Recenter only yaw. OpenXR provides gravity-aligned pitch and roll,
+        // so retaining them makes the initial horizon level without requiring
+        // the player to hold the headset straight during startup.
+        if (!ExtractYawQuaternion(current, g_headOrientationReference8))
+            return false;
         std::memcpy(g_headPositionReference8, pose.position,
             sizeof(g_headPositionReference8));
         g_headOrientationReferenceValid8 = true;
-        Log("6-DOF head pose reference captured after the calibration delay");
+        if (g_enableRoomscale8 && pose.position[1] >= 1.0f &&
+            pose.position[1] <= 2.3f)
+        {
+            constexpr float eyeToTopMeters = 0.10f;
+            const float targetEyeHeight = (std::max)(1.0f,
+                g_roomscalePlayerHeightMeters8 - eyeToTopMeters);
+            g_roomscaleHeightScale8 = std::clamp(
+                targetEyeHeight / pose.position[1], 0.70f, 1.40f);
+            g_roomscaleHeightLogged8 = true;
+            Log("Roomscale height calibrated: measured HMD height %d cm, "
+                "target player height %d cm, tracking scale x1000 %d",
+                static_cast<int>(std::lround(pose.position[1] * 100.0f)),
+                static_cast<int>(std::lround(
+                    g_roomscalePlayerHeightMeters8 * 100.0f)),
+                static_cast<int>(std::lround(
+                    g_roomscaleHeightScale8 * 1000.0f)));
+        }
+        else if (g_enableRoomscale8 && !g_roomscaleHeightLogged8)
+        {
+            g_roomscaleHeightLogged8 = true;
+            g_roomscaleHeightScale8 = 1.0f;
+            Log("Roomscale height normalization unavailable because the "
+                "OpenXR reference space did not provide a plausible floor "
+                "height; tracking scale remains 1.0");
+        }
+        Log("6-DOF yaw reference captured after the calibration delay; "
+            "pitch and roll use the OpenXR gravity-aligned horizon");
     }
 
     if (!g_haveLatchedFrameHeadPose8)
@@ -3785,6 +6485,8 @@ static bool ReadRelativeHeadPose(float orientation[4], float position[3])
     orientation[0] = -orientation[0];
     orientation[2] = -orientation[2];
 
+    UpdateCameraModSnapTurn();
+
     const float openXrDelta[3] = {
         pose.position[0] - g_headPositionReference8[0],
         pose.position[1] - g_headPositionReference8[1],
@@ -3797,9 +6499,14 @@ static bool ReadRelativeHeadPose(float orientation[4], float position[3])
     // +X right, +Y up and -Z forward. Position is reported in app-space axes,
     // so first rotate it into the reference headset's local axes. Then convert
     // meters to SH3's centimeter-like world units.
-    position[0] = headLocalDelta[0] * SH3VR_GAME_UNITS_PER_METER;
-    position[1] = -headLocalDelta[1] * SH3VR_GAME_UNITS_PER_METER;
-    position[2] = -headLocalDelta[2] * SH3VR_GAME_UNITS_PER_METER;
+    const float trackingScale = g_enableRoomscale8
+        ? g_roomscaleHeightScale8 : 1.0f;
+    position[0] = headLocalDelta[0] * g_worldScale8 *
+        trackingScale;
+    position[1] = -headLocalDelta[1] * g_worldScale8 *
+        trackingScale;
+    position[2] = -headLocalDelta[2] * g_worldScale8 *
+        trackingScale;
 
     // Render parallel stereo cameras on alternating game frames. Left is
     // negative camera X and right is positive camera X.
@@ -3807,7 +6514,7 @@ static bool ReadRelativeHeadPose(float orientation[4], float position[3])
     {
         const float eyeSign = g_renderEye8 == 0 ? -1.0f : 1.0f;
         position[0] += eyeSign * 0.5f * SH3VR_IPD_METERS *
-            SH3VR_GAME_UNITS_PER_METER;
+            g_worldScale8;
     }
     Interop8_SetFrameRenderPose(pose);
     return true;
@@ -4129,7 +6836,7 @@ static bool ApplyHeadRotationToViewProjection(const float gameViewProjection[16]
 
     if (InterlockedIncrement(&g_viewProjectionHeadRotationApplications8) == 1)
         Log("6-DOF head pose applied to the main D3D8 view-projection constants "
-            "at %.0f game units per meter", SH3VR_GAME_UNITS_PER_METER);
+            "at %.0f game units per meter", g_worldScale8);
     g_viewProjectionAppliedThisFrame8 = true;
     return true;
 }
@@ -5986,6 +8693,49 @@ static bool BeginUiStereoPairPass(IDirect3DSurface8** originalColor,
     return true;
 }
 
+// EndScene can be reached with one of SH3's intermediate post-process targets
+// still bound.  The tracked hand is an eye-space overlay and only needs the
+// already-created native eye color/depth surfaces, so do not require the
+// current game target to match the primary desktop backbuffer here.
+static bool BeginExistingStereoPairPass(IDirect3DSurface8** originalColor,
+    IDirect3DSurface8** originalDepth)
+{
+    if (!g_device8 || !originalColor || !originalDepth ||
+        !g_stereoLeftColor8 || !g_stereoLeftDepth8 ||
+        !g_stereoRightColor8 || !g_stereoRightDepth8)
+    {
+        return false;
+    }
+
+    *originalColor = nullptr;
+    *originalDepth = nullptr;
+    g_savedStereoViewportValid8 = SUCCEEDED(
+        D3D8Slot<PFN8_GetViewport>(g_device8, 41)(g_device8,
+            &g_savedStereoViewport8));
+
+    HRESULT result = D3D8Slot<PFN8_GetRenderTarget>(g_device8, 32)(
+        g_device8, originalColor);
+    if (FAILED(result) || !*originalColor)
+    {
+        g_savedStereoViewportValid8 = false;
+        return false;
+    }
+
+    result = D3D8Slot<PFN8_GetDepthStencilSurface>(g_device8, 33)(
+        g_device8, originalDepth);
+    if (FAILED(result))
+        *originalDepth = nullptr;
+
+    if (!BindStereoEyeTarget(0))
+    {
+        ReleaseD3D8Surface(*originalDepth);
+        ReleaseD3D8Surface(*originalColor);
+        g_savedStereoViewportValid8 = false;
+        return false;
+    }
+    return true;
+}
+
 static bool SwitchStereoPairEye(std::uint32_t eye)
 {
     return BindStereoEyeTarget(eye);
@@ -6038,6 +8788,1416 @@ static void EndStereoPairPass(IDirect3DSurface8* originalColor,
     g_savedStereoViewportValid8 = false;
     ReleaseD3D8Surface(originalDepth);
     ReleaseD3D8Surface(originalColor);
+}
+
+static std::wstring GetModuleSiblingPath8(const wchar_t* fileName)
+{
+    wchar_t modulePath[MAX_PATH] = {};
+    if (!fileName || GetModuleFileNameW(nullptr, modulePath,
+        static_cast<DWORD>(_countof(modulePath))) == 0)
+    {
+        return {};
+    }
+    wchar_t* finalSlash = wcsrchr(modulePath, L'\\');
+    if (!finalSlash)
+        return {};
+    *(finalSlash + 1) = L'\0';
+    std::wstring result(modulePath);
+    result += fileName;
+    return result;
+}
+
+static bool ReadWholeFile8(const std::wstring& path,
+    std::vector<std::uint8_t>* output)
+{
+    if (path.empty() || !output)
+        return false;
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+        return false;
+    LARGE_INTEGER size = {};
+    const bool validSize = GetFileSizeEx(file, &size) && size.QuadPart > 0 &&
+        size.QuadPart <= 64ll * 1024ll * 1024ll;
+    if (!validSize)
+    {
+        CloseHandle(file);
+        return false;
+    }
+    output->resize(static_cast<std::size_t>(size.QuadPart));
+    DWORD bytesRead = 0;
+    const bool read = ReadFile(file, output->data(),
+        static_cast<DWORD>(output->size()), &bytesRead, nullptr) &&
+        bytesRead == output->size();
+    CloseHandle(file);
+    if (!read)
+        output->clear();
+    return read;
+}
+
+static void ReleaseLeftHandResources8()
+{
+    ReleaseD3D8Surface(g_leftHandDesktopDepth8);
+    ReleaseD3D8Surface(g_leftHandDesktopWeaponDepth8);
+    g_leftHandDesktopWeaponDepthPresent8 = -1;
+    ReleaseD3D8Surface(g_leftHandLightSampleSurface8);
+    g_leftHandDesktopDepthWidth8 = 0;
+    g_leftHandDesktopDepthHeight8 = 0;
+    g_leftHandDesktopDepthSamples8 = 0;
+    for (IDirect3DBaseTexture8*& texture : g_leftHandTextures8)
+    {
+        if (texture)
+        {
+            D3D8Slot<PFNT8_Release>(texture, 2)(texture);
+            texture = nullptr;
+        }
+    }
+    g_leftHandMeshParts8.clear();
+    g_leftHandResourceDevice8 = nullptr;
+    g_leftHandResourcesLoaded8 = false;
+    g_leftHandResourcesAttempted8 = false;
+    g_leftHandSceneLightValid8 = false;
+}
+
+static void RebuildLeftHandGeometryNormals8(
+    std::vector<LeftHandMeshPart8>& parts)
+{
+    for (LeftHandMeshPart8& part : parts)
+    {
+        std::vector<float> accumulated(part.vertices.size() * 3u, 0.0f);
+        for (std::size_t triangle = 0; triangle + 2u < part.indices.size();
+            triangle += 3u)
+        {
+            const std::uint16_t indices[3] = {
+                part.indices[triangle], part.indices[triangle + 1u],
+                part.indices[triangle + 2u]
+            };
+            if (indices[0] >= part.vertices.size() ||
+                indices[1] >= part.vertices.size() ||
+                indices[2] >= part.vertices.size())
+            {
+                continue;
+            }
+            const float* p0 = part.vertices[indices[0]].position;
+            const float* p1 = part.vertices[indices[1]].position;
+            const float* p2 = part.vertices[indices[2]].position;
+            const float edge1[3] = {
+                p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]
+            };
+            const float edge2[3] = {
+                p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]
+            };
+            float faceNormal[3] = {
+                edge1[1] * edge2[2] - edge1[2] * edge2[1],
+                edge1[2] * edge2[0] - edge1[0] * edge2[2],
+                edge1[0] * edge2[1] - edge1[1] * edge2[0]
+            };
+            const float authoredNormal[3] = {
+                part.vertices[indices[0]].normal[0] +
+                    part.vertices[indices[1]].normal[0] +
+                    part.vertices[indices[2]].normal[0],
+                part.vertices[indices[0]].normal[1] +
+                    part.vertices[indices[1]].normal[1] +
+                    part.vertices[indices[2]].normal[1],
+                part.vertices[indices[0]].normal[2] +
+                    part.vertices[indices[1]].normal[2] +
+                    part.vertices[indices[2]].normal[2]
+            };
+            const float agreement = faceNormal[0] * authoredNormal[0] +
+                faceNormal[1] * authoredNormal[1] +
+                faceNormal[2] * authoredNormal[2];
+            if (agreement < 0.0f)
+                for (float& component : faceNormal)
+                    component = -component;
+            for (std::uint16_t index : indices)
+                for (int axis = 0; axis < 3; ++axis)
+                    accumulated[static_cast<std::size_t>(index) * 3u + axis]
+                        += faceNormal[axis];
+        }
+
+        // Average coincident vertices as well. GLB material and UV seams often
+        // duplicate a position; leaving separate normal islands is what made
+        // the top of the hand, fingers and watch split into visible patches.
+        constexpr float kWeldDistanceSquared = 0.00000001f;
+        for (std::size_t vertexIndex = 0;
+            vertexIndex < part.vertices.size(); ++vertexIndex)
+        {
+            float normal[3] = {};
+            const float* position = part.vertices[vertexIndex].position;
+            for (std::size_t candidate = 0;
+                candidate < part.vertices.size(); ++candidate)
+            {
+                const float* other = part.vertices[candidate].position;
+                const float dx = position[0] - other[0];
+                const float dy = position[1] - other[1];
+                const float dz = position[2] - other[2];
+                if (dx * dx + dy * dy + dz * dz > kWeldDistanceSquared)
+                    continue;
+                for (int axis = 0; axis < 3; ++axis)
+                    normal[axis] += accumulated[candidate * 3u + axis];
+            }
+            const float length = std::sqrt(normal[0] * normal[0] +
+                normal[1] * normal[1] + normal[2] * normal[2]);
+            if (length > 0.000001f)
+                for (int axis = 0; axis < 3; ++axis)
+                    part.vertices[vertexIndex].normal[axis] =
+                        normal[axis] / length;
+        }
+    }
+}
+
+static bool EnsureLeftHandDesktopDepth8(IDirect3DSurface8* backBuffer)
+{
+    if (!g_device8 || !backBuffer || !g_stereoLeftDepth8)
+        return false;
+
+    D3D8SurfaceDescLocal colorDesc = {};
+    D3D8SurfaceDescLocal depthDesc = {};
+    if (FAILED(D3D8Slot<PFNS8_GetDesc>(backBuffer, 8)(backBuffer,
+            &colorDesc)) ||
+        FAILED(D3D8Slot<PFNS8_GetDesc>(g_stereoLeftDepth8, 8)(
+            g_stereoLeftDepth8, &depthDesc)))
+    {
+        return false;
+    }
+
+    if (g_leftHandDesktopDepth8 &&
+        g_leftHandDesktopDepthWidth8 == colorDesc.Width &&
+        g_leftHandDesktopDepthHeight8 == colorDesc.Height &&
+        g_leftHandDesktopDepthSamples8 == colorDesc.MultiSampleType)
+    {
+        return true;
+    }
+
+    ReleaseD3D8Surface(g_leftHandDesktopDepth8);
+    const HRESULT result = D3D8Slot<PFN8_CreateDepthStencilSurface>(
+        g_device8, 26)(g_device8, colorDesc.Width, colorDesc.Height,
+        depthDesc.Format, colorDesc.MultiSampleType,
+        &g_leftHandDesktopDepth8);
+    if (FAILED(result) || !g_leftHandDesktopDepth8)
+        return false;
+
+    g_leftHandDesktopDepthWidth8 = colorDesc.Width;
+    g_leftHandDesktopDepthHeight8 = colorDesc.Height;
+    g_leftHandDesktopDepthSamples8 = colorDesc.MultiSampleType;
+    Log("LeftHand: desktop self-depth surface created at %ux%u",
+        colorDesc.Width, colorDesc.Height);
+    return true;
+}
+
+static bool IsLeftHandDesktopDepthCompatible8(IDirect3DSurface8* color,
+    IDirect3DSurface8* depth)
+{
+    if (!color || !depth)
+        return false;
+    D3D8SurfaceDescLocal colorDesc = {};
+    D3D8SurfaceDescLocal depthDesc = {};
+    return SUCCEEDED(D3D8Slot<PFNS8_GetDesc>(color, 8)(color,
+            &colorDesc)) &&
+        SUCCEEDED(D3D8Slot<PFNS8_GetDesc>(depth, 8)(depth,
+            &depthDesc)) &&
+        colorDesc.Width == depthDesc.Width &&
+        colorDesc.Height == depthDesc.Height &&
+        colorDesc.MultiSampleType == depthDesc.MultiSampleType;
+}
+
+static void CaptureLeftHandDesktopWeaponDepth8()
+{
+    if (!g_device8)
+        return;
+    IDirect3DSurface8* depth = nullptr;
+    if (FAILED(D3D8Slot<PFN8_GetDepthStencilSurface>(g_device8, 33)(
+            g_device8, &depth)) || !depth)
+    {
+        return;
+    }
+    ReleaseD3D8Surface(g_leftHandDesktopWeaponDepth8);
+    g_leftHandDesktopWeaponDepth8 = depth;
+    g_leftHandDesktopWeaponDepthPresent8 =
+        InterlockedCompareExchange(&c_present8, 0, 0);
+}
+
+static void UpdateLeftHandSceneLighting8()
+{
+    if (!g_device8)
+        return;
+
+    // Reading a D3D8 render target synchronizes the GPU. Keep the surface
+    // deliberately tiny, but update often enough that entering a differently
+    // lit room or switching the flashlight does not lag behind the player.
+    static LONG lastSampleFrame = -1000;
+    const LONG presentFrame = InterlockedCompareExchange(&c_present8, 0, 0);
+    if (presentFrame - lastSampleFrame < 5)
+        return;
+    lastSampleFrame = presentFrame;
+
+    IDirect3DSurface8* backBuffer = nullptr;
+    if (FAILED(D3D8Slot<PFN8_GetBackBuffer>(g_device8, 16)(g_device8, 0,
+            0, &backBuffer)) || !backBuffer)
+    {
+        return;
+    }
+
+    D3D8SurfaceDescLocal description = {};
+    if (FAILED(D3D8Slot<PFNS8_GetDesc>(backBuffer, 8)(backBuffer,
+            &description)) || description.Width < 64u ||
+        description.Height < 64u)
+    {
+        ReleaseD3D8Surface(backBuffer);
+        return;
+    }
+
+    if (!g_leftHandLightSampleSurface8)
+    {
+        const HRESULT createResult = D3D8Slot<PFN8_CreateImageSurface>(
+            g_device8, VT8_CreateImageSurface)(g_device8, 64u, 64u,
+            description.Format, &g_leftHandLightSampleSurface8);
+        if (FAILED(createResult) || !g_leftHandLightSampleSurface8)
+        {
+            ReleaseD3D8Surface(backBuffer);
+            return;
+        }
+    }
+
+    RECT sourceRectangles[4] = {};
+    POINT destinationPoints[4] = {
+        { 0, 0 }, { 32, 0 }, { 0, 32 }, { 32, 32 }
+    };
+    const LONG centersX[2] = {
+        static_cast<LONG>(description.Width / 4u),
+        static_cast<LONG>(description.Width * 3u / 4u)
+    };
+    const LONG centersY[2] = {
+        static_cast<LONG>(description.Height / 4u),
+        static_cast<LONG>(description.Height * 3u / 4u)
+    };
+    for (int y = 0; y < 2; ++y)
+    {
+        for (int x = 0; x < 2; ++x)
+        {
+            RECT& rectangle = sourceRectangles[y * 2 + x];
+            rectangle.left = centersX[x] - 16;
+            rectangle.top = centersY[y] - 16;
+            rectangle.right = rectangle.left + 32;
+            rectangle.bottom = rectangle.top + 32;
+        }
+    }
+    // The fourth tile follows the middle of the image instead of another
+    // distant quadrant. In first person this is where SH3's flashlight cone
+    // is concentrated, so its contribution reaches the tracked hand.
+    sourceRectangles[3].left = static_cast<LONG>(description.Width / 2u) - 16;
+    sourceRectangles[3].top = static_cast<LONG>(description.Height / 2u) - 16;
+    sourceRectangles[3].right = sourceRectangles[3].left + 32;
+    sourceRectangles[3].bottom = sourceRectangles[3].top + 32;
+
+    const HRESULT copyResult = D3D8Slot<PFN8_CopyRects>(g_device8,
+        VT8_CopyRects)(g_device8, backBuffer, sourceRectangles, 4u,
+        g_leftHandLightSampleSurface8, destinationPoints);
+    ReleaseD3D8Surface(backBuffer);
+    if (FAILED(copyResult))
+        return;
+
+    D3DLOCKED_RECT locked = {};
+    constexpr DWORD kD3dLockReadOnly = 0x10u;
+    if (FAILED(D3D8Slot<PFNS8_LockRect>(g_leftHandLightSampleSurface8, 9)(
+            g_leftHandLightSampleSurface8, &locked, nullptr,
+            kD3dLockReadOnly)) || !locked.pBits)
+    {
+        return;
+    }
+
+    double regionTotals[4][3] = {};
+    for (UINT y = 0; y < 64u; ++y)
+    {
+        const std::uint32_t* row = reinterpret_cast<const std::uint32_t*>(
+            static_cast<const std::uint8_t*>(locked.pBits) +
+            static_cast<std::size_t>(y) * locked.Pitch);
+        for (UINT x = 0; x < 64u; ++x)
+        {
+            const std::uint32_t pixel = row[x];
+            const UINT region = (y >= 32u ? 2u : 0u) +
+                (x >= 32u ? 1u : 0u);
+            regionTotals[region][0] += static_cast<double>(
+                (pixel >> 16u) & 0xFFu);
+            regionTotals[region][1] += static_cast<double>(
+                (pixel >> 8u) & 0xFFu);
+            regionTotals[region][2] += static_cast<double>(pixel & 0xFFu);
+        }
+    }
+    D3D8Slot<PFNS8_UnlockRect>(g_leftHandLightSampleSurface8, 10)(
+        g_leftHandLightSampleSurface8);
+
+    constexpr float inverseRegionTotal = 1.0f / (32.0f * 32.0f * 255.0f);
+    float globalAverage[3] = {};
+    float centerAverage[3] = {};
+    float average[3] = {};
+    for (int channel = 0; channel < 3; ++channel)
+    {
+        globalAverage[channel] = static_cast<float>(
+            regionTotals[0][channel] + regionTotals[1][channel] +
+            regionTotals[2][channel]) * (inverseRegionTotal / 3.0f);
+        centerAverage[channel] = static_cast<float>(
+            regionTotals[3][channel]) * inverseRegionTotal;
+        // Global illumination supplies the baseline. A brighter central
+        // sample (normally the flashlight spot) raises it immediately.
+        average[channel] = (std::max)(globalAverage[channel],
+            centerAverage[channel] * 0.90f);
+    }
+    const float luminance = average[0] * 0.2126f +
+        average[1] * 0.7152f + average[2] * 0.0722f;
+    const float globalLuminance = globalAverage[0] * 0.2126f +
+        globalAverage[1] * 0.7152f + globalAverage[2] * 0.0722f;
+    const float centerLuminance = centerAverage[0] * 0.2126f +
+        centerAverage[1] * 0.7152f + centerAverage[2] * 0.0722f;
+    // The hand is drawn after the game scene, so a ray aimed directly at it
+    // cannot be sampled from the backbuffer.  Use a clear central hotspot only
+    // to discover that a save loaded with SH3's flashlight already on; the
+    // input bridge then keeps that state while the ray moves off the wall and
+    // onto the tracked hand.
+    if (centerLuminance > 0.16f &&
+        centerLuminance > globalLuminance * 1.32f + 0.025f)
+    {
+        InputBridge_ObserveFlashlightEnabled();
+    }
+    const float brightness = (std::min)(1.25f,
+        (std::max)(0.0f, luminance * 2.4f));
+    float targetColor[3] = {};
+    for (int channel = 0; channel < 3; ++channel)
+    {
+        const float colorRatio = average[channel] /
+            (std::max)(0.02f, luminance);
+        const float tint = (std::min)(1.5f,
+            (std::max)(0.5f, 0.75f + colorRatio * 0.25f));
+        targetColor[channel] = (std::min)(1.25f, brightness * tint);
+    }
+
+    if (!g_leftHandSceneLightValid8)
+    {
+        for (int channel = 0; channel < 3; ++channel)
+            g_leftHandSceneLightColor8[channel] = targetColor[channel];
+    }
+    else
+    {
+        for (int channel = 0; channel < 3; ++channel)
+            g_leftHandSceneLightColor8[channel] =
+                g_leftHandSceneLightColor8[channel] * 0.20f +
+                targetColor[channel] * 0.80f;
+    }
+    g_leftHandSceneLightScale8 = brightness;
+    g_leftHandSceneLightValid8 = true;
+}
+
+static bool LoadLeftHandTexture8(IDirect3DDevice8* device,
+    const std::wstring& path, IDirect3DBaseTexture8** output)
+{
+    if (!device || path.empty() || !output)
+        return false;
+    *output = nullptr;
+
+    const HRESULT initializeResult = CoInitializeEx(nullptr,
+        COINIT_MULTITHREADED);
+    IWICImagingFactory* factory = nullptr;
+    IWICBitmapDecoder* decoder = nullptr;
+    IWICBitmapFrameDecode* frame = nullptr;
+    IWICFormatConverter* converter = nullptr;
+    IDirect3DTexture8* texture = nullptr;
+
+    HRESULT result = CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+        CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
+    if (SUCCEEDED(result))
+        result = factory->CreateDecoderFromFilename(path.c_str(), nullptr,
+            GENERIC_READ, WICDecodeMetadataCacheOnLoad, &decoder);
+    if (SUCCEEDED(result))
+        result = decoder->GetFrame(0, &frame);
+    if (SUCCEEDED(result))
+        result = factory->CreateFormatConverter(&converter);
+    if (SUCCEEDED(result))
+        result = converter->Initialize(frame, GUID_WICPixelFormat32bppBGRA,
+            WICBitmapDitherTypeNone, nullptr, 0.0,
+            WICBitmapPaletteTypeCustom);
+
+    UINT width = 0;
+    UINT height = 0;
+    if (SUCCEEDED(result))
+        result = converter->GetSize(&width, &height);
+    if (SUCCEEDED(result) && (width == 0 || height == 0 || width > 4096 ||
+        height > 4096))
+    {
+        result = E_INVALIDARG;
+    }
+
+    constexpr DWORD kD3dFormatA8R8G8B8 = 21u;
+    constexpr DWORD kD3dPoolManaged = 1u;
+    if (SUCCEEDED(result))
+    {
+        result = D3D8Slot<PFN8_CreateTexture>(device, 20)(device, width,
+            height, 1, 0, kD3dFormatA8R8G8B8, kD3dPoolManaged, &texture);
+    }
+
+    D3DLOCKED_RECT locked = {};
+    if (SUCCEEDED(result))
+        result = D3D8Slot<PFNT8_LockRect>(texture, 16)(texture, 0, &locked,
+            nullptr, 0);
+    if (SUCCEEDED(result))
+    {
+        const UINT sourceStride = width * 4u;
+        std::vector<std::uint8_t> pixels(
+            static_cast<std::size_t>(sourceStride) * height);
+        result = converter->CopyPixels(nullptr, sourceStride,
+            static_cast<UINT>(pixels.size()), pixels.data());
+        if (SUCCEEDED(result))
+        {
+            for (UINT row = 0; row < height; ++row)
+            {
+                std::memcpy(static_cast<std::uint8_t*>(locked.pBits) +
+                    static_cast<std::size_t>(row) * locked.Pitch,
+                    pixels.data() + static_cast<std::size_t>(row) *
+                    sourceStride, sourceStride);
+            }
+        }
+        D3D8Slot<PFNT8_UnlockRect>(texture, 17)(texture, 0);
+    }
+
+    if (converter)
+        converter->Release();
+    if (frame)
+        frame->Release();
+    if (decoder)
+        decoder->Release();
+    if (factory)
+        factory->Release();
+    if (SUCCEEDED(initializeResult))
+        CoUninitialize();
+
+    if (FAILED(result) || !texture)
+    {
+        if (texture)
+            D3D8Slot<PFNT8_Release>(texture, 2)(
+                reinterpret_cast<IDirect3DBaseTexture8*>(texture));
+        return false;
+    }
+    *output = reinterpret_cast<IDirect3DBaseTexture8*>(texture);
+    return true;
+}
+
+static bool EnsureLeftHandResources8(IDirect3DDevice8* device)
+{
+    if (!g_leftHandPoseProfile8.enabled || !device)
+        return false;
+    if (g_leftHandResourcesLoaded8 && g_leftHandResourceDevice8 == device)
+        return true;
+    if (g_leftHandResourceDevice8 && g_leftHandResourceDevice8 != device)
+        ReleaseLeftHandResources8();
+    if (g_leftHandResourcesAttempted8)
+        return false;
+    g_leftHandResourcesAttempted8 = true;
+
+    std::vector<std::uint8_t> bytes;
+    const std::wstring meshPath = GetModuleSiblingPath8(
+        L"sh3vr_assets\\sh3vr_lefthand.mesh");
+    if (!ReadWholeFile8(meshPath, &bytes) || bytes.size() < 16 ||
+        std::memcmp(bytes.data(), "SH3LH01\0", 8) != 0)
+    {
+        if (!g_leftHandResourceFailureLogged8)
+        {
+            g_leftHandResourceFailureLogged8 = true;
+            Log("LeftHand: sh3vr_assets\\sh3vr_lefthand.mesh is missing or invalid");
+        }
+        return false;
+    }
+
+    std::size_t cursor = 8;
+    auto readU32 = [&bytes, &cursor](std::uint32_t* value) -> bool
+    {
+        if (!value || cursor + sizeof(*value) > bytes.size())
+            return false;
+        std::memcpy(value, bytes.data() + cursor, sizeof(*value));
+        cursor += sizeof(*value);
+        return true;
+    };
+    std::uint32_t version = 0;
+    std::uint32_t partCount = 0;
+    if (!readU32(&version) || !readU32(&partCount) || version != 1 ||
+        partCount == 0 || partCount > 8)
+    {
+        return false;
+    }
+
+    std::vector<LeftHandMeshPart8> parts;
+    parts.reserve(partCount);
+    for (std::uint32_t partIndex = 0; partIndex < partCount; ++partIndex)
+    {
+        std::uint32_t vertexCount = 0;
+        std::uint32_t indexCount = 0;
+        std::uint32_t materialIndex = 0;
+        if (!readU32(&vertexCount) || !readU32(&indexCount) ||
+            !readU32(&materialIndex) || vertexCount == 0 ||
+            vertexCount > 65535 || indexCount == 0 || indexCount > 196605 ||
+            indexCount % 3 != 0 || materialIndex >= 2)
+        {
+            return false;
+        }
+        const std::size_t vertexBytes = static_cast<std::size_t>(vertexCount) *
+            sizeof(LeftHandDiskVertex8);
+        const std::size_t indexBytes = static_cast<std::size_t>(indexCount) *
+            sizeof(std::uint16_t);
+        if (cursor + vertexBytes + indexBytes > bytes.size())
+            return false;
+
+        LeftHandMeshPart8 part = {};
+        part.vertices.resize(vertexCount);
+        part.indices.resize(indexCount);
+        part.materialIndex = materialIndex;
+        const LeftHandDiskVertex8* diskVertices =
+            reinterpret_cast<const LeftHandDiskVertex8*>(bytes.data() + cursor);
+        for (std::uint32_t vertexIndex = 0; vertexIndex < vertexCount;
+            ++vertexIndex)
+        {
+            std::memcpy(part.vertices[vertexIndex].position,
+                diskVertices[vertexIndex].position,
+                sizeof(part.vertices[vertexIndex].position));
+            std::memcpy(part.vertices[vertexIndex].normal,
+                diskVertices[vertexIndex].normal,
+                sizeof(part.vertices[vertexIndex].normal));
+            part.vertices[vertexIndex].diffuse = 0xFFFFFFFFu;
+            std::memcpy(part.vertices[vertexIndex].texcoord,
+                diskVertices[vertexIndex].texcoord,
+                sizeof(part.vertices[vertexIndex].texcoord));
+        }
+        cursor += vertexBytes;
+        std::memcpy(part.indices.data(), bytes.data() + cursor, indexBytes);
+        cursor += indexBytes;
+        parts.push_back(std::move(part));
+    }
+
+    // Do not trust exported vertex normals here. The source GLB contains
+    // split normal islands around the fingers, back of the hand and watch;
+    // rebuild a continuous geometric field after loading the complete mesh.
+    RebuildLeftHandGeometryNormals8(parts);
+
+    IDirect3DBaseTexture8* textures[2] = {};
+    const bool firstTexture = LoadLeftHandTexture8(device,
+        GetModuleSiblingPath8(L"sh3vr_assets\\sh3vr_lefthand_0.png"),
+        &textures[0]);
+    const bool secondTexture = firstTexture && LoadLeftHandTexture8(device,
+        GetModuleSiblingPath8(L"sh3vr_assets\\sh3vr_lefthand_1.png"),
+        &textures[1]);
+    if (!firstTexture || !secondTexture)
+    {
+        for (IDirect3DBaseTexture8* texture : textures)
+            if (texture)
+                D3D8Slot<PFNT8_Release>(texture, 2)(texture);
+        if (!g_leftHandResourceFailureLogged8)
+        {
+            g_leftHandResourceFailureLogged8 = true;
+            Log("LeftHand: one or more PNG textures could not be loaded");
+        }
+        return false;
+    }
+
+    g_leftHandMeshParts8 = std::move(parts);
+    g_leftHandTextures8[0] = textures[0];
+    g_leftHandTextures8[1] = textures[1];
+    g_leftHandResourceDevice8 = device;
+    g_leftHandResourcesLoaded8 = true;
+    Log("LeftHand: loaded %u mesh parts and 2 textures",
+        static_cast<unsigned>(g_leftHandMeshParts8.size()));
+    return true;
+}
+
+static void BuildLeftHandWorldMatrix8(const float orientation[4],
+    const float position[3], D3DMATRIX* world)
+{
+    if (!orientation || !position || !world)
+        return;
+    float handRotation[3][3] = {};
+    BuildQuaternionRotation3x3(orientation, handRotation);
+
+    const float yawCos = std::cos(g_leftHandPoseProfile8.yawRadians);
+    const float yawSin = std::sin(g_leftHandPoseProfile8.yawRadians);
+    const float pitchCos = std::cos(g_leftHandPoseProfile8.pitchRadians);
+    const float pitchSin = std::sin(g_leftHandPoseProfile8.pitchRadians);
+    const float rollCos = std::cos(g_leftHandPoseProfile8.rollRadians);
+    const float rollSin = std::sin(g_leftHandPoseProfile8.rollRadians);
+    const float rollYaw[3][3] = {
+        { rollCos * yawCos, -rollSin, rollCos * yawSin },
+        { rollSin * yawCos, rollCos, rollSin * yawSin },
+        { -yawSin, 0.0f, yawCos }
+    };
+    const float calibration[3][3] = {
+        { rollYaw[0][0],
+            rollYaw[0][1] * pitchCos + rollYaw[0][2] * pitchSin,
+            -rollYaw[0][1] * pitchSin + rollYaw[0][2] * pitchCos },
+        { rollYaw[1][0],
+            rollYaw[1][1] * pitchCos + rollYaw[1][2] * pitchSin,
+            -rollYaw[1][1] * pitchSin + rollYaw[1][2] * pitchCos },
+        { rollYaw[2][0],
+            rollYaw[2][1] * pitchCos + rollYaw[2][2] * pitchSin,
+            -rollYaw[2][1] * pitchSin + rollYaw[2][2] * pitchCos }
+    };
+    float calibrated[3][3] = {};
+    for (int row = 0; row < 3; ++row)
+        for (int column = 0; column < 3; ++column)
+            for (int k = 0; k < 3; ++k)
+                calibrated[row][column] +=
+                    handRotation[row][k] * calibration[k][column];
+
+    *world = {};
+    const float scale = g_worldScale8 * g_leftHandPoseProfile8.scale;
+    // D3D8 fixed-function transforms use row vectors. The controller and
+    // calibration matrices above use column vectors, hence the transpose.
+    for (int row = 0; row < 3; ++row)
+        for (int column = 0; column < 3; ++column)
+            world->m[row][column] = calibrated[column][row] * scale;
+    world->m[3][0] = position[0];
+    world->m[3][1] = position[1];
+    world->m[3][2] = position[2];
+    world->m[3][3] = 1.0f;
+
+    float modelBasis[3][3] = {};
+    bool validBasis = true;
+    for (int row = 0; row < 3; ++row)
+    {
+        const float length = std::sqrt(
+            world->m[row][0] * world->m[row][0] +
+            world->m[row][1] * world->m[row][1] +
+            world->m[row][2] * world->m[row][2]);
+        if (!std::isfinite(length) || length < 0.0001f)
+        {
+            validBasis = false;
+            break;
+        }
+        for (int column = 0; column < 3; ++column)
+            modelBasis[row][column] = world->m[row][column] / length;
+    }
+    if (validBasis)
+    {
+        constexpr float radiansToDegrees = 57.29577951308232f;
+        const float modelPitch = std::atan2(modelBasis[2][1],
+            modelBasis[2][2]) * radiansToDegrees;
+        const float modelYaw = std::asin((std::max)(-1.0f,
+            (std::min)(1.0f, -modelBasis[2][0]))) * radiansToDegrees;
+        const float modelRoll = std::atan2(modelBasis[1][0],
+            modelBasis[0][0]) * radiansToDegrees;
+        Interop8_SetLeftHandDebugOrientation(true, modelPitch, modelYaw,
+            modelRoll);
+    }
+}
+
+struct ControllerOrientationOverlayVertex8
+{
+    float x;
+    float y;
+    float z;
+    float rhw;
+    DWORD diffuse;
+};
+
+static bool DrawControllerOrientationOverlayRect8(float left, float top,
+    float right, float bottom, DWORD color)
+{
+    const ControllerOrientationOverlayVertex8 vertices[4] = {
+        { left, top, 0.0f, 1.0f, color },
+        { right, top, 0.0f, 1.0f, color },
+        { left, bottom, 0.0f, 1.0f, color },
+        { right, bottom, 0.0f, 1.0f, color }
+    };
+    return SUCCEEDED(o_D3D8_DrawPrimitiveUP(g_device8, 5u, 2u, vertices,
+        sizeof(ControllerOrientationOverlayVertex8)));
+}
+
+static bool ReadRightControllerEulerDegrees8(float* pitch, float* yaw,
+    float* roll)
+{
+    if (!pitch || !yaw || !roll)
+        return false;
+
+    float orientation[4] = {};
+    float position[3] = {};
+    if (!ReadRightHandRelativePoseForWeapon8(orientation, position))
+        return false;
+
+    const float x = orientation[0];
+    const float y = orientation[1];
+    const float z = orientation[2];
+    const float w = orientation[3];
+    // These are the same head-relative controller axes used by the weapon
+    // attachment: pitch about X, yaw about Y, roll about Z.
+    const float pitchRadians = std::atan2(2.0f * (w * x + y * z),
+        1.0f - 2.0f * (x * x + y * y));
+    const float yawArgument = (std::max)(-1.0f, (std::min)(1.0f,
+        2.0f * (w * y - z * x)));
+    const float yawRadians = std::asin(yawArgument);
+    const float rollRadians = std::atan2(2.0f * (w * z + x * y),
+        1.0f - 2.0f * (y * y + z * z));
+    constexpr float radiansToDegrees = 57.29577951308232f;
+    *pitch = pitchRadians * radiansToDegrees;
+    *yaw = yawRadians * radiansToDegrees;
+    *roll = rollRadians * radiansToDegrees;
+    return std::isfinite(*pitch) && std::isfinite(*yaw) &&
+        std::isfinite(*roll);
+}
+
+static void DrawControllerOrientationOverlay8()
+{
+    if (!g_enableControllerOrientationOverlay8 || !g_device8)
+        return;
+
+    float pitch = 0.0f;
+    float yaw = 0.0f;
+    float roll = 0.0f;
+    if (!ReadRightControllerEulerDegrees8(&pitch, &yaw, &roll))
+        return;
+
+    D3D8ViewportLocal viewport = {};
+    if (FAILED(D3D8Slot<PFN8_GetViewport>(g_device8, 41)(g_device8,
+        &viewport)) || viewport.Width < 160u || viewport.Height < 160u)
+    {
+        return;
+    }
+
+    const auto setRenderState = D3D8Slot<PFN8_SetRenderState>(g_device8,
+        VT8_SetRenderState);
+    const auto setTextureStage = D3D8Slot<PFN8_SetTextureStageState>(
+        g_device8, VT8_SetTextureStageState);
+    const auto setTexture = o_D3D8_SetTexture ? o_D3D8_SetTexture
+        : D3D8Slot<PFN_D3D8_SetTexture>(g_device8, VT8_SetTexture);
+    const auto setVertexShader = o_D3D8_SetVertexShader
+        ? o_D3D8_SetVertexShader
+        : D3D8Slot<PFN_D3D8_SetVertexShader>(g_device8,
+            VT8_SetVertexShader);
+    if (!setRenderState || !setTextureStage || !setTexture ||
+        !setVertexShader || FAILED(setVertexShader(g_device8, 0x44u)))
+    {
+        return;
+    }
+
+    // A small fixed-function, pre-transformed overlay is copied to both eye
+    // targets at identical screen coordinates. It intentionally has no depth
+    // parallax: diagnostic text remains razor-sharp in the headset.
+    setTexture(g_device8, 0, nullptr);
+    setRenderState(g_device8, 7u, FALSE);   // ZENABLE
+    setRenderState(g_device8, 14u, FALSE);  // ZWRITEENABLE
+    setRenderState(g_device8, 27u, FALSE);  // ALPHABLENDENABLE
+    setRenderState(g_device8, 22u, 1u);     // CULLMODE = NONE
+    setTextureStage(g_device8, 0, 1u, 2u);  // COLOROP = SELECTARG1
+    setTextureStage(g_device8, 0, 2u, 0u);  // COLORARG1 = DIFFUSE
+    setTextureStage(g_device8, 0, 4u, 2u);  // ALPHAOP = SELECTARG1
+    setTextureStage(g_device8, 0, 5u, 0u);  // ALPHAARG1 = DIFFUSE
+    setTextureStage(g_device8, 1, 1u, 1u);  // COLOROP = DISABLE
+    setTextureStage(g_device8, 1, 4u, 1u);  // ALPHAOP = DISABLE
+
+    constexpr float x = 22.0f;
+    constexpr float y = 22.0f;
+    constexpr float segmentLength = 15.0f;
+    constexpr float segmentThickness = 3.0f;
+    constexpr float glyphWidth = 18.0f;
+    constexpr float glyphHeight = 30.0f;
+    constexpr float glyphSpacing = 5.0f;
+    constexpr float rowSpacing = 11.0f;
+    constexpr DWORD background = 0xFF101010u;
+    constexpr DWORD pitchColor = 0xFFFFD060u;
+    constexpr DWORD yawColor = 0xFF68D8FFu;
+    constexpr DWORD rollColor = 0xFF8DFF88u;
+    DrawControllerOrientationOverlayRect8(x - 10.0f, y - 10.0f,
+        x + 138.0f, y + 3.0f * (glyphHeight + rowSpacing) + 4.0f,
+        background);
+
+    auto drawSegments = [=](float glyphX, float glyphY, unsigned mask,
+        DWORD color)
+    {
+        const float h = segmentLength;
+        const float t = segmentThickness;
+        // a, b, c, d, e, f, g in the normal seven-segment layout.
+        if (mask & 0x01u) DrawControllerOrientationOverlayRect8(glyphX + t,
+            glyphY, glyphX + h, glyphY + t, color);
+        if (mask & 0x02u) DrawControllerOrientationOverlayRect8(glyphX + h,
+            glyphY + t, glyphX + h + t, glyphY + h, color);
+        if (mask & 0x04u) DrawControllerOrientationOverlayRect8(glyphX + h,
+            glyphY + h + t, glyphX + h + t, glyphY + 2.0f * h + t, color);
+        if (mask & 0x08u) DrawControllerOrientationOverlayRect8(glyphX + t,
+            glyphY + 2.0f * h + t, glyphX + h, glyphY + 2.0f * h + 2.0f * t,
+            color);
+        if (mask & 0x10u) DrawControllerOrientationOverlayRect8(glyphX,
+            glyphY + h + t, glyphX + t, glyphY + 2.0f * h + t, color);
+        if (mask & 0x20u) DrawControllerOrientationOverlayRect8(glyphX,
+            glyphY + t, glyphX + t, glyphY + h, color);
+        if (mask & 0x40u) DrawControllerOrientationOverlayRect8(glyphX + t,
+            glyphY + h, glyphX + h, glyphY + h + t, color);
+    };
+    static constexpr unsigned digitMasks[10] = {
+        0x3Fu, 0x06u, 0x5Bu, 0x4Fu, 0x66u,
+        0x6Du, 0x7Du, 0x07u, 0x7Fu, 0x6Fu
+    };
+    auto drawValue = [&](float glyphX, float glyphY,
+        float value, unsigned labelMask, DWORD color)
+    {
+        drawSegments(glyphX, glyphY, labelMask, color);
+        int whole = std::clamp(static_cast<int>(std::lround(value)), -999, 999);
+        float cursor = glyphX + glyphWidth + glyphSpacing;
+        if (whole < 0)
+        {
+            drawSegments(cursor, glyphY, 0x40u, color);
+            cursor += glyphWidth + glyphSpacing;
+            whole = -whole;
+        }
+        int divisor = whole >= 100 ? 100 : (whole >= 10 ? 10 : 1);
+        do
+        {
+            const int digit = whole / divisor;
+            drawSegments(cursor, glyphY, digitMasks[digit], color);
+            cursor += glyphWidth + glyphSpacing;
+            whole %= divisor;
+            divisor /= 10;
+        } while (divisor > 0);
+    };
+
+    // P = a,b,e,f,g.  Y and R use the closest readable seven-segment forms.
+    drawValue(x, y, pitch, 0x73u, pitchColor);
+    drawValue(x, y + glyphHeight + rowSpacing, yaw, 0x6Eu, yawColor);
+    drawValue(x, y + 2.0f * (glyphHeight + rowSpacing), roll, 0x77u,
+        rollColor);
+}
+
+static bool DrawLeftHandEye8(std::uint32_t eye, const D3DMATRIX& world)
+{
+    if (!g_device8 || eye > 2 || g_leftHandMeshParts8.empty())
+        return false;
+
+    D3DMATRIX view = {};
+    view.m[0][0] = 1.0f;
+    view.m[1][1] = 1.0f;
+    view.m[2][2] = 1.0f;
+    view.m[3][3] = 1.0f;
+    if (eye < 2)
+    {
+        const float eyeSign = eye == 0 ? -1.0f : 1.0f;
+        view.m[3][0] = -eyeSign * 0.5f * SH3VR_IPD_METERS * g_worldScale8;
+    }
+
+    D3DMATRIX projection = {};
+    if (!BuildImmersiveProjection(g_lastProjection8, projection))
+        return false;
+    const UINT targetWidth = eye < 2
+        ? g_stereoTargetWidth8 : g_gameRenderTargetWidth8;
+    const UINT targetHeight = eye < 2
+        ? g_stereoTargetHeight8 : g_gameRenderTargetHeight8;
+    if (targetWidth != 0 && targetHeight != 0)
+    {
+        const float eyeAspect = static_cast<float>(targetWidth) /
+            static_cast<float>(targetHeight);
+        projection.m[0][0] = std::copysign(
+            SH3VR_IMMERSIVE_VERTICAL_SCALE / eyeAspect,
+            projection.m[0][0]);
+    }
+
+    if (FAILED(o_D3D8_SetTransform(g_device8, SH3VR_D3DTS_WORLD, &world)) ||
+        FAILED(o_D3D8_SetTransform(g_device8, SH3VR_D3DTS_VIEW, &view)) ||
+        FAILED(o_D3D8_SetTransform(g_device8, SH3VR_D3DTS_PROJECTION,
+            &projection)))
+    {
+        return false;
+    }
+
+    const auto setVertexShader = o_D3D8_SetVertexShader
+        ? o_D3D8_SetVertexShader
+        : D3D8Slot<PFN_D3D8_SetVertexShader>(g_device8,
+            VT8_SetVertexShader);
+    const auto setTexture = o_D3D8_SetTexture ? o_D3D8_SetTexture
+        : D3D8Slot<PFN_D3D8_SetTexture>(g_device8, VT8_SetTexture);
+    const auto draw = o_D3D8_DrawIndexedPrimitiveUP
+        ? o_D3D8_DrawIndexedPrimitiveUP
+        : D3D8Slot<PFN_D3D8_DrawIndexedPrimitiveUP>(g_device8,
+            VT8_DrawIndexedPrimitiveUP);
+    constexpr DWORD kLeftHandFvf = 0x00000144u; // XYZRHW | DIFFUSE | TEX1
+    constexpr DWORD kTriangleList = 4u;
+    constexpr DWORD kIndex16 = 101u;
+    if (FAILED(setVertexShader(g_device8, kLeftHandFvf)))
+        return false;
+
+    bool complete = true;
+    // The hand is composited after SH3 has finished its scene, so it cannot
+    // receive the game's fixed-function lights directly. Modulate geometric
+    // shading with the color and brightness sampled from that finished scene.
+    constexpr float lightDirection[3] = { 0.25f, -0.35f, 0.90f };
+    const bool flashlightActive = InputBridge_IsFlashlightEnabled();
+    if (flashlightActive && !g_loggedLeftHandFlashlight8)
+    {
+        g_loggedLeftHandFlashlight8 = true;
+        Log("LeftHand: direct controller-tracked SH3 flashlight lighting is active");
+    }
+    for (LeftHandMeshPart8& part : g_leftHandMeshParts8)
+    {
+        for (LeftHandVertex8& vertex : part.vertices)
+        {
+            float transformedNormal[3] = {
+                vertex.normal[0] * world.m[0][0] +
+                    vertex.normal[1] * world.m[1][0] +
+                    vertex.normal[2] * world.m[2][0],
+                vertex.normal[0] * world.m[0][1] +
+                    vertex.normal[1] * world.m[1][1] +
+                    vertex.normal[2] * world.m[2][1],
+                vertex.normal[0] * world.m[0][2] +
+                    vertex.normal[1] * world.m[1][2] +
+                    vertex.normal[2] * world.m[2][2]
+            };
+            const float normalLength = std::sqrt(
+                transformedNormal[0] * transformedNormal[0] +
+                transformedNormal[1] * transformedNormal[1] +
+                transformedNormal[2] * transformedNormal[2]);
+            if (normalLength > 0.00001f)
+            {
+                transformedNormal[0] /= normalLength;
+                transformedNormal[1] /= normalLength;
+                transformedNormal[2] /= normalLength;
+            }
+            const float lightDot =
+                transformedNormal[0] * lightDirection[0] +
+                transformedNormal[1] * lightDirection[1] +
+                transformedNormal[2] * lightDirection[2];
+            const float facing = std::fabs(lightDot);
+            const float shapeLight = 0.35f + 0.65f * facing;
+            const float vertexPosition[3] = {
+                vertex.position[0] * world.m[0][0] +
+                    vertex.position[1] * world.m[1][0] +
+                    vertex.position[2] * world.m[2][0] + world.m[3][0],
+                vertex.position[0] * world.m[0][1] +
+                    vertex.position[1] * world.m[1][1] +
+                    vertex.position[2] * world.m[2][1] + world.m[3][1],
+                vertex.position[0] * world.m[0][2] +
+                    vertex.position[1] * world.m[1][2] +
+                    vertex.position[2] * world.m[2][2] + world.m[3][2]
+            };
+            const float distance = std::sqrt(
+                vertexPosition[0] * vertexPosition[0] +
+                vertexPosition[1] * vertexPosition[1] +
+                vertexPosition[2] * vertexPosition[2]);
+            float flashlightContribution = 0.0f;
+            if (flashlightActive && distance > 0.0001f)
+            {
+                const float inverseDistance = 1.0f / distance;
+                const float toLight[3] = {
+                    -vertexPosition[0] * inverseDistance,
+                    -vertexPosition[1] * inverseDistance,
+                    -vertexPosition[2] * inverseDistance
+                };
+                const float normalFacingLight = (std::max)(0.0f,
+                    transformedNormal[0] * toLight[0] +
+                    transformedNormal[1] * toLight[1] +
+                    transformedNormal[2] * toLight[2]);
+                const float forwardCosine = vertexPosition[2] *
+                    inverseDistance;
+                const float cone = (std::min)(1.0f, (std::max)(0.0f,
+                    (forwardCosine - 0.35f) / 0.50f));
+                const float distanceMeters = distance /
+                    (std::max)(1.0f, g_worldScale8);
+                const float attenuation = (std::min)(1.0f,
+                    (std::max)(0.25f, 1.15f - distanceMeters * 0.65f));
+                flashlightContribution = cone * attenuation *
+                    (0.20f + 0.80f * normalFacingLight) * 0.95f;
+            }
+            constexpr float flashlightColor[3] = { 1.0f, 0.96f, 0.82f };
+            constexpr float kMinimumHandVisibility = 0.15f;
+            DWORD channels[3] = {};
+            for (int channel = 0; channel < 3; ++channel)
+            {
+                const float value = (std::min)(1.0f, (std::max)(0.0f,
+                    g_leftHandSceneLightColor8[channel] * shapeLight +
+                    flashlightContribution * flashlightColor[channel] +
+                    kMinimumHandVisibility));
+                channels[channel] = static_cast<DWORD>(value * 255.0f +
+                    0.5f);
+            }
+            vertex.diffuse = 0xFF000000u | (channels[0] << 16u) |
+                (channels[1] << 8u) | channels[2];
+        }
+
+        std::vector<LeftHandClipVertex8> clipVertices(part.vertices.size());
+        for (std::size_t vertexIndex = 0;
+            vertexIndex < part.vertices.size(); ++vertexIndex)
+        {
+            const LeftHandVertex8& source = part.vertices[vertexIndex];
+            const float x = source.position[0];
+            const float y = source.position[1];
+            const float z = source.position[2];
+            const float worldX = x * world.m[0][0] + y * world.m[1][0] +
+                z * world.m[2][0] + world.m[3][0];
+            const float worldY = x * world.m[0][1] + y * world.m[1][1] +
+                z * world.m[2][1] + world.m[3][1];
+            const float worldZ = x * world.m[0][2] + y * world.m[1][2] +
+                z * world.m[2][2] + world.m[3][2];
+            const float viewX = worldX * view.m[0][0] +
+                worldY * view.m[1][0] + worldZ * view.m[2][0] + view.m[3][0];
+            const float viewY = worldX * view.m[0][1] +
+                worldY * view.m[1][1] + worldZ * view.m[2][1] + view.m[3][1];
+            const float viewZ = worldX * view.m[0][2] +
+                worldY * view.m[1][2] + worldZ * view.m[2][2] + view.m[3][2];
+
+            LeftHandClipVertex8& output = clipVertices[vertexIndex];
+            output.clip[0] = viewX * projection.m[0][0] +
+                viewY * projection.m[1][0] + viewZ * projection.m[2][0] +
+                projection.m[3][0];
+            output.clip[1] = viewX * projection.m[0][1] +
+                viewY * projection.m[1][1] + viewZ * projection.m[2][1] +
+                projection.m[3][1];
+            output.clip[2] = viewX * projection.m[0][2] +
+                viewY * projection.m[1][2] + viewZ * projection.m[2][2] +
+                projection.m[3][2];
+            output.clip[3] = viewX * projection.m[0][3] +
+                viewY * projection.m[1][3] + viewZ * projection.m[2][3] +
+                projection.m[3][3];
+            output.color[0] = static_cast<float>((source.diffuse >> 16u) &
+                0xFFu) / 255.0f;
+            output.color[1] = static_cast<float>((source.diffuse >> 8u) &
+                0xFFu) / 255.0f;
+            output.color[2] = static_cast<float>(source.diffuse & 0xFFu) /
+                255.0f;
+            output.texcoord[0] = source.texcoord[0];
+            output.texcoord[1] = source.texcoord[1];
+        }
+
+        // Clip every source triangle just in front of the camera plane using
+        // W, while retaining the game's original depth projection. Rebuilding
+        // the projection with a millimetre near plane pushes hand depth close
+        // to 1.0 and lets the entire world occlude it in native eye targets.
+        // This creates intersection vertices instead of moving the original
+        // ones, so a hand crossing the camera plane remains watertight.
+        std::vector<LeftHandScreenVertex8> screenVertices;
+        std::vector<std::uint16_t> screenIndices;
+        screenVertices.reserve(part.indices.size() * 2u);
+        screenIndices.reserve(part.indices.size() * 2u);
+        const auto interpolateClipVertex = [](const LeftHandClipVertex8& a,
+            const LeftHandClipVertex8& b, float amount)
+        {
+            LeftHandClipVertex8 result = {};
+            for (int component = 0; component < 4; ++component)
+                result.clip[component] = a.clip[component] +
+                    (b.clip[component] - a.clip[component]) * amount;
+            for (int component = 0; component < 3; ++component)
+                result.color[component] = a.color[component] +
+                    (b.color[component] - a.color[component]) * amount;
+            for (int component = 0; component < 2; ++component)
+                result.texcoord[component] = a.texcoord[component] +
+                    (b.texcoord[component] - a.texcoord[component]) * amount;
+            return result;
+        };
+        const auto emitScreenVertex = [&](const LeftHandClipVertex8& input)
+        {
+            const float safeW = (std::max)(0.000001f, input.clip[3]);
+            const float invW = 1.0f / safeW;
+            LeftHandScreenVertex8 output = {};
+            output.positionRhw[0] = (input.clip[0] * invW + 1.0f) *
+                0.5f * static_cast<float>(targetWidth);
+            output.positionRhw[1] = (1.0f - input.clip[1] * invW) *
+                0.5f * static_cast<float>(targetHeight);
+            const float projectedDepth = input.clip[2] * invW;
+            // The game's projection produces negative Z between the eye and
+            // its regular near plane. Clamping that whole interval to zero
+            // made the palm, back of the hand and weapon coplanar in depth:
+            // whichever triangle happened to draw last became visible. Keep
+            // a narrow viewmodel depth band for this interval instead, while
+            // preserving the normal scene projection above the near plane.
+            const float projectionM22 = projection.m[2][2];
+            const float projectionM23 = projection.m[2][3];
+            const float gameNearW = std::fabs(projectionM22) > 0.000001f
+                ? std::fabs((-projection.m[3][2] / projectionM22) *
+                    projectionM23)
+                : 0.01f;
+            constexpr float kViewmodelDepthBand = 0.002f;
+            // Weapon vertices inside SH3's normal near plane settle at the
+            // front edge of D3D's depth range. Never let the later hand pass
+            // also reach exactly zero: equality there made the hand overwrite
+            // the weapon solely because it was submitted last.
+            constexpr float kNearHandDepthFloor = 0.00075f;
+            if (projectedDepth < 0.0f && gameNearW > 0.000051f)
+            {
+                const float closeDepth = (safeW - 0.00005f) /
+                    (gameNearW - 0.00005f);
+                output.positionRhw[2] = kNearHandDepthFloor +
+                    (kViewmodelDepthBand - kNearHandDepthFloor) *
+                    (std::min)(1.0f, (std::max)(0.0f, closeDepth));
+            }
+            else
+            {
+                const float sceneDepth = (std::min)(1.0f,
+                    (std::max)(0.0f, projectedDepth));
+                output.positionRhw[2] = kViewmodelDepthBand +
+                    (1.0f - kViewmodelDepthBand) * sceneDepth;
+            }
+            output.positionRhw[3] = invW;
+            DWORD channels[3] = {};
+            for (int channel = 0; channel < 3; ++channel)
+                channels[channel] = static_cast<DWORD>((std::min)(1.0f,
+                    (std::max)(0.0f, input.color[channel])) * 255.0f +
+                    0.5f);
+            output.diffuse = 0xFF000000u | (channels[0] << 16u) |
+                (channels[1] << 8u) | channels[2];
+            output.texcoord[0] = input.texcoord[0];
+            output.texcoord[1] = input.texcoord[1];
+            screenVertices.push_back(output);
+            screenIndices.push_back(static_cast<std::uint16_t>(
+                screenVertices.size() - 1u));
+        };
+        for (std::size_t triangle = 0; triangle + 2u < part.indices.size();
+            triangle += 3u)
+        {
+            LeftHandClipVertex8 inputPolygon[4] = {
+                clipVertices[part.indices[triangle]],
+                clipVertices[part.indices[triangle + 1u]],
+                clipVertices[part.indices[triangle + 2u]],
+                {}
+            };
+            LeftHandClipVertex8 clippedPolygon[4] = {};
+            int clippedCount = 0;
+            LeftHandClipVertex8 previous = inputPolygon[2];
+            // Dedicated viewmodel camera plane. The scene's regular near
+            // plane is far too coarse for an object intentionally brought
+            // within centimetres of the eyes. Keep true tracked placement and
+            // clip only geometry that has effectively crossed the eye itself.
+            constexpr float kCameraPlaneW = 0.00005f;
+            float previousDistance = previous.clip[3] - kCameraPlaneW;
+            bool previousInside = previousDistance >= 0.0f;
+            for (int vertex = 0; vertex < 3; ++vertex)
+            {
+                const LeftHandClipVertex8 current = inputPolygon[vertex];
+                const float currentDistance = current.clip[3] -
+                    kCameraPlaneW;
+                const bool currentInside = currentDistance >= 0.0f;
+                if (currentInside != previousInside)
+                {
+                    const float denominator = previousDistance -
+                        currentDistance;
+                    const float amount = std::fabs(denominator) > 0.0000001f
+                        ? previousDistance / denominator : 0.0f;
+                    clippedPolygon[clippedCount++] = interpolateClipVertex(
+                        previous, current, amount);
+                }
+                if (currentInside)
+                    clippedPolygon[clippedCount++] = current;
+                previous = current;
+                previousDistance = currentDistance;
+                previousInside = currentInside;
+            }
+            for (int vertex = 1; vertex + 1 < clippedCount; ++vertex)
+            {
+                if (screenVertices.size() + 3u > 65535u)
+                    break;
+                emitScreenVertex(clippedPolygon[0]);
+                emitScreenVertex(clippedPolygon[vertex]);
+                emitScreenVertex(clippedPolygon[vertex + 1]);
+            }
+        }
+        if (part.materialIndex >= _countof(g_leftHandTextures8) ||
+            FAILED(setTexture(g_device8, 0,
+                g_leftHandTextures8[part.materialIndex])) ||
+            screenVertices.empty() ||
+            FAILED(draw(g_device8, kTriangleList, 0,
+                static_cast<UINT>(screenVertices.size()),
+                static_cast<UINT>(screenIndices.size() / 3u),
+                screenIndices.data(), kIndex16, screenVertices.data(),
+                sizeof(LeftHandScreenVertex8))))
+        {
+            complete = false;
+            break;
+        }
+    }
+    return complete;
+}
+
+static bool RenderLeftHandStereo8()
+{
+    if (!g_leftHandPoseProfile8.enabled || !g_device8 || !g_haveProjection8 ||
+        !EnsureLeftHandResources8(g_device8))
+    {
+        return false;
+    }
+
+    float orientation[4] = {};
+    float position[3] = {};
+    if (!ReadControllerRelativePoseForWeapon8(0, orientation, position))
+    {
+        if (!g_leftHandPoseFailureLogged8)
+        {
+            g_leftHandPoseFailureLogged8 = true;
+            Log("LeftHand: left grip pose is not available yet");
+        }
+        return false;
+    }
+    float rotatedOffset[3] = {};
+    RotateVectorByQuaternion(orientation, g_leftHandPoseProfile8.position,
+        rotatedOffset);
+    for (int axis = 0; axis < 3; ++axis)
+        position[axis] += rotatedOffset[axis];
+
+    D3DMATRIX world = {};
+    BuildLeftHandWorldMatrix8(orientation, position, &world);
+
+    // Sample the untouched desktop scene before switching to the native eye
+    // targets and drawing the hand into them.
+    UpdateLeftHandSceneLighting8();
+
+    IDirect3DSurface8* originalColor = nullptr;
+    IDirect3DSurface8* originalDepth = nullptr;
+    if (!BeginExistingStereoPairPass(&originalColor, &originalDepth))
+    {
+        if (!g_leftHandStereoFailureLogged8)
+        {
+            g_leftHandStereoFailureLogged8 = true;
+            Log("LeftHand: existing native stereo targets are not available at EndScene");
+        }
+        return false;
+    }
+
+    DWORD stateBlock = 0;
+    const bool haveStateBlock = SUCCEEDED(
+        D3D8Slot<PFN8_CreateStateBlock>(g_device8, VT8_CreateStateBlock)(
+            g_device8, 1u, &stateBlock));
+    bool leftComplete = false;
+    bool rightComplete = false;
+    bool desktopComplete = false;
+    if (haveStateBlock)
+    {
+        const auto setRenderState = D3D8Slot<PFN8_SetRenderState>(g_device8,
+            VT8_SetRenderState);
+        const auto setTextureStage = D3D8Slot<PFN8_SetTextureStageState>(
+            g_device8, VT8_SetTextureStageState);
+        setRenderState(g_device8, 7u, TRUE);   // ZENABLE: hand self-depth
+        setRenderState(g_device8, 14u, TRUE);  // ZWRITEENABLE
+        setRenderState(g_device8, 15u, FALSE); // GLB alphaMode = OPAQUE
+        setRenderState(g_device8, 19u, 5u);    // SRCBLEND = SRCALPHA
+        setRenderState(g_device8, 20u, 6u);    // DESTBLEND = INVSRCALPHA
+        // The authored fingers/watch mix thin and double-sided surfaces. Draw
+        // both sides into a fresh view-model depth buffer so the nearest outer
+        // surface hides the inside regardless of local winding.
+        setRenderState(g_device8, 22u, 1u);    // CULLMODE = NONE
+        // Strict LESS is important for the pre-transformed viewmodel. Equal
+        // depth must not let a later back-facing triangle overwrite the
+        // already visible outer surface.
+        setRenderState(g_device8, 23u, 2u);    // ZFUNC = LESS
+        setRenderState(g_device8, 24u, 8u);    // ALPHAREF
+        setRenderState(g_device8, 25u, 5u);    // ALPHAFUNC = GREATER
+        setRenderState(g_device8, 27u, FALSE); // GLB alphaMode = OPAQUE
+        setRenderState(g_device8, 29u, FALSE); // SPECULARENABLE
+        setRenderState(g_device8, 80u, FALSE); // FOGENABLE
+        setRenderState(g_device8, 137u, FALSE); // CPU two-sided lighting
+
+        setTextureStage(g_device8, 0, 1u, 4u); // COLOROP = MODULATE
+        setTextureStage(g_device8, 0, 2u, 2u); // COLORARG1 = TEXTURE
+        setTextureStage(g_device8, 0, 3u, 0u); // COLORARG2 = DIFFUSE
+        setTextureStage(g_device8, 0, 4u, 2u); // ALPHAOP = SELECTARG1
+        setTextureStage(g_device8, 0, 5u, 2u); // ALPHAARG1 = TEXTURE
+        setTextureStage(g_device8, 0, 11u, 0u); // TEXCOORDINDEX = TEXCOORD0
+        setTextureStage(g_device8, 0, 13u, 1u); // ADDRESSU = WRAP (glTF default)
+        setTextureStage(g_device8, 0, 14u, 1u); // ADDRESSV = WRAP (glTF default)
+        setTextureStage(g_device8, 0, 16u, 2u); // MAGFILTER = LINEAR
+        setTextureStage(g_device8, 0, 17u, 2u); // MINFILTER = LINEAR
+        setTextureStage(g_device8, 0, 18u, 0u); // MIPFILTER = NONE
+        setTextureStage(g_device8, 0, 24u, 0u); // TEXTURETRANSFORMFLAGS = DISABLE
+        setTextureStage(g_device8, 1, 1u, 1u); // COLOROP = DISABLE
+        setTextureStage(g_device8, 1, 4u, 1u); // ALPHAOP = DISABLE
+
+        constexpr DWORD kClearDepth = 0x00000002u;
+        // Preserve native eye depth. The tracked hand now uses the same
+        // projection as replayed weapon geometry, so depth testing decides
+        // which model is actually closer to the player.
+        leftComplete = DrawLeftHandEye8(0, world);
+        if (SwitchStereoPairEye(1))
+        {
+            rightComplete = DrawLeftHandEye8(1, world);
+        }
+
+        // The native eye surfaces are not the desktop mirror. Draw a central
+        // (zero-IPD) copy into the actual D3D8 backbuffer as the last scene
+        // element so the monitor shows the same tracked hand.
+        IDirect3DSurface8* desktopBackBuffer = nullptr;
+        const HRESULT backBufferResult = D3D8Slot<PFN8_GetBackBuffer>(
+            g_device8, 16)(g_device8, 0, 0, &desktopBackBuffer);
+        if (SUCCEEDED(backBufferResult) && desktopBackBuffer)
+        {
+            const LONG presentFrame = InterlockedCompareExchange(
+                &c_present8, 0, 0);
+            IDirect3DSurface8* desktopDepth = nullptr;
+            bool preserveWeaponDepth =
+                g_leftHandDesktopWeaponDepthPresent8 == presentFrame &&
+                IsLeftHandDesktopDepthCompatible8(desktopBackBuffer,
+                    g_leftHandDesktopWeaponDepth8);
+            if (preserveWeaponDepth)
+            {
+                desktopDepth = g_leftHandDesktopWeaponDepth8;
+            }
+            else if (EnsureLeftHandDesktopDepth8(desktopBackBuffer))
+            {
+                desktopDepth = g_leftHandDesktopDepth8;
+            }
+            HRESULT bindResult = desktopDepth
+                ? D3D8Slot<PFN8_SetRenderTarget>(g_device8, 31)(g_device8,
+                    desktopBackBuffer, desktopDepth)
+                : E_FAIL;
+            if (FAILED(bindResult) && preserveWeaponDepth &&
+                EnsureLeftHandDesktopDepth8(desktopBackBuffer))
+            {
+                preserveWeaponDepth = false;
+                desktopDepth = g_leftHandDesktopDepth8;
+                bindResult = D3D8Slot<PFN8_SetRenderTarget>(g_device8, 31)(
+                    g_device8, desktopBackBuffer, desktopDepth);
+            }
+            if (SUCCEEDED(bindResult))
+            {
+                setRenderState(g_device8, 7u, TRUE);
+                setRenderState(g_device8, 14u, TRUE);
+                setRenderState(g_device8, 22u, 1u);
+                if (!preserveWeaponDepth)
+                {
+                    o_D3D8_Clear(g_device8, 0, nullptr, kClearDepth,
+                        0, 1.0f, 0);
+                }
+                desktopComplete = DrawLeftHandEye8(2, world);
+            }
+            ReleaseD3D8Surface(desktopBackBuffer);
+        }
+    }
+    else if (!g_leftHandStateFailureLogged8)
+    {
+        g_leftHandStateFailureLogged8 = true;
+        Log("LeftHand: CreateStateBlock failed");
+    }
+    if (haveStateBlock)
+    {
+        D3D8Slot<PFN8_ApplyStateBlock>(g_device8, VT8_ApplyStateBlock)(
+            g_device8, stateBlock);
+        D3D8Slot<PFN8_DeleteStateBlock>(g_device8, VT8_DeleteStateBlock)(
+            g_device8, stateBlock);
+    }
+    EndStereoPairPass(originalColor, originalDepth);
+
+    if (desktopComplete && !g_leftHandDesktopRenderLogged8)
+    {
+        g_leftHandDesktopRenderLogged8 = true;
+        Log("LeftHand: central tracked model is rendering in the desktop backbuffer");
+    }
+    else if (!desktopComplete && !g_leftHandDesktopFailureLogged8)
+    {
+        g_leftHandDesktopFailureLogged8 = true;
+        Log("LeftHand: desktop backbuffer draw failed");
+    }
+
+    if (leftComplete && rightComplete)
+    {
+        InterlockedIncrement(&g_uiStereoOverlayDraws8);
+        if (!g_leftHandRenderLogged8)
+        {
+            g_leftHandRenderLogged8 = true;
+            Log("LeftHand: tracked model is rendering in both native eyes");
+        }
+        return true;
+    }
+    if (!g_leftHandDrawFailureLogged8)
+    {
+        g_leftHandDrawFailureLogged8 = true;
+        Log("LeftHand: eye draw incomplete (left=%d right=%d)",
+            leftComplete ? 1 : 0, rightComplete ? 1 : 0);
+    }
+    return false;
 }
 
 static bool RenderHeavyFullSceneStereo()
@@ -6367,12 +10527,12 @@ static UINT UiVertexCountForPrimitive(DWORD primitiveType,
 
 static bool BuildUiOverlayVertices(const D3D8ViewportLocal& sourceViewport,
     const void* vertices, UINT vertexCount, UINT stride,
-    std::vector<std::uint8_t>* transformed)
+    std::uint32_t eye, std::vector<std::uint8_t>* transformed)
 {
     if (!vertices || !transformed || vertexCount == 0 || stride < 16 ||
         stride > 1024 || sourceViewport.Width == 0 ||
         sourceViewport.Height == 0 || g_stereoTargetWidth8 == 0 ||
-        g_stereoTargetHeight8 == 0)
+        g_stereoTargetHeight8 == 0 || eye > 1)
     {
         return false;
     }
@@ -6397,6 +10557,28 @@ static bool BuildUiOverlayVertices(const D3D8ViewportLocal& sourceViewport,
     const float left = (targetWidth - sourceWidth * scale) * 0.5f;
     const float top = (targetHeight - sourceHeight * scale) * 0.5f;
 
+    // The Host samples each symmetric native eye texture through a different
+    // asymmetric OpenXR FOV rectangle.  Identical raw pixel coordinates in
+    // both eyes therefore do not describe the same final display ray.  Map a
+    // common, aspect-preserved UI position through each eye's source rectangle
+    // so the Host's later crop maps both copies back to exactly the same final
+    // position (zero disparity).  This adjusts the existing subtitle pass; it
+    // does not introduce an additional centered subtitle copy.
+    float eyeRects[2][4] = {};
+    if (!Interop8_ReadProjectionUvRects(eyeRects))
+        return false;
+    const float* rect = eyeRects[eye];
+    const float rectWidth = rect[2] - rect[0];
+    const float rectHeight = rect[3] - rect[1];
+    if (!std::isfinite(rect[0]) || !std::isfinite(rect[1]) ||
+        !std::isfinite(rect[2]) || !std::isfinite(rect[3]) ||
+        rectWidth <= 0.01f || rectHeight <= 0.01f ||
+        rect[0] < -0.25f || rect[1] < -0.25f ||
+        rect[2] > 1.25f || rect[3] > 1.25f)
+    {
+        return false;
+    }
+
     for (UINT index = 0; index < vertexCount; ++index)
     {
         std::uint8_t* vertex = transformed->data() +
@@ -6405,8 +10587,23 @@ static bool BuildUiOverlayVertices(const D3D8ViewportLocal& sourceViewport,
         float y = 0.0f;
         std::memcpy(&x, vertex + 0, sizeof(x));
         std::memcpy(&y, vertex + 4, sizeof(y));
-        x = (x - static_cast<float>(sourceViewport.X)) * scale + left;
-        y = (y - static_cast<float>(sourceViewport.Y)) * scale + top;
+        const float finalX =
+            ((x - static_cast<float>(sourceViewport.X)) * scale + left) /
+            targetWidth;
+        const float finalY =
+            ((y - static_cast<float>(sourceViewport.Y)) * scale + top) /
+            targetHeight;
+        // Monocular subtitle comfort layout requested for Quest 3.  Shrink
+        // uniformly toward the bottom-right safe area, keeping even the
+        // longest original lines completely inside the right-eye image.
+        constexpr float monocularScale = 0.84f;
+        constexpr float safeRightBottom = 0.98f;
+        const float monocularX = safeRightBottom -
+            (1.0f - finalX) * monocularScale;
+        const float monocularY = safeRightBottom -
+            (1.0f - finalY) * monocularScale;
+        x = targetWidth * (rect[0] + monocularX * rectWidth);
+        y = targetHeight * (rect[1] + monocularY * rectHeight);
         std::memcpy(vertex + 0, &x, sizeof(x));
         std::memcpy(vertex + 4, &y, sizeof(y));
     }
@@ -6451,9 +10648,9 @@ static bool DuplicateUiPrimitiveUPForStereo(DWORD primitiveType,
         return false;
     }
 
-    std::vector<std::uint8_t> transformed;
+    std::vector<std::uint8_t> transformedRight;
     if (!BuildUiOverlayVertices(sourceViewport, vertices, vertexCount, stride,
-        &transformed))
+            1, &transformedRight))
     {
         LogUiStereoOverlayFailure8("BuildUiOverlayVertices for UP draw");
         return false;
@@ -6467,14 +10664,14 @@ static bool DuplicateUiPrimitiveUPForStereo(DWORD primitiveType,
         return false;
     }
 
-    bool leftComplete = SetUiOverlayViewport() &&
-        SUCCEEDED(o_D3D8_DrawPrimitiveUP(g_device8, primitiveType,
-            primitiveCount, transformed.data(), stride));
+    // Deliberately do not draw subtitles into the left eye.  A monocular
+    // subtitle cannot acquire contradictory binocular disparity.
+    const bool leftComplete = true;
     bool rightComplete = false;
     if (SwitchStereoPairEye(1) && SetUiOverlayViewport())
     {
         rightComplete = SUCCEEDED(o_D3D8_DrawPrimitiveUP(g_device8,
-            primitiveType, primitiveCount, transformed.data(), stride));
+            primitiveType, primitiveCount, transformedRight.data(), stride));
     }
     EndStereoPairPass(originalColor, originalDepth);
 
@@ -6485,7 +10682,7 @@ static bool DuplicateUiPrimitiveUPForStereo(DWORD primitiveType,
         {
             g_loggedUiStereoOverlay8 = true;
             Log("Stereo UI overlay enabled: FVF 0x%08X, source viewport "
-                "%ux%u, native target %ux%u, centered aspect-preserving "
+                "%ux%u, native target %ux%u, right-eye-only scaled safe "
                 "layout", g_currentVertexShader8, sourceViewport.Width,
                 sourceViewport.Height, g_stereoTargetWidth8,
                 g_stereoTargetHeight8);
@@ -6592,6 +10789,284 @@ static bool BuildFixedFunctionStereoTransforms8(bool eyeOffset,
     g_applyStereoEyeOffset8 = savedEyeOffset;
     g_renderEye8 = savedEye;
     return haveView && haveProjection;
+}
+
+struct FirearmReticleVertex8
+{
+    float x;
+    float y;
+    float z;
+    DWORD diffuse;
+};
+
+static bool BuildWeaponGuideTargetLocal8(int profileIndex, float target[3])
+{
+    if (!target || profileIndex < 0 ||
+        profileIndex >= SH3VR_WEAPON_PROFILE_COUNT8)
+    {
+        return false;
+    }
+
+    PollWeaponIniHotReload8();
+    float gripOrientation[4] = {};
+    float gripPosition[3] = {};
+    if (!ReadRightHandRelativePoseForWeapon8(gripOrientation, gripPosition))
+        return false;
+
+    const WeaponPoseProfile8& profile = g_weaponPoseProfiles8[profileIndex];
+    const float weaponWorldCompensation = g_worldScale8 /
+        SH3VR_DEFAULT_WORLD_SCALE;
+    const float calibratedOffset[3] = {
+        profile.position[0] * weaponWorldCompensation,
+        profile.position[1] * weaponWorldCompensation,
+        profile.position[2] * weaponWorldCompensation
+    };
+    float rotatedOffset[3] = {};
+    RotateVectorByQuaternion(gripOrientation, calibratedOffset,
+        rotatedOffset);
+    for (int axis = 0; axis < 3; ++axis)
+        gripPosition[axis] += rotatedOffset[axis];
+
+    float forward[3] = {};
+    float distanceMeters = 0.0f;
+    if (profileIndex >= 4)
+    {
+        float aimOrientation[4] = {};
+        float unusedAimPosition[3] = {};
+        if (!ReadRightHandRelativeAimPose8(aimOrientation,
+            unusedAimPosition))
+        {
+            return false;
+        }
+        const float pitch = profile.aimPitchRadians;
+        const float yaw = profile.aimYawRadians;
+        const float calibratedForward[3] = {
+            std::sin(yaw) * std::cos(pitch),
+            -std::sin(pitch),
+            std::cos(yaw) * std::cos(pitch)
+        };
+        RotateVectorByQuaternion(aimOrientation, calibratedForward, forward);
+        distanceMeters = profileIndex == 4 ? 2.0f : 8.0f;
+    }
+    else
+    {
+        const float controllerForward[3] = { 0.0f, 0.0f, 1.0f };
+        RotateVectorByQuaternion(gripOrientation, controllerForward, forward);
+        distanceMeters = profileIndex == 0 ? 0.38f :
+            (profileIndex == 1 ? 0.82f :
+                (profileIndex == 2 ? 0.76f : 0.95f));
+    }
+
+    const float forwardLength = std::sqrt(forward[0] * forward[0] +
+        forward[1] * forward[1] + forward[2] * forward[2]);
+    if (!std::isfinite(forwardLength) || forwardLength < 0.001f)
+        return false;
+    for (int axis = 0; axis < 3; ++axis)
+    {
+        forward[axis] /= forwardLength;
+        target[axis] = gripPosition[axis] + forward[axis] *
+            distanceMeters * g_worldScale8;
+    }
+    return true;
+}
+
+static bool BuildWeaponGuideTransforms8(std::uint32_t eye, D3DMATRIX* view,
+    D3DMATRIX* projection)
+{
+    if (!view || !projection || eye > 2 || !g_haveProjection8)
+        return false;
+
+    std::memset(view, 0, sizeof(*view));
+    view->m[0][0] = 1.0f;
+    view->m[1][1] = 1.0f;
+    view->m[2][2] = 1.0f;
+    view->m[3][3] = 1.0f;
+    if (eye < 2)
+    {
+        const float eyeSign = eye == 0 ? -1.0f : 1.0f;
+        view->m[3][0] = -eyeSign * 0.5f * SH3VR_IPD_METERS * g_worldScale8;
+    }
+
+    if (!BuildImmersiveProjection(g_lastProjection8, *projection))
+        return false;
+    const UINT width = eye < 2 ? g_stereoTargetWidth8 :
+        g_gameRenderTargetWidth8;
+    const UINT height = eye < 2 ? g_stereoTargetHeight8 :
+        g_gameRenderTargetHeight8;
+    if (width != 0 && height != 0)
+    {
+        const float aspect = static_cast<float>(width) /
+            static_cast<float>(height);
+        projection->m[0][0] = std::copysign(
+            SH3VR_IMMERSIVE_VERTICAL_SCALE / aspect,
+            projection->m[0][0]);
+    }
+    return true;
+}
+
+static bool RenderFirearmReticleStereo8()
+{
+    if (!g_device8 || !g_haveProjection8)
+        return false;
+
+    const int profileIndex = g_activeWeaponPoseProfile8;
+    if (profileIndex < 0 || profileIndex >= SH3VR_WEAPON_PROFILE_COUNT8)
+        return false;
+
+    float target[3] = {};
+    if (!BuildWeaponGuideTargetLocal8(profileIndex, target))
+        return false;
+
+    const float halfSize = (profileIndex < 4 ? 0.005f : 0.040f) *
+        g_worldScale8;
+    const float right[3] = { halfSize, 0.0f, 0.0f };
+    const float up[3] = { 0.0f, halfSize, 0.0f };
+
+    constexpr DWORD color = 0xFFFFFFFFu;
+    const FirearmReticleVertex8 vertices[4] = {
+        { target[0] - right[0] + up[0],
+          target[1] - right[1] + up[1],
+          target[2] - right[2] + up[2], color },
+        { target[0] + right[0] + up[0],
+          target[1] + right[1] + up[1],
+          target[2] + right[2] + up[2], color },
+        { target[0] - right[0] - up[0],
+          target[1] - right[1] - up[1],
+          target[2] - right[2] - up[2], color },
+        { target[0] + right[0] - up[0],
+          target[1] + right[1] - up[1],
+          target[2] + right[2] - up[2], color }
+    };
+
+    D3DMATRIX leftView = {};
+    D3DMATRIX leftProjection = {};
+    D3DMATRIX rightView = {};
+    D3DMATRIX rightProjection = {};
+    D3DMATRIX desktopView = {};
+    D3DMATRIX desktopProjection = {};
+    if (!BuildWeaponGuideTransforms8(0, &leftView,
+        &leftProjection) ||
+        !BuildWeaponGuideTransforms8(1, &rightView,
+            &rightProjection) ||
+        !BuildWeaponGuideTransforms8(2, &desktopView,
+            &desktopProjection))
+    {
+        return false;
+    }
+
+    IDirect3DSurface8* originalColor = nullptr;
+    IDirect3DSurface8* originalDepth = nullptr;
+    if (!BeginExistingStereoPairPass(&originalColor, &originalDepth))
+        return false;
+
+    DWORD stateBlock = 0;
+    const bool haveStateBlock = SUCCEEDED(
+        D3D8Slot<PFN8_CreateStateBlock>(g_device8, VT8_CreateStateBlock)(
+            g_device8, 1u, &stateBlock));
+    bool leftComplete = false;
+    bool rightComplete = false;
+    bool desktopComplete = false;
+    if (haveStateBlock)
+    {
+        const auto setRenderState = D3D8Slot<PFN8_SetRenderState>(g_device8,
+            VT8_SetRenderState);
+        const auto setTextureStage = D3D8Slot<PFN8_SetTextureStageState>(
+            g_device8, VT8_SetTextureStageState);
+        const auto setTexture = o_D3D8_SetTexture ? o_D3D8_SetTexture
+            : D3D8Slot<PFN_D3D8_SetTexture>(g_device8, VT8_SetTexture);
+        const auto setVertexShader = o_D3D8_SetVertexShader
+            ? o_D3D8_SetVertexShader
+            : D3D8Slot<PFN_D3D8_SetVertexShader>(g_device8,
+                VT8_SetVertexShader);
+
+        D3DMATRIX identity = {};
+        identity.m[0][0] = 1.0f;
+        identity.m[1][1] = 1.0f;
+        identity.m[2][2] = 1.0f;
+        identity.m[3][3] = 1.0f;
+        setTexture(g_device8, 0, nullptr);
+        setVertexShader(g_device8, 0x42u); // XYZ | DIFFUSE
+        setRenderState(g_device8, 7u, FALSE);   // ZENABLE
+        setRenderState(g_device8, 14u, FALSE);  // ZWRITEENABLE
+        setRenderState(g_device8, 22u, 1u);     // CULLMODE = NONE
+        setRenderState(g_device8, 27u, FALSE);  // ALPHABLENDENABLE
+        setRenderState(g_device8, 80u, FALSE);  // FOGENABLE
+        setTextureStage(g_device8, 0, 1u, 2u);  // COLOROP = SELECTARG1
+        setTextureStage(g_device8, 0, 2u, 0u);  // COLORARG1 = DIFFUSE
+        setTextureStage(g_device8, 0, 4u, 2u);  // ALPHAOP = SELECTARG1
+        setTextureStage(g_device8, 0, 5u, 0u);  // ALPHAARG1 = DIFFUSE
+        setTextureStage(g_device8, 1, 1u, 1u);  // COLOROP = DISABLE
+        setTextureStage(g_device8, 1, 4u, 1u);  // ALPHAOP = DISABLE
+
+        leftComplete = SUCCEEDED(o_D3D8_SetTransform(g_device8,
+            SH3VR_D3DTS_WORLD, &identity)) &&
+            SUCCEEDED(o_D3D8_SetTransform(g_device8,
+                SH3VR_D3DTS_VIEW, &leftView)) &&
+            SUCCEEDED(o_D3D8_SetTransform(g_device8,
+                SH3VR_D3DTS_PROJECTION, &leftProjection)) &&
+            SUCCEEDED(o_D3D8_DrawPrimitiveUP(g_device8, 5u, 2u,
+                vertices, sizeof(FirearmReticleVertex8)));
+
+        if (SwitchStereoPairEye(1))
+        {
+            rightComplete = SUCCEEDED(o_D3D8_SetTransform(g_device8,
+                SH3VR_D3DTS_WORLD, &identity)) &&
+                SUCCEEDED(o_D3D8_SetTransform(g_device8,
+                    SH3VR_D3DTS_VIEW, &rightView)) &&
+                SUCCEEDED(o_D3D8_SetTransform(g_device8,
+                    SH3VR_D3DTS_PROJECTION, &rightProjection)) &&
+                SUCCEEDED(o_D3D8_DrawPrimitiveUP(g_device8, 5u, 2u,
+                vertices, sizeof(FirearmReticleVertex8)));
+        }
+
+        // Native eye surfaces are separate from the monitor mirror. Render a
+        // zero-IPD copy into the real backbuffer, with depth disabled, so the
+        // guide remains visible in the desktop view as well.
+        IDirect3DSurface8* desktopBackBuffer = nullptr;
+        const HRESULT backBufferResult = D3D8Slot<PFN8_GetBackBuffer>(
+            g_device8, 16)(g_device8, 0, 0, &desktopBackBuffer);
+        if (SUCCEEDED(backBufferResult) && desktopBackBuffer)
+        {
+            const HRESULT bindResult = D3D8Slot<PFN8_SetRenderTarget>(
+                g_device8, 31)(g_device8, desktopBackBuffer, nullptr);
+            if (SUCCEEDED(bindResult))
+            {
+                D3D8ViewportLocal desktopViewport = {};
+                desktopViewport.Width = g_gameRenderTargetWidth8;
+                desktopViewport.Height = g_gameRenderTargetHeight8;
+                desktopViewport.MinZ = 0.0f;
+                desktopViewport.MaxZ = 1.0f;
+                const bool viewportReady = desktopViewport.Width != 0 &&
+                    desktopViewport.Height != 0 &&
+                    SUCCEEDED(D3D8Slot<PFN8_SetViewport>(g_device8,
+                        VT8_SetViewport)(g_device8, &desktopViewport));
+                desktopComplete = viewportReady &&
+                    SUCCEEDED(o_D3D8_SetTransform(g_device8,
+                        SH3VR_D3DTS_WORLD, &identity)) &&
+                    SUCCEEDED(o_D3D8_SetTransform(g_device8,
+                        SH3VR_D3DTS_VIEW, &desktopView)) &&
+                    SUCCEEDED(o_D3D8_SetTransform(g_device8,
+                        SH3VR_D3DTS_PROJECTION, &desktopProjection)) &&
+                    SUCCEEDED(o_D3D8_DrawPrimitiveUP(g_device8, 5u, 2u,
+                        vertices, sizeof(FirearmReticleVertex8)));
+            }
+            ReleaseD3D8Surface(desktopBackBuffer);
+        }
+
+        D3D8Slot<PFN8_ApplyStateBlock>(g_device8, VT8_ApplyStateBlock)(
+            g_device8, stateBlock);
+        D3D8Slot<PFN8_DeleteStateBlock>(g_device8, VT8_DeleteStateBlock)(
+            g_device8, stateBlock);
+    }
+    EndStereoPairPass(originalColor, originalDepth);
+
+    if (leftComplete && rightComplete && !g_firearmReticleLogged8)
+    {
+        g_firearmReticleLogged8 = true;
+        Log("MotionControls: weapon guide dot is rendering in both native eyes (desktop=%d)",
+            desktopComplete ? 1 : 0);
+    }
+    return leftComplete && rightComplete;
 }
 
 static bool DuplicateFixedFunctionPrimitiveUPForStereo(
@@ -6728,9 +11203,9 @@ static bool DuplicateUiPrimitiveForStereo(DWORD primitiveType,
     D3D8Slot<PFNV8_Unlock>(vertexBuffer, 12)(vertexBuffer);
     D3D8Slot<PFNV8_Release>(vertexBuffer, 2)(vertexBuffer);
 
-    std::vector<std::uint8_t> transformed;
+    std::vector<std::uint8_t> transformedRight;
     if (!BuildUiOverlayVertices(sourceViewport, source.data(), vertexCount,
-        stride, &transformed))
+            stride, 1, &transformedRight))
     {
         return false;
     }
@@ -6740,14 +11215,12 @@ static bool DuplicateUiPrimitiveForStereo(DWORD primitiveType,
     if (!BeginUiStereoPairPass(&originalColor, &originalDepth))
         return false;
 
-    bool leftComplete = SetUiOverlayViewport() &&
-        SUCCEEDED(o_D3D8_DrawPrimitiveUP(g_device8, primitiveType,
-            primitiveCount, transformed.data(), stride));
+    const bool leftComplete = true;
     bool rightComplete = false;
     if (SwitchStereoPairEye(1) && SetUiOverlayViewport())
     {
         rightComplete = SUCCEEDED(o_D3D8_DrawPrimitiveUP(g_device8,
-            primitiveType, primitiveCount, transformed.data(), stride));
+            primitiveType, primitiveCount, transformedRight.data(), stride));
     }
     EndStereoPairPass(originalColor, originalDepth);
 
@@ -6759,7 +11232,8 @@ static bool DuplicateUiPrimitiveForStereo(DWORD primitiveType,
             g_loggedUiStereoOverlay8 = true;
             Log("Stereo UI vertex-buffer overlay enabled: shader/FVF "
                 "0x%08X, atlas 512x512, source viewport %ux%u, native "
-                "target %ux%u", g_currentVertexShader8,
+                "target %ux%u, right-eye-only scaled safe layout",
+                g_currentVertexShader8,
                 sourceViewport.Width, sourceViewport.Height,
                 g_stereoTargetWidth8, g_stereoTargetHeight8);
         }
@@ -6781,9 +11255,9 @@ static bool DuplicateUiIndexedPrimitiveUPForStereo(DWORD primitiveType,
         return false;
     }
 
-    std::vector<std::uint8_t> transformed;
+    std::vector<std::uint8_t> transformedRight;
     if (!BuildUiOverlayVertices(sourceViewport, vertices, vertexCount, stride,
-        &transformed))
+            1, &transformedRight))
     {
         return false;
     }
@@ -6793,16 +11267,13 @@ static bool DuplicateUiIndexedPrimitiveUPForStereo(DWORD primitiveType,
     if (!BeginUiStereoPairPass(&originalColor, &originalDepth))
         return false;
 
-    bool leftComplete = SetUiOverlayViewport() &&
-        SUCCEEDED(o_D3D8_DrawIndexedPrimitiveUP(g_device8, primitiveType,
-            minIndex, vertexCount, primitiveCount, indices, indexFormat,
-            transformed.data(), stride));
+    const bool leftComplete = true;
     bool rightComplete = false;
     if (SwitchStereoPairEye(1) && SetUiOverlayViewport())
     {
         rightComplete = SUCCEEDED(o_D3D8_DrawIndexedPrimitiveUP(g_device8,
             primitiveType, minIndex, vertexCount, primitiveCount, indices,
-            indexFormat, transformed.data(), stride));
+            indexFormat, transformedRight.data(), stride));
     }
     EndStereoPairPass(originalColor, originalDepth);
 
@@ -6813,8 +11284,8 @@ static bool DuplicateUiIndexedPrimitiveUPForStereo(DWORD primitiveType,
         {
             g_loggedUiStereoOverlay8 = true;
             Log("Stereo indexed UI overlay enabled: FVF 0x%08X, source "
-                "viewport %ux%u, native target %ux%u, centered "
-                "aspect-preserving layout", g_currentVertexShader8,
+                "viewport %ux%u, native target %ux%u, right-eye-only "
+                "scaled safe layout", g_currentVertexShader8,
                 sourceViewport.Width, sourceViewport.Height,
                 g_stereoTargetWidth8, g_stereoTargetHeight8);
         }
@@ -6865,10 +11336,30 @@ static HRESULT WINAPI hk_D3D8_SetTransform(IDirect3DDevice8* device, DWORD state
         D3DMATRIX vrView = {};
         if (g_enableExperimentalColumnViewHeadRotation8 &&
             ApplyHeadRotationToColumnView(*matrix, vrView))
-            return o_D3D8_SetTransform(device, state, &vrView);
+        {
+            const HRESULT result = o_D3D8_SetTransform(device, state, &vrView);
+            if (SUCCEEDED(result))
+            {
+                g_flashlightBaseView8 = *matrix;
+                g_flashlightVrView8 = vrView;
+                g_haveFlashlightViewPair8 = true;
+                RefreshHeadTrackedFlashlightProjection8(device);
+            }
+            return result;
+        }
         if (g_enableExperimentalHeadRotation8 &&
             ApplyHeadRotationToMainCamera(*matrix, vrView))
-            return o_D3D8_SetTransform(device, state, &vrView);
+        {
+            const HRESULT result = o_D3D8_SetTransform(device, state, &vrView);
+            if (SUCCEEDED(result))
+            {
+                g_flashlightBaseView8 = *matrix;
+                g_flashlightVrView8 = vrView;
+                g_haveFlashlightViewPair8 = true;
+                RefreshHeadTrackedFlashlightProjection8(device);
+            }
+            return result;
+        }
     }
 
     return o_D3D8_SetTransform(device, state, matrix);
@@ -6932,6 +11423,8 @@ static HRESULT WINAPI hk_D3D8_Present(IDirect3DDevice8* device, const RECT* src,
 {
     g_device8 = device;
     ProbeD3D8Device(device);
+    UpdateMotionWeaponDrawCapture8();
+    TryAutoLoadCameraModFirstPerson();
     EnsureProxyVirtualFPSMode4();
     ApplyProxyVirtualFrameTimeTuple90Hz();
     ApplyProxyFrameTimeState90Hz();
@@ -7009,6 +11502,46 @@ static HRESULT WINAPI hk_D3D8_Present(IDirect3DDevice8* device, const RECT* src,
     // this state would keep the previous native eye texture on screen and hide
     // the newly opened pause menu.
     const bool immersive = g_viewProjectionAppliedThisFrame8;
+    if (immersive != g_previousImmersiveFrame8)
+    {
+        // A save/room load replaces shader objects and may leave a loading or
+        // menu frame between two gameplay scenes. Do not carry partially
+        // filled eye targets, an overflow fallback, or a cached intermediate
+        // render target across that boundary: doing so mixes geometry from
+        // two scenes and appears as severe stereo ghosting.
+        ResetBatchedFog8();
+        g_perDrawStereoProbeDraws8 = 0;
+        g_uiStereoOverlayDraws8 = 0;
+        g_perDrawStereoReplayOverflow8 = false;
+        g_consecutiveStereoReplayOverflowFrames8 = 0;
+        g_perDrawStereoTargetCleared8[0] = false;
+        g_perDrawStereoTargetCleared8[1] = false;
+        g_havePerDrawStereoMatrices8 = false;
+        g_havePerDrawGameMatrix8 = false;
+        g_heavyFullSceneStereo8 = false;
+        g_fullSceneStereoPairReady8 = false;
+        g_fullSceneStereoReplayActive8 = false;
+        g_fullScenePrimaryTargetBound8 = false;
+        g_forceWaterFullSceneStereo8 = false;
+        g_holdPreviousNativeEyeFrame8 = false;
+        g_transientEffectPresentPreviousFrame8 = false;
+        g_recentOffscreenTargetCount8 = 0;
+        std::memset(g_recentOffscreenTargets8, 0,
+            sizeof(g_recentOffscreenTargets8));
+        ReleaseD3D8Surface(g_stereoReplayTarget8);
+        if (g_stereoReplayTargetContainer8)
+        {
+            g_stereoReplayTargetContainer8->Release();
+            g_stereoReplayTargetContainer8 = nullptr;
+        }
+        g_stereoReplayTargetFrame8 = -1;
+        g_primaryTargetRefreshFrame8 = -1;
+        Log(immersive
+            ? "Stereo scene state reset before entering gameplay"
+            : "Stereo scene state reset after leaving gameplay");
+        g_previousImmersiveFrame8 = immersive;
+    }
+    UpdateRoomscaleMovement(immersive);
     if (!immersive)
         ResetBatchedFog8();
     else if (g_perDrawStereoProbeActive8)
@@ -7188,6 +11721,7 @@ static HRESULT WINAPI hk_D3D8_Present(IDirect3DDevice8* device, const RECT* src,
         (immersive && g_enableAlternatingStereo8
         ? g_renderEye8 : 0));
     g_viewProjectionAppliedThisFrame8 = false;
+    g_haveFlashlightViewPair8 = false;
     g_viewCallsThisFrame8 = 0;
     g_projectionCallsThisFrame8 = 0;
     g_transformCallOrdinal8 = 0;
@@ -7281,11 +11815,29 @@ static HRESULT WINAPI hk_D3D8_Present(IDirect3DDevice8* device, const RECT* src,
 static HRESULT WINAPI hk_D3D8_EndScene(IDirect3DDevice8* device)
 {
     g_device8 = device;
+    PollWeaponIniHotReload8();
 
     if (InterlockedIncrement(&c_endScene8) == 1)
     {
         Log("hk_D3D8_EndScene first call, device 0x%08X", (unsigned)(UINT_PTR)device);
         LogRenderCaller("D3D8 EndScene", _ReturnAddress());
+    }
+
+    // Append the tracked hand while the game's D3D8 scene is still open.
+    // Starting a fresh scene from Present is rejected by several D3D8-to-D3D12
+    // wrappers and left the resources loaded without ever issuing a visible draw.
+    const LONG presentFrame = InterlockedCompareExchange(&c_present8, 0, 0);
+    if (g_viewProjectionAppliedThisFrame8 &&
+        g_leftHandRenderedPresent8 != presentFrame &&
+        RenderLeftHandStereo8())
+    {
+        g_leftHandRenderedPresent8 = presentFrame;
+    }
+    if ((g_viewProjectionAppliedThisFrame8 || g_previousImmersiveFrame8) &&
+        g_firearmReticleRenderedPresent8 != presentFrame &&
+        RenderFirearmReticleStereo8())
+    {
+        g_firearmReticleRenderedPresent8 = presentFrame;
     }
 
     return o_D3D8_EndScene(device);
@@ -7294,6 +11846,14 @@ static HRESULT WINAPI hk_D3D8_EndScene(IDirect3DDevice8* device)
 static HRESULT WINAPI hk_D3D8_Reset(IDirect3DDevice8* device, void* presentParams)
 {
     Log("hk_D3D8_Reset called");
+    ReleaseLeftHandResources8();
+    g_haveFlashlightViewPair8 = false;
+    g_haveFlashlightProjectionSource8 = false;
+    g_firearmReticleRenderedPresent8 = -1;
+    g_firearmReticleLogged8 = false;
+    g_flashlightProjectionSeenFrame8 = -1000;
+    g_flashlightProjectionStrength8 = 0.0f;
+    g_loggedLeftHandFlashlight8 = false;
     std::memset(g_currentTextures8, 0, sizeof(g_currentTextures8));
     std::memset(g_currentTextureIsRenderTarget8, 0,
         sizeof(g_currentTextureIsRenderTarget8));
@@ -7330,6 +11890,9 @@ static void HookD3D8Device(IDirect3DDevice8* device)
     HookOne("IDirect3DDevice8::SetViewport", vtable[VT8_SetViewport],
         &hk_D3D8_SetViewport,
         reinterpret_cast<void**>(&o_D3D8_SetViewport));
+    HookOne("IDirect3DDevice8::EndScene", vtable[VT8_EndScene],
+        &hk_D3D8_EndScene,
+        reinterpret_cast<void**>(&o_D3D8_EndScene));
     HookOne("IDirect3DDevice8::SetTransform", vtable[VT8_SetTransform],
         &hk_D3D8_SetTransform, reinterpret_cast<void**>(&o_D3D8_SetTransform));
     if (g_enableRuntimeDiagnostics8 || g_enablePerDrawStereoProbe8)
@@ -7792,6 +12355,87 @@ bool D3D9Hook_Install()
     g_enableFullPassStereo8 = ReadFullPassStereoSetting();
     g_enableGamePostProcess8 = ReadGamePostProcessSetting();
     g_stereoReplayWorldOnly8 = ReadStereoReplayWorldOnlySetting();
+    g_enableWeaponRenderProbe8 =
+        ReadIniIntSetting("MotionControls", "WeaponRenderProbe", 0) != 0;
+    g_enableWeaponPosePrototype8 = ReadIniIntSetting("MotionControls",
+        "EnableWeaponPosePrototype", 0) != 0;
+    g_enableWeaponPoseRotation8 = ReadIniIntSetting("MotionControls",
+        "WeaponPoseRotation", 0) != 0;
+    g_weaponPoseRotateSecondaryBone8 = ReadIniIntSetting("MotionControls",
+        "WeaponPoseRotateSecondaryBone", 0) != 0;
+    g_weaponPoseAbsolutePosition8 = ReadIniIntSetting("MotionControls",
+        "WeaponPoseAbsolutePosition", 1) != 0;
+    LoadWeaponPoseProfiles8();
+    LoadLeftHandPoseProfile8();
+    InitializeWeaponIniHotReload8();
+    g_activeWeaponPoseProfile8 = -1;
+    g_weaponPoseMinimumForward8 = 0.0f;
+    g_weaponPoseDisableClipping8 = true;
+    if (g_enableWeaponRenderProbe8)
+    {
+        Log("MotionControls: WeaponRenderProbe=1; press the right grip while "
+            "an equipped melee weapon is visible to capture its draw passes");
+    }
+    if (g_enableWeaponPosePrototype8)
+    {
+        Log("MotionControls: EnableWeaponPosePrototype=1; %d weapon profiles loaded from sh3vr_weapons.ini (rotation %s, absolute position %s)",
+            SH3VR_WEAPON_PROFILE_COUNT8,
+            g_enableWeaponPoseRotation8 ? "enabled" : "disabled",
+            g_weaponPoseAbsolutePosition8 ? "enabled" : "disabled");
+    }
+    if (g_leftHandPoseProfile8.enabled)
+    {
+        Log("LeftHand: enabled from sh3vr_weapons.ini (scale %d%%, local position %d/%d/%d)",
+            static_cast<int>(std::lround(g_leftHandPoseProfile8.scale * 100.0f)),
+            static_cast<int>(g_leftHandPoseProfile8.position[0]),
+            static_cast<int>(g_leftHandPoseProfile8.position[1]),
+            static_cast<int>(g_leftHandPoseProfile8.position[2]));
+    }
+    g_enableRoomscale8 =
+        ReadIniIntSetting("Roomscale", "Enable", 1) != 0;
+    int roomscalePlayerHeightCm =
+        ReadIniIntSetting("Roomscale", "PlayerHeightCm", 165);
+    roomscalePlayerHeightCm = std::clamp(roomscalePlayerHeightCm, 120, 220);
+    g_roomscalePlayerHeightMeters8 =
+        static_cast<float>(roomscalePlayerHeightCm) / 100.0f;
+    int roomscaleFullKeySpeedCmPerSecond = ReadIniIntSetting(
+        "Roomscale", "FullSpeedCmPerSecond", 150);
+    roomscaleFullKeySpeedCmPerSecond = std::clamp(
+        roomscaleFullKeySpeedCmPerSecond, 50, 400);
+    g_roomscaleFullKeySpeedMetersPerSecond8 =
+        static_cast<float>(roomscaleFullKeySpeedCmPerSecond) / 100.0f;
+    int worldScale = ReadIniIntSetting("Roomscale", "WorldScale",
+        static_cast<int>(SH3VR_DEFAULT_WORLD_SCALE));
+    worldScale = std::clamp(worldScale, 200, 600);
+    // WorldScale is a user-facing perceived-size control: values below the
+    // 360 baseline must make the world smaller. Internally the renderer needs
+    // the inverse quantity (SH3 game units per physical metre) for IPD, head
+    // translation, controllers, weapons, and the tracked hand. Keeping the
+    // conversion in one place prevents the world and held objects from
+    // drifting to different physical scales.
+    g_worldScale8 = (SH3VR_DEFAULT_WORLD_SCALE *
+        SH3VR_DEFAULT_WORLD_SCALE) / static_cast<float>(worldScale);
+    g_autoLoadCameraModFirstPerson8 =
+        ReadIniIntSetting("CameraMod", "AutoLoadFirstPerson", 1) != 0;
+    g_enableCameraModSnapTurn8 =
+        ReadInputSetting("EnableCameraModRightStick", 1) != 0;
+    g_enableHeadTrackedFlashlight8 =
+        ReadInputSetting("HeadTrackedFlashlight", 0) != 0;
+    int cameraModSnapActivation =
+        ReadInputSetting("CameraModSnapTurnActivation", 65);
+    cameraModSnapActivation = std::clamp(cameraModSnapActivation, 20, 95);
+    g_cameraModSnapTurnActivation8 =
+        static_cast<float>(cameraModSnapActivation) / 100.0f;
+    int cameraModSnapDegrees =
+        ReadInputSetting("CameraModSnapTurnDegrees", 45);
+    cameraModSnapDegrees = std::clamp(cameraModSnapDegrees, 15, 180);
+    g_cameraModSnapTurnDegrees8 = static_cast<float>(cameraModSnapDegrees);
+    int cameraModCharacterAlignMilliseconds =
+        ReadInputSetting("CameraModCharacterAlignMilliseconds", 34);
+    cameraModCharacterAlignMilliseconds = std::clamp(
+        cameraModCharacterAlignMilliseconds, 16, 100);
+    g_cameraModCharacterAlignMilliseconds8 =
+        static_cast<DWORD>(cameraModCharacterAlignMilliseconds);
     if (g_enableFullPassStereo8)
     {
         // The full-scene path is deliberately mutually exclusive with the
@@ -7875,6 +12519,25 @@ bool D3D9Hook_Install()
     Log("Loaded [Stereo] ReplayWorldOnly=%s; per-draw replay shader "
         "filter %s", g_stereoReplayWorldOnly8 ? "1" : "0",
         g_stereoReplayWorldOnly8 ? "world shader 0x2D only" : "full allowlist");
+    Log("Loaded [Roomscale] WorldScale=%d perceived-size units; internal "
+        "tracking scale %.1f game units per meter",
+        worldScale, g_worldScale8);
+    Log("Loaded [Input] Camera Mod integrated snap turn=%s; activation %d%%, "
+        "angle %d degrees, Heather alignment pulse %d ms",
+        g_enableCameraModSnapTurn8 ? "1" : "0",
+        cameraModSnapActivation, cameraModSnapDegrees,
+        cameraModCharacterAlignMilliseconds);
+    Log("Loaded [Input] HeadTrackedFlashlight=%s; SH3 flashlight projection "
+        "c80-c82 follows the headset",
+        g_enableHeadTrackedFlashlight8 ? "1" : "0");
+    Log("Loaded [CameraMod] AutoLoadFirstPerson=%s",
+        g_autoLoadCameraModFirstPerson8 ? "1" : "0");
+    Log("Loaded [Roomscale] Enable=%s; PlayerHeightCm=%d; "
+        "FullSpeedCmPerSecond=%d; follow radius %d cm",
+        g_enableRoomscale8 ? "1" : "0", roomscalePlayerHeightCm,
+        roomscaleFullKeySpeedCmPerSecond,
+        static_cast<int>(std::lround(
+            SH3VR_ROOMSCALE_FOLLOW_RADIUS_METERS * 100.0f)));
     if (g_enableFixedStep90Test8)
     {
         Log("Loaded [Timing] FixedStep90Test=1 from sh3vr.ini; "
@@ -7964,6 +12627,7 @@ void D3D9Hook_Remove()
 
     if (g_minHookReady)
     {
+        ReleaseLeftHandResources8();
         ReleaseStereoRenderTargets();
         ReleaseD3D12EyeTextureSharedHandles();
         ReleaseDxgiBackBufferSharedHandles();

@@ -1,0 +1,101 @@
+; SH3VR per-weapon visual calibration.
+; Copy this file next to sh3.exe as sh3vr_weapons.ini.
+; Values are reloaded automatically while the game is running.
+;
+; Position uses controller-local game units:
+; X = right/left, Y = down/up, Z = forward/back.
+; Rotation uses degrees around the controller-local axes.
+; Firearms also support AimPitchDegrees and AimYawDegrees. A negative aim
+; pitch lowers both the bullet ray and reticle; yaw adjusts them horizontally.
+
+; Optional immersive left hand rendered from sh3vr_lefthand.mesh.
+; These values are independent from every weapon profile below.
+[LeftHand]
+Enabled=1
+ScalePercent=100
+PositionX=0
+PositionY=0
+PositionZ=0
+RotationPitchDegrees=0
+RotationYawDegrees=0
+RotationRollDegrees=0
+
+[Knife]
+ScalePercent=70
+PositionX=0
+PositionY=0
+PositionZ=0
+RotationPitchDegrees=90
+RotationYawDegrees=90
+RotationRollDegrees=45
+
+[Steel Pipe]
+ScalePercent=100
+PositionX=0
+PositionY=0
+PositionZ=0
+RotationPitchDegrees=90
+RotationYawDegrees=90
+RotationRollDegrees=45
+
+[Maul]
+ScalePercent=100
+PositionX=0
+PositionY=0
+PositionZ=0
+RotationPitchDegrees=90
+RotationYawDegrees=90
+RotationRollDegrees=45
+
+[Katana]
+ScalePercent=100
+PositionX=0
+PositionY=0
+PositionZ=0
+RotationPitchDegrees=90
+RotationYawDegrees=90
+RotationRollDegrees=45
+
+[Stun Gun]
+ScalePercent=100
+PositionX=0
+PositionY=0
+PositionZ=0
+RotationPitchDegrees=90
+RotationYawDegrees=90
+RotationRollDegrees=45
+AimPitchDegrees=-18
+AimYawDegrees=0
+
+[Handgun]
+ScalePercent=100
+PositionX=0
+PositionY=0
+PositionZ=0
+RotationPitchDegrees=90
+RotationYawDegrees=90
+RotationRollDegrees=45
+AimPitchDegrees=-18
+AimYawDegrees=0
+
+[Shotgun]
+ScalePercent=100
+PositionX=0
+PositionY=0
+PositionZ=0
+RotationPitchDegrees=90
+RotationYawDegrees=90
+RotationRollDegrees=45
+AimPitchDegrees=-18
+AimYawDegrees=0
+
+[Submachine Gun]
+ScalePercent=100
+PositionX=0
+PositionY=0
+PositionZ=0
+RotationPitchDegrees=90
+RotationYawDegrees=90
+RotationRollDegrees=45
+AimPitchDegrees=-18
+AimYawDegrees=0

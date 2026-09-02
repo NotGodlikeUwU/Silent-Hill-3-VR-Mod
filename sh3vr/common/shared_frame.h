@@ -71,6 +71,15 @@ enum Sh3VrControllerButton : std::uint32_t
     SH3VR_BUTTON_MENU = 1u << 10
 };
 
+enum Sh3VrRoomscaleMovement : std::uint32_t
+{
+    SH3VR_ROOMSCALE_NONE = 0,
+    SH3VR_ROOMSCALE_FORWARD = 1u << 0,
+    SH3VR_ROOMSCALE_BACKWARD = 1u << 1,
+    SH3VR_ROOMSCALE_LEFT = 1u << 2,
+    SH3VR_ROOMSCALE_RIGHT = 1u << 3
+};
+
 struct Sh3VrHeadPose
 {
     std::uint32_t flags;
@@ -111,6 +120,42 @@ struct Sh3VrControllerState
 
 static_assert(sizeof(Sh3VrControllerState) == 224,
     "The shared controller state ABI must remain exactly 224 bytes.");
+
+// Optional diagnostic payload stored at the beginning of
+// Sh3VrFrameHeader::reserved. It does not change the shared-memory ABI.
+inline constexpr std::uint32_t SH3VR_WEAPON_DEBUG_MAGIC = 0x47554244u;
+struct Sh3VrWeaponDebugState
+{
+    std::uint32_t magic;
+    std::uint32_t weaponValid;
+    std::int32_t profileIndex;
+    float pitchDegrees;
+    float yawDegrees;
+    float rollDegrees;
+    std::uint32_t leftHandValid;
+    float leftHandPitchDegrees;
+    float leftHandYawDegrees;
+    float leftHandRollDegrees;
+};
+
+static_assert(sizeof(Sh3VrWeaponDebugState) == 40,
+    "Weapon debug state must fit in the reserved frame-header area.");
+
+// Host-owned projection metadata stored separately from the proxy-owned
+// weapon diagnostics in Sh3VrFrameHeader::reserved.  The native eye textures
+// are sampled through asymmetric OpenXR FOV rectangles.  Screen-space UI must
+// know those rectangles so its two copies land on the same final display ray.
+inline constexpr std::uint32_t SH3VR_PROJECTION_UV_MAGIC = 0x56505553u;
+inline constexpr std::uint32_t SH3VR_PROJECTION_UV_RESERVED_OFFSET = 64u;
+struct Sh3VrProjectionUvState
+{
+    std::uint32_t magic;
+    volatile std::int32_t sequence;
+    float eyeRect[2][4];
+};
+
+static_assert(sizeof(Sh3VrProjectionUvState) == 40,
+    "Projection UV state must fit in the reserved frame-header area.");
 
 struct Sh3VrFrameHeader
 {

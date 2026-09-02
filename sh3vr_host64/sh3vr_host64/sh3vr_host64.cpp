@@ -54,6 +54,9 @@ struct HostSettings
     float gamePostProcessStrength = 0.80f;
     float gamePostProcessContrast = 0.95f;
     float gamePostProcessExposureStops = 0.18f;
+    // Drawn by the D3D11 OpenXR compositor, after the game image for each eye.
+    // This deliberately never touches the legacy D3D8 state used by hands.
+    bool controllerOrientationDebug = false;
 };
 
 HostSettings g_settings = {};
@@ -117,6 +120,8 @@ void LoadSettings()
         L"EnableColorCorrection", 1, path);
     const UINT enableGamePostProcess = GetPrivateProfileIntW(L"Image",
         L"EnableGamePostProcess", 0, path);
+    const UINT controllerOrientationDebug = GetPrivateProfileIntW(L"Debug",
+        L"ControllerOrientationOverlay", 0, path);
     if ((width == 0 && height == 0) ||
         (width >= 64 && width <= 4096 && height >= 64 && height <= 4096))
     {
@@ -146,6 +151,7 @@ void LoadSettings()
     g_settings.requestRefreshRate = requestRefreshRate != 0;
     g_settings.enableColorCorrection = enableColorCorrection != 0;
     g_settings.enableGamePostProcess = enableGamePostProcess != 0;
+    g_settings.controllerOrientationDebug = controllerOrientationDebug != 0;
     g_settings.exposureStops = ReadIniFloat(path, L"Image", L"ExposureStops",
         -1.5f, -4.0f, 2.0f);
     g_settings.contrast = ReadIniFloat(path, L"Image", L"Contrast",
@@ -181,6 +187,8 @@ void LoadSettings()
         g_settings.gamePostProcessStrength,
         g_settings.gamePostProcessContrast,
         g_settings.gamePostProcessExposureStops);
+    Log("Debug: ControllerOrientationOverlay=%u (host compositor)",
+        g_settings.controllerOrientationDebug ? 1u : 0u);
 }
 
 void Log(const char* format, ...)
@@ -447,6 +455,22 @@ public:
             &m_header->controllerStateSequence));
     }
 
+    void PublishProjectionUvRects(
+        const std::array<std::array<float, 4>, 2>& eyeRects)
+    {
+        if (!m_header)
+            return;
+
+        auto* state = reinterpret_cast<Sh3VrProjectionUvState*>(
+            m_header->reserved + SH3VR_PROJECTION_UV_RESERVED_OFFSET);
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&state->sequence));
+        MemoryBarrier();
+        state->magic = SH3VR_PROJECTION_UV_MAGIC;
+        std::memcpy(state->eyeRect, eyeRects.data(), sizeof(state->eyeRect));
+        MemoryBarrier();
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&state->sequence));
+    }
+
 private:
     bool ValidateHeader() const
     {
@@ -560,7 +584,9 @@ public:
         const XrResult headResult = xrLocateSpace(m_viewSpace, m_appSpace,
             frameState.predictedDisplayTime, &headLocation);
         if (XR_SUCCEEDED(headResult))
+        {
             consumer.PublishHeadPose(frameState.predictedDisplayTime, headLocation);
+        }
         else if (!m_headLocateFailureLogged)
         {
             Log("xrLocateSpace(VIEW) failed with XrResult %d",
@@ -600,18 +626,21 @@ public:
                 if (XR_SUCCEEDED(locateResult) && viewCount == locatedViews.size())
                 {
                     submitProjection = true;
+                    std::array<std::array<float, 4>, 2> projectionUvRects = {};
                     for (std::size_t eye = 0; eye < locatedViews.size(); ++eye)
                     {
                         const XrFovf guardBandFov = BuildGuardBandFov(
                             locatedViews[eye].fov, nativeEyeSourcesReady);
-                        if (!RenderEye(eye,
-                            BuildProjectionUvRect(guardBandFov,
-                                nativeEyeSourcesReady)))
+                        projectionUvRects[eye] = BuildProjectionUvRect(
+                            guardBandFov, nativeEyeSourcesReady);
+                        if (!RenderEye(eye, projectionUvRects[eye]))
                         {
                             submitProjection = false;
                             break;
                         }
                     }
+                    if (submitProjection && nativeEyeSourcesReady)
+                        consumer.PublishProjectionUvRects(projectionUvRects);
                     submitLayer = submitProjection;
                 }
                 else
@@ -663,32 +692,87 @@ public:
                         m_frameRenderPose.position[2]
                     }
                 };
-                const XrVector3f currentEyeOffset{
-                    locatedViews[eye].pose.position.x - headLocation.pose.position.x,
-                    locatedViews[eye].pose.position.y - headLocation.pose.position.y,
-                    locatedViews[eye].pose.position.z - headLocation.pose.position.z
-                };
-                const XrQuaternionf inverseCurrentHead{
-                    -headLocation.pose.orientation.x,
-                    -headLocation.pose.orientation.y,
-                    -headLocation.pose.orientation.z,
-                    headLocation.pose.orientation.w
-                };
-                const XrVector3f localEyeOffset = RotateVector(
-                    inverseCurrentHead, currentEyeOffset);
-                const XrVector3f renderEyeOffset = RotateVector(
-                    renderHeadPose.orientation, localEyeOffset);
-                projectionViews[eye].pose.position = {
-                    renderHeadPose.position.x + renderEyeOffset.x,
-                    renderHeadPose.position.y + renderEyeOffset.y,
-                    renderHeadPose.position.z + renderEyeOffset.z
-                };
+                if (nativeEyeSourcesReady)
+                {
+                    // The game hook renders a parallel 64 mm stereo pair: the
+                    // two cameras differ only by +/-32 mm on head-local X.
+                    // Do not describe those textures with the runtime's eye
+                    // poses, which can contain small Y/Z offsets and per-eye
+                    // rotations. That pose mismatch is negligible at a
+                    // distance but creates strong vertical disparity for a
+                    // hand, weapon, or wall close to the lower lens area.
+                    constexpr float renderedHalfIpdMeters = 0.032f;
+                    const float eyeSign = eye == 0 ? -1.0f : 1.0f;
+                    const XrVector3f localRenderedEyeOffset{
+                        eyeSign * renderedHalfIpdMeters, 0.0f, 0.0f
+                    };
+                    const XrVector3f renderedEyeOffset = RotateVector(
+                        renderHeadPose.orientation, localRenderedEyeOffset);
+                    projectionViews[eye].pose.position = {
+                        renderHeadPose.position.x + renderedEyeOffset.x,
+                        renderHeadPose.position.y + renderedEyeOffset.y,
+                        renderHeadPose.position.z + renderedEyeOffset.z
+                    };
+                    // Preserve the eye-relative orientation that belongs to
+                    // the runtime's asymmetric FOV. Removing it makes the
+                    // center look correct while the headset is level, but
+                    // after a menu transition and a larger head rotation the
+                    // two images diverge and distant geometry leaves the
+                    // submitted frustum. Only the positional Y/Z mismatch is
+                    // absent from the game's parallel camera pair.
+                    const XrQuaternionf inverseCurrentHead{
+                        -headLocation.pose.orientation.x,
+                        -headLocation.pose.orientation.y,
+                        -headLocation.pose.orientation.z,
+                        headLocation.pose.orientation.w
+                    };
+                    const XrQuaternionf eyeRelativeOrientation =
+                        MultiplyQuaternions(inverseCurrentHead,
+                            locatedViews[eye].pose.orientation);
+                    projectionViews[eye].pose.orientation =
+                        MultiplyQuaternions(renderHeadPose.orientation,
+                            eyeRelativeOrientation);
+                    if (!m_nativeEyePoseMatchLogged && eye == 1)
+                    {
+                        m_nativeEyePoseMatchLogged = true;
+                        Log("Native eye submission uses the rendered parallel "
+                            "64 mm camera positions and runtime FOV-relative "
+                            "eye orientations");
+                    }
+                }
+                else
+                {
+                    const XrVector3f currentEyeOffset{
+                        locatedViews[eye].pose.position.x -
+                            headLocation.pose.position.x,
+                        locatedViews[eye].pose.position.y -
+                            headLocation.pose.position.y,
+                        locatedViews[eye].pose.position.z -
+                            headLocation.pose.position.z
+                    };
+                    const XrQuaternionf inverseCurrentHead{
+                        -headLocation.pose.orientation.x,
+                        -headLocation.pose.orientation.y,
+                        -headLocation.pose.orientation.z,
+                        headLocation.pose.orientation.w
+                    };
+                    const XrVector3f localEyeOffset = RotateVector(
+                        inverseCurrentHead, currentEyeOffset);
+                    const XrVector3f renderEyeOffset = RotateVector(
+                        renderHeadPose.orientation, localEyeOffset);
+                    projectionViews[eye].pose.position = {
+                        renderHeadPose.position.x + renderEyeOffset.x,
+                        renderHeadPose.position.y + renderEyeOffset.y,
+                        renderHeadPose.position.z + renderEyeOffset.z
+                    };
 
-                const XrQuaternionf eyeRelativeOrientation =
-                    MultiplyQuaternions(inverseCurrentHead,
-                        locatedViews[eye].pose.orientation);
-                projectionViews[eye].pose.orientation = MultiplyQuaternions(
-                    renderHeadPose.orientation, eyeRelativeOrientation);
+                    const XrQuaternionf eyeRelativeOrientation =
+                        MultiplyQuaternions(inverseCurrentHead,
+                            locatedViews[eye].pose.orientation);
+                    projectionViews[eye].pose.orientation =
+                        MultiplyQuaternions(renderHeadPose.orientation,
+                            eyeRelativeOrientation);
+                }
             }
             else
             {
@@ -1579,11 +1663,34 @@ float4 StatsPsMain(VertexOutput input) : SV_Target
     }
     return float4(colorSum / 64.0, saturationSum / 64.0);
 }
+struct DebugVertexInput
+{
+    float2 position : POSITION;
+    float4 color : COLOR;
+};
+struct DebugVertexOutput
+{
+    float4 position : SV_Position;
+    float4 color : COLOR;
+};
+DebugVertexOutput DebugVsMain(DebugVertexInput input)
+{
+    DebugVertexOutput output;
+    output.position = float4(input.position, 0.0, 1.0);
+    output.color = input.color;
+    return output;
+}
+float4 DebugPsMain(DebugVertexOutput input) : SV_Target
+{
+    return input.color;
+}
 )";
 
         ComPtr<ID3DBlob> vertexCode;
         ComPtr<ID3DBlob> pixelCode;
         ComPtr<ID3DBlob> statsPixelCode;
+        ComPtr<ID3DBlob> debugVertexCode;
+        ComPtr<ID3DBlob> debugPixelCode;
         ComPtr<ID3DBlob> errors;
         HRESULT result = D3DCompile(shaderSource, sizeof(shaderSource), "sh3vr_blit.hlsl",
             nullptr, nullptr, "VsMain", "vs_4_0", 0, 0, &vertexCode, &errors);
@@ -1604,6 +1711,28 @@ float4 StatsPsMain(VertexOutput input) : SV_Target
         }
         errors.Reset();
         result = D3DCompile(shaderSource, sizeof(shaderSource), "sh3vr_blit.hlsl",
+            nullptr, nullptr, "DebugVsMain", "vs_4_0", 0, 0,
+            &debugVertexCode, &errors);
+        if (FAILED(result))
+        {
+            Log("Debug overlay vertex shader compilation failed: %s",
+                errors ? static_cast<const char*>(errors->GetBufferPointer()) :
+                "unknown error");
+            return false;
+        }
+        errors.Reset();
+        result = D3DCompile(shaderSource, sizeof(shaderSource), "sh3vr_blit.hlsl",
+            nullptr, nullptr, "DebugPsMain", "ps_4_0", 0, 0,
+            &debugPixelCode, &errors);
+        if (FAILED(result))
+        {
+            Log("Debug overlay pixel shader compilation failed: %s",
+                errors ? static_cast<const char*>(errors->GetBufferPointer()) :
+                "unknown error");
+            return false;
+        }
+        errors.Reset();
+        result = D3DCompile(shaderSource, sizeof(shaderSource), "sh3vr_blit.hlsl",
             nullptr, nullptr, "StatsPsMain", "ps_4_0", 0, 0,
             &statsPixelCode, &errors);
         if (FAILED(result))
@@ -1620,9 +1749,57 @@ float4 StatsPsMain(VertexOutput input) : SV_Target
                 pixelCode->GetBufferSize(), nullptr, &m_pixelShader)) ||
             FAILED(m_device->CreatePixelShader(statsPixelCode->GetBufferPointer(),
                 statsPixelCode->GetBufferSize(), nullptr,
-                &m_statsPixelShader)))
+                &m_statsPixelShader)) ||
+            FAILED(m_device->CreateVertexShader(debugVertexCode->GetBufferPointer(),
+                debugVertexCode->GetBufferSize(), nullptr,
+                &m_debugVertexShader)) ||
+            FAILED(m_device->CreatePixelShader(debugPixelCode->GetBufferPointer(),
+                debugPixelCode->GetBufferSize(), nullptr,
+                &m_debugPixelShader)))
         {
             Log("Failed to create blit shaders");
+            return false;
+        }
+
+        const D3D11_INPUT_ELEMENT_DESC debugElements[] = {
+            { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0,
+                D3D11_INPUT_PER_VERTEX_DATA, 0 },
+            { "COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 8,
+                D3D11_INPUT_PER_VERTEX_DATA, 0 }
+        };
+        if (FAILED(m_device->CreateInputLayout(debugElements,
+            static_cast<UINT>(std::size(debugElements)),
+            debugVertexCode->GetBufferPointer(), debugVertexCode->GetBufferSize(),
+            &m_debugInputLayout)))
+        {
+            Log("Failed to create debug overlay input layout");
+            return false;
+        }
+        D3D11_BUFFER_DESC debugVertexDesc = {};
+        debugVertexDesc.ByteWidth = 4096u * 6u * sizeof(float);
+        debugVertexDesc.Usage = D3D11_USAGE_DYNAMIC;
+        debugVertexDesc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+        debugVertexDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (FAILED(m_device->CreateBuffer(&debugVertexDesc, nullptr,
+            &m_debugVertexBuffer)))
+        {
+            Log("Failed to create debug overlay vertex buffer");
+            return false;
+        }
+        D3D11_BLEND_DESC debugBlendDesc = {};
+        debugBlendDesc.RenderTarget[0].BlendEnable = TRUE;
+        debugBlendDesc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+        debugBlendDesc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+        debugBlendDesc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+        debugBlendDesc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+        debugBlendDesc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+        debugBlendDesc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        debugBlendDesc.RenderTarget[0].RenderTargetWriteMask =
+            D3D11_COLOR_WRITE_ENABLE_ALL;
+        if (FAILED(m_device->CreateBlendState(&debugBlendDesc,
+            &m_debugBlendState)))
+        {
+            Log("Failed to create debug overlay blend state");
             return false;
         }
 
@@ -1754,6 +1931,34 @@ float4 StatsPsMain(VertexOutput input) : SV_Target
 
         UpdateD3D12BackBufferSource(metadata);
         UpdateD3D12EyeSources(metadata);
+
+        Sh3VrWeaponDebugState weaponDebug = {};
+        std::memcpy(&weaponDebug, metadata.reserved, sizeof(weaponDebug));
+        m_debugWeaponOrientationValid =
+            weaponDebug.magic == SH3VR_WEAPON_DEBUG_MAGIC &&
+            weaponDebug.weaponValid != 0 &&
+            std::isfinite(weaponDebug.pitchDegrees) &&
+            std::isfinite(weaponDebug.yawDegrees) &&
+            std::isfinite(weaponDebug.rollDegrees);
+        if (m_debugWeaponOrientationValid)
+        {
+            m_debugWeaponPitch = weaponDebug.pitchDegrees;
+            m_debugWeaponYaw = weaponDebug.yawDegrees;
+            m_debugWeaponRoll = weaponDebug.rollDegrees;
+            m_debugWeaponProfileIndex = weaponDebug.profileIndex;
+        }
+        m_debugLeftHandOrientationValid =
+            weaponDebug.magic == SH3VR_WEAPON_DEBUG_MAGIC &&
+            weaponDebug.leftHandValid != 0 &&
+            std::isfinite(weaponDebug.leftHandPitchDegrees) &&
+            std::isfinite(weaponDebug.leftHandYawDegrees) &&
+            std::isfinite(weaponDebug.leftHandRollDegrees);
+        if (m_debugLeftHandOrientationValid)
+        {
+            m_debugLeftHandPitch = weaponDebug.leftHandPitchDegrees;
+            m_debugLeftHandYaw = weaponDebug.leftHandYawDegrees;
+            m_debugLeftHandRoll = weaponDebug.leftHandRollDegrees;
+        }
 
         if (metadata.renderMode != m_renderMode)
         {
@@ -2298,6 +2503,195 @@ float4 StatsPsMain(VertexOutput input) : SV_Target
         m_colorStatsInitialized[statsIndex] = true;
     }
 
+    struct DebugOverlayVertex
+    {
+        float x;
+        float y;
+        float r;
+        float g;
+        float b;
+        float a;
+    };
+
+    bool ReadDebugWeaponEuler(float& pitch, float& yaw, float& roll) const
+    {
+        if (!m_debugWeaponOrientationValid)
+            return false;
+        pitch = m_debugWeaponPitch;
+        yaw = m_debugWeaponYaw;
+        roll = m_debugWeaponRoll;
+        return true;
+    }
+
+    bool ReadDebugLeftHandEuler(float& pitch, float& yaw, float& roll) const
+    {
+        if (!m_debugLeftHandOrientationValid)
+            return false;
+        pitch = m_debugLeftHandPitch;
+        yaw = m_debugLeftHandYaw;
+        roll = m_debugLeftHandRoll;
+        return true;
+    }
+
+    static std::uint8_t DebugSegmentMask(char character)
+    {
+        switch (character)
+        {
+        case '0': return 0x3Fu;
+        case '1': return 0x06u;
+        case '2': return 0x5Bu;
+        case '3': return 0x4Fu;
+        case '4': return 0x66u;
+        case '5': return 0x6Du;
+        case '6': return 0x7Du;
+        case '7': return 0x07u;
+        case '8': return 0x7Fu;
+        case '9': return 0x6Fu;
+        case '-': return 0x40u;
+        case 'P': return 0x73u;
+        case 'Y': return 0x6Eu;
+        case 'R': return 0x50u;
+        default: return 0u;
+        }
+    }
+
+    static void AddDebugRect(std::vector<DebugOverlayVertex>& vertices,
+        float left, float top, float right, float bottom,
+        float width, float height, const std::array<float, 4>& color)
+    {
+        const float x0 = left / width * 2.0f - 1.0f;
+        const float x1 = right / width * 2.0f - 1.0f;
+        const float y0 = 1.0f - top / height * 2.0f;
+        const float y1 = 1.0f - bottom / height * 2.0f;
+        const DebugOverlayVertex a = { x0, y0, color[0], color[1],
+            color[2], color[3] };
+        const DebugOverlayVertex b = { x1, y0, color[0], color[1],
+            color[2], color[3] };
+        const DebugOverlayVertex c = { x1, y1, color[0], color[1],
+            color[2], color[3] };
+        const DebugOverlayVertex d = { x0, y1, color[0], color[1],
+            color[2], color[3] };
+        vertices.insert(vertices.end(), { a, b, c, a, c, d });
+    }
+
+    static void AddDebugGlyph(std::vector<DebugOverlayVertex>& vertices,
+        char character, float x, float y, float scale, float width,
+        float height, const std::array<float, 4>& color)
+    {
+        const std::uint8_t mask = DebugSegmentMask(character);
+        const float t = 2.5f * scale;
+        const float w = 13.0f * scale;
+        const float h = 22.0f * scale;
+        const auto rect = [&](float left, float top, float right, float bottom)
+        {
+            AddDebugRect(vertices, x + left, y + top, x + right, y + bottom,
+                width, height, color);
+        };
+        if (mask & 0x01u) rect(t, 0.0f, w - t, t);
+        if (mask & 0x02u) rect(w - t, t, w, h * 0.5f - t * 0.5f);
+        if (mask & 0x04u) rect(w - t, h * 0.5f + t * 0.5f, w, h - t);
+        if (mask & 0x08u) rect(t, h - t, w - t, h);
+        if (mask & 0x10u) rect(0.0f, h * 0.5f + t * 0.5f, t, h - t);
+        if (mask & 0x20u) rect(0.0f, t, t, h * 0.5f - t * 0.5f);
+        if (mask & 0x40u) rect(t, h * 0.5f - t * 0.5f,
+            w - t, h * 0.5f + t * 0.5f);
+    }
+
+    void DrawControllerOrientationDebug(std::uint32_t width,
+        std::uint32_t height)
+    {
+        if (!g_settings.controllerOrientationDebug || !m_debugVertexBuffer ||
+            width == 0 || height == 0)
+        {
+            return;
+        }
+        std::vector<DebugOverlayVertex> vertices;
+        vertices.reserve(2048);
+        const float scale = std::clamp(static_cast<float>(height) / 1080.0f,
+            0.75f, 1.5f);
+        const float panelTop = static_cast<float>(height) * 0.40f;
+        const float panelWidth = 155.0f * scale;
+        const float panelHeight = 112.0f * scale;
+        const char labels[3] = { 'P', 'Y', 'R' };
+        const std::array<std::array<float, 4>, 3> colors = {
+            std::array<float, 4>{ 0.25f, 0.85f, 1.0f, 1.0f },
+            std::array<float, 4>{ 0.40f, 1.0f, 0.45f, 1.0f },
+            std::array<float, 4>{ 1.0f, 0.65f, 0.20f, 1.0f }
+        };
+        const auto addPanel = [&](float panelLeft, const float values[3],
+            const std::array<float, 4>& markerColor)
+        {
+            AddDebugRect(vertices, panelLeft, panelTop,
+                panelLeft + panelWidth, panelTop + panelHeight,
+                static_cast<float>(width), static_cast<float>(height),
+                { 0.01f, 0.01f, 0.015f, 0.78f });
+            AddDebugRect(vertices, panelLeft, panelTop,
+                panelLeft + panelWidth, panelTop + 4.0f * scale,
+                static_cast<float>(width), static_cast<float>(height),
+                markerColor);
+            for (std::size_t line = 0; line < 3; ++line)
+            {
+                char text[8] = {};
+                snprintf(text, std::size(text), "%c%4d", labels[line],
+                    static_cast<int>(std::lround(values[line])));
+                const float lineY = panelTop +
+                    (10.0f + 33.0f * line) * scale;
+                for (std::size_t index = 0; text[index] != '\0'; ++index)
+                {
+                    AddDebugGlyph(vertices, text[index],
+                        panelLeft + (10.0f + 25.0f * index) * scale, lineY,
+                        scale, static_cast<float>(width),
+                        static_cast<float>(height), colors[line]);
+                }
+            }
+        };
+
+        float weaponValues[3] = {};
+        if (ReadDebugWeaponEuler(weaponValues[0], weaponValues[1],
+            weaponValues[2]))
+        {
+            addPanel(static_cast<float>(width) * 0.24f, weaponValues,
+                { 0.35f, 0.45f, 1.0f, 1.0f });
+        }
+        float leftHandValues[3] = {};
+        if (ReadDebugLeftHandEuler(leftHandValues[0], leftHandValues[1],
+            leftHandValues[2]))
+        {
+            addPanel(static_cast<float>(width) * 0.54f, leftHandValues,
+                { 1.0f, 0.25f, 0.35f, 1.0f });
+        }
+        if (vertices.empty())
+            return;
+
+        D3D11_MAPPED_SUBRESOURCE mapped = {};
+        if (FAILED(m_context->Map(m_debugVertexBuffer.Get(), 0,
+            D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+        {
+            return;
+        }
+        std::memcpy(mapped.pData, vertices.data(),
+            vertices.size() * sizeof(DebugOverlayVertex));
+        m_context->Unmap(m_debugVertexBuffer.Get(), 0);
+        const UINT stride = sizeof(DebugOverlayVertex);
+        const UINT offset = 0;
+        ID3D11Buffer* vertexBuffer = m_debugVertexBuffer.Get();
+        m_context->IASetInputLayout(m_debugInputLayout.Get());
+        m_context->IASetVertexBuffers(0, 1, &vertexBuffer, &stride, &offset);
+        m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        m_context->VSSetShader(m_debugVertexShader.Get(), nullptr, 0);
+        m_context->PSSetShader(m_debugPixelShader.Get(), nullptr, 0);
+        m_context->OMSetBlendState(m_debugBlendState.Get(), nullptr,
+            0xFFFFFFFFu);
+        m_context->Draw(static_cast<UINT>(vertices.size()), 0);
+        m_context->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu);
+        if (!m_debugOverlayDrawLogged)
+        {
+            m_debugOverlayDrawLogged = true;
+            Log("Matrix P/Y/R overlay active: weapon panel plus left-hand panel (profile %d)",
+                m_debugWeaponProfileIndex);
+        }
+    }
+
     bool RenderEye(std::size_t eye, const std::array<float, 4>& uvRect)
     {
         EyeSwapchain& target = m_eyes[eye];
@@ -2518,6 +2912,10 @@ float4 StatsPsMain(VertexOutput input) : SV_Target
                 usingNativeEye && g_settings.enableFxaa);
         }
 
+        // The debug display is composed only after the complete eye image.
+        // It cannot modify D3D8 hand/weapon state or either native eye depth.
+        DrawControllerOrientationDebug(target.width, target.height);
+
         m_context->Flush();
         XrSwapchainImageReleaseInfo releaseInfo{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
         return CheckXr(xrReleaseSwapchainImage(target.handle, &releaseInfo),
@@ -2544,6 +2942,11 @@ float4 StatsPsMain(VertexOutput input) : SV_Target
         m_vertexShader.Reset();
         m_pixelShader.Reset();
         m_statsPixelShader.Reset();
+        m_debugVertexShader.Reset();
+        m_debugPixelShader.Reset();
+        m_debugInputLayout.Reset();
+        m_debugVertexBuffer.Reset();
+        m_debugBlendState.Reset();
         m_sampler.Reset();
         m_statsBlendState.Reset();
         for (std::size_t index = 0; index < m_colorStatsTextures.size(); ++index)
@@ -2605,6 +3008,16 @@ float4 StatsPsMain(VertexOutput input) : SV_Target
         XR_NULL_HANDLE, XR_NULL_HANDLE };
     bool m_controllerInputInitialized = false;
     bool m_controllerSyncFailureLogged = false;
+    bool m_debugWeaponOrientationValid = false;
+    float m_debugWeaponPitch = 0.0f;
+    float m_debugWeaponYaw = 0.0f;
+    float m_debugWeaponRoll = 0.0f;
+    std::int32_t m_debugWeaponProfileIndex = -1;
+    bool m_debugLeftHandOrientationValid = false;
+    float m_debugLeftHandPitch = 0.0f;
+    float m_debugLeftHandYaw = 0.0f;
+    float m_debugLeftHandRoll = 0.0f;
+    bool m_debugOverlayDrawLogged = false;
     bool m_sessionRunning = false;
     bool m_shouldRender = false;
     bool m_exitRequested = false;
@@ -2626,6 +3039,11 @@ float4 StatsPsMain(VertexOutput input) : SV_Target
     ComPtr<ID3D11VertexShader> m_vertexShader;
     ComPtr<ID3D11PixelShader> m_pixelShader;
     ComPtr<ID3D11PixelShader> m_statsPixelShader;
+    ComPtr<ID3D11VertexShader> m_debugVertexShader;
+    ComPtr<ID3D11PixelShader> m_debugPixelShader;
+    ComPtr<ID3D11InputLayout> m_debugInputLayout;
+    ComPtr<ID3D11Buffer> m_debugVertexBuffer;
+    ComPtr<ID3D11BlendState> m_debugBlendState;
     ComPtr<ID3D11SamplerState> m_sampler;
     ComPtr<ID3D11BlendState> m_statsBlendState;
     std::array<ComPtr<ID3D11Texture2D>, 3> m_colorStatsTextures;
@@ -2657,6 +3075,7 @@ float4 StatsPsMain(VertexOutput input) : SV_Target
     bool m_usingD3D12SharedSource = false;
     bool m_nativeEyeRenderingLogged = false;
     bool m_projectionMappingLogged = false;
+    bool m_nativeEyePoseMatchLogged = false;
     bool m_eyeDebugCaptured = false;
     bool m_gamePostProcessEnabled = false;
     bool m_gamePostProcessLogged = false;

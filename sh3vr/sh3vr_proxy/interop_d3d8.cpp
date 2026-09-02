@@ -144,6 +144,36 @@ static float g_gamePostProcessScale[3] = { 1.0f, 1.0f, 1.0f };
 static float g_gamePostProcessBlend = 0.0f;
 static std::uint32_t g_gamePostProcessSource[4] = {};
 static std::uint32_t g_gamePostProcessIntensity = 0;
+static Sh3VrWeaponDebugState g_weaponDebugState = {
+    SH3VR_WEAPON_DEBUG_MAGIC, 0u, -1, 0.0f, 0.0f, 0.0f,
+    0u, 0.0f, 0.0f, 0.0f
+};
+
+bool Interop8_ReadProjectionUvRects(float eyeRects[2][4])
+{
+    if (!g_header || !eyeRects)
+        return false;
+
+    const auto* state = reinterpret_cast<const Sh3VrProjectionUvState*>(
+        g_header->reserved + SH3VR_PROJECTION_UV_RESERVED_OFFSET);
+    for (int attempt = 0; attempt < 3; ++attempt)
+    {
+        const LONG before = InterlockedCompareExchange(
+            reinterpret_cast<volatile LONG*>(
+                const_cast<volatile std::int32_t*>(&state->sequence)), 0, 0);
+        if ((before & 1) != 0 || state->magic != SH3VR_PROJECTION_UV_MAGIC)
+            continue;
+        MemoryBarrier();
+        memcpy(eyeRects, state->eyeRect, sizeof(state->eyeRect));
+        MemoryBarrier();
+        const LONG after = InterlockedCompareExchange(
+            reinterpret_cast<volatile LONG*>(
+                const_cast<volatile std::int32_t*>(&state->sequence)), 0, 0);
+        if (before == after && (after & 1) == 0)
+            return true;
+    }
+    return false;
+}
 
 static LONG   g_frameCounter = 0;
 static LONG64 g_qpcFrequency = 0;
@@ -217,6 +247,38 @@ void Interop8_SetGamePostProcess(bool enabled, const float scale[3],
                 g_gamePostProcessSource[channel];
         }
         g_header->gamePostProcessIntensity = g_gamePostProcessIntensity;
+    }
+}
+
+void Interop8_SetWeaponDebugOrientation(bool valid,
+    std::int32_t profileIndex, float pitchDegrees, float yawDegrees,
+    float rollDegrees)
+{
+    g_weaponDebugState.magic = SH3VR_WEAPON_DEBUG_MAGIC;
+    g_weaponDebugState.weaponValid = valid ? 1u : 0u;
+    g_weaponDebugState.profileIndex = profileIndex;
+    g_weaponDebugState.pitchDegrees = pitchDegrees;
+    g_weaponDebugState.yawDegrees = yawDegrees;
+    g_weaponDebugState.rollDegrees = rollDegrees;
+    if (g_header)
+    {
+        memcpy(g_header->reserved, &g_weaponDebugState,
+            sizeof(g_weaponDebugState));
+    }
+}
+
+void Interop8_SetLeftHandDebugOrientation(bool valid, float pitchDegrees,
+    float yawDegrees, float rollDegrees)
+{
+    g_weaponDebugState.magic = SH3VR_WEAPON_DEBUG_MAGIC;
+    g_weaponDebugState.leftHandValid = valid ? 1u : 0u;
+    g_weaponDebugState.leftHandPitchDegrees = pitchDegrees;
+    g_weaponDebugState.leftHandYawDegrees = yawDegrees;
+    g_weaponDebugState.leftHandRollDegrees = rollDegrees;
+    if (g_header)
+    {
+        memcpy(g_header->reserved, &g_weaponDebugState,
+            sizeof(g_weaponDebugState));
     }
 }
 
@@ -439,6 +501,8 @@ static bool SharedFrame_Init()
             g_gamePostProcessSource[channel];
     }
     g_header->gamePostProcessIntensity = g_gamePostProcessIntensity;
+    memcpy(g_header->reserved, &g_weaponDebugState,
+        sizeof(g_weaponDebugState));
 
     QueryPerformanceFrequency(reinterpret_cast<LARGE_INTEGER*>(&g_qpcFrequency));
     g_header->qpcFrequency = g_qpcFrequency;
