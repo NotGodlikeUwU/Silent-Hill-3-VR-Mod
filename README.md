@@ -56,13 +56,11 @@ The repository contains `sh3vr.ini.example` and `sh3vr_weapons.ini.example` temp
 | **X** | Inventory |
 | **Y** | Map |
 | **Left Menu Button** | Cancel / Pause |
-| **Right Grip** | Open Camera Mod menu |
-| **Flashlight** | Not assigned |
 
 ### Roadmap
-- Improved support for ZealotTormunds First Person mod
 - Fixes for missing shadows and blood effects
 - SteamVR support
+- Various bug fixes
 
 ### Building from source
 
