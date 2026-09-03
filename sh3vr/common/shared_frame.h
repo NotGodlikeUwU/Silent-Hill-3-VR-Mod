@@ -157,6 +157,22 @@ struct Sh3VrProjectionUvState
 static_assert(sizeof(Sh3VrProjectionUvState) == 40,
     "Projection UV state must fit in the reserved frame-header area.");
 
+// Host-owned runtime stereo calibration. OpenXR reports the actual physical
+// eye poses selected by the headset/runtime; the 32-bit renderer must use the
+// same separation instead of assuming a universal 64 mm IPD.
+inline constexpr std::uint32_t SH3VR_RUNTIME_STEREO_MAGIC = 0x44504953u;
+inline constexpr std::uint32_t SH3VR_RUNTIME_STEREO_RESERVED_OFFSET = 112u;
+struct Sh3VrRuntimeStereoState
+{
+    std::uint32_t magic;
+    volatile std::int32_t sequence;
+    float ipdMeters;
+    std::uint32_t reserved;
+};
+
+static_assert(sizeof(Sh3VrRuntimeStereoState) == 16,
+    "Runtime stereo state must fit in the reserved frame-header area.");
+
 struct Sh3VrFrameHeader
 {
     std::uint32_t magic;

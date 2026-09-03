@@ -63,6 +63,7 @@ extern void Interop8_GrabFrame(struct IDirect3DDevice8* device);
 extern void Interop8_OnDeviceReset();
 extern void Interop8_Shutdown();
 extern bool Interop8_ReadHeadPose(Sh3VrHeadPose* output);
+extern bool Interop8_ReadRuntimeIpd(float* outputMeters);
 extern bool Interop8_ReadControllerState(Sh3VrControllerState* state);
 extern void Interop8_SetFrameRenderPose(const Sh3VrHeadPose& pose);
 extern void Interop8_SetRenderMode(std::uint32_t mode);
@@ -499,6 +500,8 @@ static bool IsUiPretransformedFvf(DWORD shader);
 static bool IsLikelyUiAtlasDraw8();
 static bool IsGamePostProcessDraw8(DWORD primitiveType,
     UINT primitiveCount, UINT stride, const void* caller);
+static bool IsGameNoiseDraw8(DWORD primitiveType,
+    UINT primitiveCount, UINT stride, const void* caller);
 static bool IsLowResolutionLightCompositeDraw8(DWORD primitiveType,
     UINT primitiveCount, const void* caller);
 static bool IsScreenSpaceEffectCompositeDraw8(DWORD primitiveType,
@@ -622,6 +625,7 @@ static bool g_enableUiTrace8 = false;
 // This is deliberately opt-in because the pass is renderer-specific.
 static bool g_enableGamePostProcess8 = false;
 static bool g_loggedGamePostProcess8 = false;
+static bool g_loggedGameNoiseStereo8 = false;
 static float g_leftHandSceneLightScale8 = 1.0f;
 static float g_leftHandSceneLightColor8[3] = { 1.0f, 1.0f, 1.0f };
 static bool g_leftHandSceneLightValid8 = false;
@@ -721,21 +725,30 @@ static float g_cameraModSnapTurnDegrees8 = 45.0f;
 static DWORD g_cameraModCharacterAlignMilliseconds8 = 34;
 static volatile LONG g_cameraModCharacterAlignEndTick8 = 0;
 static bool g_autoLoadCameraModFirstPerson8 = true;
-static DWORD g_cameraModAutoLoadDelaySeconds8 = 180;
-static ULONGLONG g_cameraModStartupTick8 = 0;
-static bool g_cameraModAutoLoadDelayLogged8 = false;
 static bool g_cameraModAutoLoadDone8 = false;
-// Number of consecutive frames for which the normal immersive game camera
-// was submitted.  The startup movie/menu does not submit this projection;
-// using a short streak avoids touching Camera Mod while that state is live.
+// Rendering alone does not identify gameplay: native demos render stereo too.
+// The demo lifecycle guard below keeps Camera Mod disabled until cleanup has
+// restored the player/camera. The short streak only settles that transition.
 static unsigned g_cameraModImmersiveFrameStreak8 = 0;
+static bool g_cameraModDemoActive8 = false;
+// An event may contain multiple demos and loading/fade steps between them.
+// A demo's cleanup is NOT the completion of its owning event.
+static bool g_cameraModEventPending8 = false;
+static bool g_cameraModEventGameplayReady8 = false;
+static bool g_cameraModEventVisited8 = false;
+static bool g_cameraModDemoHooksReady8 = false;
+using Sh3DemoStartFn = void(__cdecl*)(void*);
+using Sh3DemoFinishFn = void(__cdecl*)();
+using Sh3EventUpdateFn = int(__cdecl*)(int);
+using Sh3EventDispatchFn = int(__cdecl*)();
+static Sh3DemoStartFn g_originalCameraModDemoStart8 = nullptr;
+static Sh3DemoFinishFn g_originalCameraModDemoFinish8 = nullptr;
+static Sh3EventUpdateFn g_originalCameraModEventUpdate8 = nullptr;
+static Sh3EventDispatchFn g_originalCameraModEventDispatch8 = nullptr;
 static bool g_enableRoomscale8 = true;
 static float g_roomscalePlayerHeightMeters8 = 1.65f;
 static float g_roomscaleHeightScale8 = 1.0f;
-static float g_roomscaleFullKeySpeedMetersPerSecond8 = 1.50f;
-static float g_roomscaleMovementPulse8 = 0.0f;
 static std::int64_t g_roomscaleLastPoseTime8 = 0;
-static float g_roomscaleSmoothedVelocity8[2] = {};
 static volatile LONG g_roomscaleMovementMask8 = SH3VR_ROOMSCALE_NONE;
 static LONG g_roomscaleMovementLogCount8 = 0;
 static bool g_roomscaleHeightLogged8 = false;
@@ -762,8 +775,6 @@ static constexpr DWORD SH3VR_CAMERA_MOD_TOGGLE_RVA = 0x9060u;
 static constexpr DWORD SH3VR_CAMERA_MOD_ENABLED_OFFSET = 0x40Cu;
 static constexpr DWORD SH3VR_CAMERA_MOD_YAW_OFFSET = 0x41Cu;
 static constexpr DWORD SH3VR_CAMERA_MOD_HIDE_PLAYER_OFFSET = 0x442u;
-static constexpr float SH3VR_ROOMSCALE_FOLLOW_RADIUS_METERS = 0.08f;
-static constexpr float SH3VR_ROOMSCALE_START_SPEED_METERS_PER_SECOND = 0.08f;
 static constexpr float SH3VR_ROOMSCALE_TRACKING_JUMP_METERS = 0.35f;
 static LONG g_headPoseCalibrationStartFrame8 = -1;
 static constexpr LONG SH3VR_HEAD_POSE_CALIBRATION_FRAMES = 30;
@@ -795,7 +806,9 @@ static std::uint32_t g_loggedStereoDrawShaderCount8 = 0;
 // headset's visible FOV.
 static constexpr float SH3VR_IMMERSIVE_VERTICAL_SCALE = 0.5773502692f;
 static constexpr float SH3VR_DEFAULT_WORLD_SCALE = 360.0f;
-static constexpr float SH3VR_IPD_METERS = 0.064f;
+static constexpr float SH3VR_FALLBACK_IPD_METERS = 0.064f;
+static float g_runtimeIpdMeters8 = SH3VR_FALLBACK_IPD_METERS;
+static bool g_runtimeIpdLogged8 = false;
 static float g_worldScale8 = SH3VR_DEFAULT_WORLD_SCALE;
 static constexpr LONGLONG SH3VR_TARGET_GAME_FPS = 90;
 static LONGLONG g_framePacingFrequency8 = 0;
@@ -5068,6 +5081,24 @@ static HRESULT WINAPI hk_D3D8_DrawPrimitiveUP(IDirect3DDevice8* device,
     const void* caller = _ReturnAddress();
     LogMotionWeaponDrawCapture8(device, "DrawPrimitiveUP", primitiveType,
         primitiveCount, false, 0, 0, 0, stride, caller);
+    const bool gameNoiseCandidate = IsGameNoiseDraw8(
+        primitiveType, primitiveCount, stride, caller);
+    if (gameNoiseCandidate && g_perDrawStereoProbeActive8 &&
+        !g_fullSceneStereoReplayActive8)
+    {
+        // SH3 regenerates this fullscreen temporal quad independently while
+        // each native eye target is active.  Replaying it also disturbs the
+        // target/pair state, while leaving it native gives the eyes different
+        // samples.  Suppress only the immersive-eye pass until noise is moved
+        // into the host compositor; desktop/cinema rendering is untouched.
+        if (!g_loggedGameNoiseStereo8)
+        {
+            g_loggedGameNoiseStereo8 = true;
+            Log("Native Noise Effect suppressed in immersive stereo to "
+                "preserve a coherent eye pair");
+        }
+        return D3D_OK;
+    }
     const HRESULT result = o_D3D8_DrawPrimitiveUP(device, primitiveType,
         primitiveCount, vertices, stride);
     TraceScreenSpaceDraw("DrawPrimitiveUP", false, primitiveType,
@@ -5706,8 +5737,11 @@ bool D3D9Hook_GetMeleeWeaponHitbox(std::uint8_t gameWeapon,
     {
     case 4u: // Knife
         profileIndex = 0;
-        reachMeters = 0.38f;
-        radiusMeters = 0.10f;
+        // A knife is easy to miss with a thin mathematical segment.  The
+        // capsule remains centred on the tracked blade, but includes the
+        // hand and a modest safety margin around the visible mesh.
+        reachMeters = 0.46f;
+        radiusMeters = 0.19f;
         break;
     case 5u: // Steel Pipe
         profileIndex = 1;
@@ -6083,43 +6117,232 @@ static bool ReadCameraModYaw(float* yawOutput)
     return true;
 }
 
-static void TryAutoLoadCameraModFirstPerson()
+static void SuspendAutoLoadedCameraForDemo()
 {
-    if (!g_autoLoadCameraModFirstPerson8 || g_cameraModAutoLoadDone8)
+    g_cameraModImmersiveFrameStreak8 = 0;
+    if (!g_autoLoadCameraModFirstPerson8)
         return;
 
-    const ULONGLONG now = GetTickCount64();
-    if (g_cameraModStartupTick8 == 0)
-        g_cameraModStartupTick8 = now;
+    BYTE* moduleBase = nullptr;
+    BYTE* state = nullptr;
+    if (!GetSupportedCameraModState(&moduleBase, &state) ||
+        !IsWritableMemoryRange(state + SH3VR_CAMERA_MOD_ENABLED_OFFSET, 1) ||
+        state[SH3VR_CAMERA_MOD_ENABLED_OFFSET] == 0)
+        return;
 
-    // Present runs before the per-frame flag is cleared below, so these
-    // values describe the frame that has just completed.  Wait for a few
-    // consecutive gameplay frames; this is the transition out of the intro
-    // cutscene and remains safe even when the user skips it immediately.
+    // Use the mod's OFF action, not just its enabled byte: OFF restores the
+    // native camera instructions that the demo needs. Do this before SH3
+    // starts replacing its player/camera objects, never during demo cleanup.
+    reinterpret_cast<void(__cdecl*)()>(moduleBase +
+        SH3VR_CAMERA_MOD_TOGGLE_RVA)();
+    g_cameraModAutoLoadDone8 = false;
+    Log("Camera Mod suspended before native demo initialization");
+}
+
+static void __cdecl hk_CameraModDemoStart(void* descriptor)
+{
+    g_cameraModDemoActive8 = true;
+    g_cameraModEventGameplayReady8 = false;
+    SuspendAutoLoadedCameraForDemo();
+    Log("Camera Mod guard: native demo started (descriptor=%p)", descriptor);
+    g_originalCameraModDemoStart8(descriptor);
+}
+
+static void __cdecl hk_CameraModDemoFinish()
+{
+    // Keep the guard raised THROUGH the native cleanup: this function
+    // restores Heather, animation ownership and the gameplay camera.
+    g_originalCameraModDemoFinish8();
+    g_cameraModDemoActive8 = false;
+    g_cameraModImmersiveFrameStreak8 = 0;
+    Log("Camera Mod guard: demo cleanup completed; waiting for owning event "
+        "and gameplay dispatch (event pending=%d)", g_cameraModEventPending8 ? 1 : 0);
+}
+
+static int __cdecl hk_CameraModEventUpdate(int eventIndex)
+{
+    const bool wasPending = g_cameraModEventPending8;
+    g_cameraModEventVisited8 = true;
+    g_cameraModEventPending8 = true;
+    g_cameraModEventGameplayReady8 = false;
+    // Keep this raised across frames until the event interpreter returns
+    // completion, including the frame where an inner demo cleans itself up.
+    const int finished = g_originalCameraModEventUpdate8(eventIndex);
+    g_cameraModEventPending8 = finished == 0;
+    if (wasPending != g_cameraModEventPending8)
+    {
+        Log("Camera Mod guard: native event %d %s", eventIndex,
+            g_cameraModEventPending8 ? "pending" : "completed");
+    }
+    return finished;
+}
+
+static int __cdecl hk_CameraModEventDispatch()
+{
+    const bool wasReady = g_cameraModEventGameplayReady8;
+    g_cameraModEventGameplayReady8 = false;
+    g_cameraModEventVisited8 = false;
+    const int nextMode = g_originalCameraModEventDispatch8();
+    // Loading a different save can abandon the previous interpreter without
+    // returning through its completion path. A dispatch without that
+    // interpreter must not inherit its pending latch indefinitely.
+    if (!g_cameraModEventVisited8)
+        g_cameraModEventPending8 = false;
+    // The PC GameMain callsites at 0x58F0E7 / 0x58F547 consume this result:
+    // 5 continues playable update; other values enter loading/menu/etc.
+    g_cameraModEventGameplayReady8 = nextMode == 5 &&
+        !g_cameraModEventPending8 && !g_cameraModDemoActive8;
+    if (wasReady != g_cameraModEventGameplayReady8)
+    {
+        g_cameraModImmersiveFrameStreak8 = 0;
+        Log("Camera Mod guard: event dispatch mode=%d, event pending=%d, "
+            "gameplay ready=%d", nextMode, g_cameraModEventPending8 ? 1 : 0,
+            g_cameraModEventGameplayReady8 ? 1 : 0);
+    }
+    return nextMode;
+}
+
+static bool ReadCameraModDemoStatus(DWORD* status)
+{
+    // Verified PC getter at VA 0x4670B0 reads this DWORD: 0 idle,
+    // 1 loading, 2 running. Start initializes it to zero before loading,
+    // hence the lifecycle latch above is also necessary.
+    const BYTE* game = reinterpret_cast<const BYTE*>(GetModuleHandleA(nullptr));
+    SIZE_T read = 0;
+    return ReadProcessMemory(GetCurrentProcess(), game + 0x00498308,
+        status, sizeof(*status), &read) && read == sizeof(*status);
+}
+
+static void InstallCameraModDemoGuard()
+{
+    if (!g_autoLoadCameraModFirstPerson8 || g_cameraModDemoHooksReady8)
+        return;
+
+    BYTE* game = reinterpret_cast<BYTE*>(GetModuleHandleA(nullptr));
+    void* start = game + 0x00067530;
+    void* finish = game + 0x00067130;
+    void* eventUpdate = game + 0x000B8B70;
+    void* eventDispatch = game + 0x000B9E70;
+    // Validate all targets before installing any hook. The demo-start
+    // argument is a descriptor pointer; both functions use plain cdecl.
+    BYTE startExpected[] = { 0x8B, 0x44, 0x24, 0x04, 0xA3, 0, 0, 0, 0 };
+    const DWORD descriptorAddress = reinterpret_cast<DWORD>(game + 0x00498310);
+    std::memcpy(startExpected + 5, &descriptorAddress, sizeof(DWORD));
+    const BYTE finishExpected[] = { 0x81, 0xEC, 0x00, 0x06, 0x00, 0x00,
+        0x55, 0x56, 0x57 };
+    const BYTE eventExpected[] = { 0x83, 0xEC, 0x1C, 0x53, 0x8B, 0x5C,
+        0x24, 0x24, 0x55 };
+    const BYTE dispatchExpected[] = { 0x51, 0x53, 0x55, 0x56, 0x57, 0xE8,
+        0xD6, 0x7C, 0x13 };
+    BYTE actual[9] = {};
+    SIZE_T read = 0;
+    if (!ReadProcessMemory(GetCurrentProcess(), start, actual, sizeof(actual),
+            &read) || read != sizeof(actual) ||
+        std::memcmp(actual, startExpected, sizeof(actual)) != 0 ||
+        !ReadProcessMemory(GetCurrentProcess(), finish, actual, sizeof(actual),
+            &read) || read != sizeof(actual) ||
+        std::memcmp(actual, finishExpected, sizeof(actual)) != 0 ||
+        !ReadProcessMemory(GetCurrentProcess(), eventUpdate, actual, sizeof(actual),
+            &read) || read != sizeof(actual) ||
+        std::memcmp(actual, eventExpected, sizeof(actual)) != 0 ||
+        !ReadProcessMemory(GetCurrentProcess(), eventDispatch, actual, sizeof(actual),
+            &read) || read != sizeof(actual) ||
+        std::memcmp(actual, dispatchExpected, sizeof(actual)) != 0)
+    {
+        Log("Camera Mod auto-load blocked: unsupported native demo entry points");
+        return;
+    }
+
+    struct GuardHook { void* target; void* detour; void** original; };
+    const GuardHook hooks[] = {
+        { start, reinterpret_cast<void*>(&hk_CameraModDemoStart),
+            reinterpret_cast<void**>(&g_originalCameraModDemoStart8) },
+        { finish, reinterpret_cast<void*>(&hk_CameraModDemoFinish),
+            reinterpret_cast<void**>(&g_originalCameraModDemoFinish8) },
+        { eventUpdate, reinterpret_cast<void*>(&hk_CameraModEventUpdate),
+            reinterpret_cast<void**>(&g_originalCameraModEventUpdate8) },
+        { eventDispatch, reinterpret_cast<void*>(&hk_CameraModEventDispatch),
+            reinterpret_cast<void**>(&g_originalCameraModEventDispatch8) }
+    };
+    unsigned created = 0;
+    MH_STATUS result = MH_OK;
+    for (const auto& hook : hooks)
+    {
+        result = MH_CreateHook(hook.target, hook.detour, hook.original);
+        if (result != MH_OK)
+            break;
+        ++created;
+    }
+    if (result == MH_OK)
+    {
+        for (const auto& hook : hooks)
+        {
+            result = MH_EnableHook(hook.target);
+            if (result != MH_OK)
+                break;
+        }
+    }
+    if (result == MH_OK)
+    {
+        g_cameraModDemoHooksReady8 = true;
+        Log("Camera Mod native demo + owning event guard installed (no startup timer)");
+        return;
+    }
+    for (unsigned index = 0; index < created; ++index)
+    {
+        MH_DisableHook(hooks[index].target);
+        MH_RemoveHook(hooks[index].target);
+    }
+    Log("Camera Mod auto-load blocked: native event hooks failed (%d)",
+        static_cast<int>(result));
+}
+
+static void TryAutoLoadCameraModFirstPerson()
+{
+    if (!g_autoLoadCameraModFirstPerson8 || !g_cameraModDemoHooksReady8)
+        return;
+
+    DWORD demoStatus = 0;
+    if (!ReadCameraModDemoStatus(&demoStatus) ||
+        g_cameraModDemoActive8 || demoStatus != 0)
+    {
+        SuspendAutoLoadedCameraForDemo();
+        return;
+    }
+    if (g_cameraModAutoLoadDone8)
+        return;
+
+    if (g_cameraModEventPending8 || !g_cameraModEventGameplayReady8)
+    {
+        g_cameraModImmersiveFrameStreak8 = 0;
+        return;
+    }
+
+    // The first scene can render while the native player is still being
+    // constructed. Use the same verified PC player pointer/kind as combat.
+    const BYTE* game = reinterpret_cast<const BYTE*>(GetModuleHandleA(nullptr));
+    const BYTE* player = nullptr;
+    WORD kind = 0;
+    SIZE_T read = 0;
+    if (!ReadProcessMemory(GetCurrentProcess(), game + 0x06D2C100,
+            &player, sizeof(player), &read) || read != sizeof(player) ||
+        !player || !ReadProcessMemory(GetCurrentProcess(), player + 0x80,
+            &kind, sizeof(kind), &read) || read != sizeof(kind) || kind != 0x100)
+    {
+        g_cameraModImmersiveFrameStreak8 = 0;
+        return;
+    }
+
+    // The native lifecycle/status, not this render streak, excludes demos.
+    // Two completed frames allow the restored camera to reach Present.
     if (g_viewProjectionAppliedThisFrame8 || g_previousImmersiveFrame8)
         g_cameraModImmersiveFrameStreak8 =
             (std::min)(g_cameraModImmersiveFrameStreak8 + 1u, 8u);
     else
         g_cameraModImmersiveFrameStreak8 = 0;
-    const bool gameplayConfirmed = g_cameraModImmersiveFrameStreak8 >= 3u;
-
-    const ULONGLONG delayMilliseconds =
-        static_cast<ULONGLONG>(g_cameraModAutoLoadDelaySeconds8) * 1000u;
-    // The configured delay is only a fallback for builds/scenes where the
-    // projection hook cannot observe gameplay.  Once gameplay is confirmed,
-    // never wait out the old three-minute startup delay.
-    if (!gameplayConfirmed && delayMilliseconds != 0 &&
-        now - g_cameraModStartupTick8 < delayMilliseconds)
-    {
-        if (!g_cameraModAutoLoadDelayLogged8)
-        {
-            g_cameraModAutoLoadDelayLogged8 = true;
-            Log("Camera Mod First Person auto-load delayed for %u seconds "
-                "to keep the startup/new-game cutscene in third person",
-                static_cast<unsigned>(g_cameraModAutoLoadDelaySeconds8));
-        }
+    const bool gameplayConfirmed = g_cameraModImmersiveFrameStreak8 >= 2u;
+    if (!gameplayConfirmed)
         return;
-    }
 
     Sh3VrHeadPose pose = {};
     if (!Interop8_ReadHeadPose(&pose) ||
@@ -6159,8 +6382,8 @@ static void TryAutoLoadCameraModFirstPerson()
         pluginState[SH3VR_CAMERA_MOD_HIDE_PLAYER_OFFSET] != 0)
     {
         g_cameraModAutoLoadDone8 = true;
-        Log("Camera Mod First Person preset auto-loaded after %u confirmed "
-            "immersive gameplay frames and Camera Mod enabled",
+        Log("Camera Mod First Person auto-loaded after full native event "
+            "completion, gameplay dispatch and %u settled scene frames (no timer)",
             g_cameraModImmersiveFrameStreak8);
     }
 }
@@ -6169,14 +6392,110 @@ static void ResetRoomscaleMovement(const Sh3VrHeadPose* pose)
 {
     InterlockedExchange(&g_roomscaleMovementMask8, SH3VR_ROOMSCALE_NONE);
     g_roomscaleLastPoseTime8 = 0;
-    g_roomscaleMovementPulse8 = 0.0f;
-    g_roomscaleSmoothedVelocity8[0] = 0.0f;
-    g_roomscaleSmoothedVelocity8[1] = 0.0f;
     if (pose && g_headOrientationReferenceValid8)
     {
         g_headPositionReference8[0] = pose->position[0];
         g_headPositionReference8[2] = pose->position[2];
     }
+}
+
+static void RefreshRuntimeIpd8()
+{
+    float runtimeIpd = 0.0f;
+    if (!Interop8_ReadRuntimeIpd(&runtimeIpd) ||
+        !std::isfinite(runtimeIpd))
+    {
+        return;
+    }
+    runtimeIpd = std::clamp(runtimeIpd, 0.04f, 0.09f);
+    const bool changed = std::fabs(runtimeIpd - g_runtimeIpdMeters8) >=
+        0.00025f;
+    g_runtimeIpdMeters8 = runtimeIpd;
+    if (!g_runtimeIpdLogged8 || changed)
+    {
+        g_runtimeIpdLogged8 = true;
+        Log("OpenXR runtime IPD applied to native stereo cameras: %.2f mm",
+            g_runtimeIpdMeters8 * 1000.0f);
+    }
+}
+
+static bool ApplyDirectRoomscaleTranslation(float localRightMeters,
+    float localForwardMeters)
+{
+    if (!std::isfinite(localRightMeters) ||
+        !std::isfinite(localForwardMeters))
+    {
+        return false;
+    }
+
+    BYTE* executable = reinterpret_cast<BYTE*>(GetModuleHandleA(nullptr));
+    if (!executable)
+        return false;
+    auto** playerPointer = reinterpret_cast<BYTE**>(
+        executable + (0x0712C100u - 0x00400000u));
+    if (!IsWritableMemoryRange(playerPointer, sizeof(*playerPointer)) ||
+        !*playerPointer)
+    {
+        return false;
+    }
+    BYTE* player = *playerPointer;
+    if (!IsWritableMemoryRange(player, 0xE0u))
+        return false;
+    const std::uint16_t characterKind =
+        *reinterpret_cast<const std::uint16_t*>(player + 0x80u);
+    if (characterKind != 0x0100u)
+        return false;
+
+    // Derive the world-space axes from the game's actual camera matrix. This
+    // avoids guessing Camera Mod's yaw sign and remains correct after physical
+    // turns, snap turns and camera preset changes.
+    D3DMATRIX cameraWorld = {};
+    if (!g_haveView8 || !IsMainCameraView(g_lastView8) ||
+        !InvertD3D8Matrix(g_lastView8, cameraWorld))
+    {
+        return false;
+    }
+    float rightX = cameraWorld.m[0][0];
+    float rightZ = cameraWorld.m[0][2];
+    float forwardX = cameraWorld.m[2][0];
+    float forwardZ = cameraWorld.m[2][2];
+    const float rightLength = std::sqrt(rightX * rightX + rightZ * rightZ);
+    const float forwardLength = std::sqrt(
+        forwardX * forwardX + forwardZ * forwardZ);
+    if (rightLength < 0.001f || forwardLength < 0.001f)
+        return false;
+    rightX /= rightLength;
+    rightZ /= rightLength;
+    forwardX /= forwardLength;
+    forwardZ /= forwardLength;
+    const float worldDeltaX = (localRightMeters * rightX +
+        localForwardMeters * forwardX) * g_worldScale8;
+    const float worldDeltaZ = (localRightMeters * rightZ +
+        localForwardMeters * forwardZ) * g_worldScale8;
+    if (!std::isfinite(worldDeltaX) || !std::isfinite(worldDeltaZ))
+        return false;
+
+    float position[4] = {};
+    std::memcpy(position, player, sizeof(position));
+    position[0] += worldDeltaX;
+    position[2] += worldDeltaZ;
+
+    // SH3's own position setter writes both the current and previous actor
+    // position (offsets 0x00 and 0xD0).  That is the crucial difference from
+    // synthetic W/S/Q/E: there is no locomotion state or walk animation, and
+    // tiny physical deltas remain continuous rather than becoming key pulses.
+    using SetCharacterPositionFn = void(__cdecl*)(void*, const float*);
+    const auto setCharacterPosition = reinterpret_cast<SetCharacterPositionFn>(
+        executable + (0x004736C0u - 0x00400000u));
+    __try
+    {
+        setCharacterPosition(player, position);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+    return true;
 }
 
 static void UpdateRoomscaleMovement(bool immersive)
@@ -6189,13 +6508,6 @@ static void UpdateRoomscaleMovement(bool immersive)
         !g_headOrientationReferenceValid8 || !havePose)
     {
         ResetRoomscaleMovement(havePose ? &pose : nullptr);
-        return;
-    }
-
-    float cameraModYawDegrees = 0.0f;
-    if (!ReadCameraModYaw(&cameraModYawDegrees))
-    {
-        ResetRoomscaleMovement(&pose);
         return;
     }
 
@@ -6234,18 +6546,12 @@ static void UpdateRoomscaleMovement(bool immersive)
         return;
     }
 
-    float consumedStageX = 0.0f;
-    float consumedStageZ = 0.0f;
-    if (stageDistance > SH3VR_ROOMSCALE_FOLLOW_RADIUS_METERS)
-    {
-        const float consumedFraction =
-            (stageDistance - SH3VR_ROOMSCALE_FOLLOW_RADIUS_METERS) /
-            stageDistance;
-        consumedStageX = stageOffsetX * consumedFraction;
-        consumedStageZ = stageOffsetZ * consumedFraction;
-        g_headPositionReference8[0] += consumedStageX;
-        g_headPositionReference8[2] += consumedStageZ;
-    }
+    // Consume the complete per-frame tracking delta. There is no virtual body
+    // radius and therefore no delayed catch-up or accumulated speed burst.
+    const float consumedStageX = stageOffsetX;
+    const float consumedStageZ = stageOffsetZ;
+    g_headPositionReference8[0] = pose.position[0];
+    g_headPositionReference8[2] = pose.position[2];
 
     const float inverseReference[4] = {
         -g_headOrientationReference8[0],
@@ -6260,112 +6566,24 @@ static void UpdateRoomscaleMovement(bool immersive)
     RotateVectorByQuaternion(inverseReference, consumedStage,
         consumedReferenceLocal);
 
-    const float rawRightVelocity = consumedReferenceLocal[0] /
-        static_cast<float>(elapsedSeconds);
-    const float rawForwardVelocity = -consumedReferenceLocal[2] /
-        static_cast<float>(elapsedSeconds);
-    const float smoothing = std::clamp(
-        static_cast<float>(elapsedSeconds) * 14.0f, 0.0f, 1.0f);
-    g_roomscaleSmoothedVelocity8[0] += smoothing *
-        (rawRightVelocity - g_roomscaleSmoothedVelocity8[0]);
-    g_roomscaleSmoothedVelocity8[1] += smoothing *
-        (rawForwardVelocity - g_roomscaleSmoothedVelocity8[1]);
-
-    float current[4] = {
-        pose.orientation[0], pose.orientation[1],
-        pose.orientation[2], pose.orientation[3]
-    };
-    if (!NormalizeQuaternion(current))
-    {
-        InterlockedExchange(&g_roomscaleMovementMask8,
-            SH3VR_ROOMSCALE_NONE);
-        return;
-    }
-    float relativeOrientation[4] = {};
-    MultiplyQuaternions(inverseReference, current, relativeOrientation);
-    if (!NormalizeQuaternion(relativeOrientation))
-    {
-        InterlockedExchange(&g_roomscaleMovementMask8,
-            SH3VR_ROOMSCALE_NONE);
-        return;
-    }
-
-    const float x = relativeOrientation[0];
-    const float y = relativeOrientation[1];
-    const float z = relativeOrientation[2];
-    const float w = relativeOrientation[3];
-    const float openXrYaw = std::atan2(
-        2.0f * (w * y + x * z),
-        1.0f - 2.0f * (y * y + z * z));
-    constexpr float degreesToRadians = 0.01745329251994329577f;
-    const float virtualRightYaw =
-        cameraModYawDegrees * degreesToRadians - openXrYaw;
-    const float yawCos = std::cos(virtualRightYaw);
-    const float yawSin = std::sin(virtualRightYaw);
-    // OpenXR stage translation and Camera Mod movement use opposite signs on
-    // both horizontal axes. Negate the final camera-relative vector so a real
-    // step and Heather's movement always point in the same direction.
-    const float cameraForwardVelocity = -(
-        g_roomscaleSmoothedVelocity8[1] * yawCos +
-        g_roomscaleSmoothedVelocity8[0] * yawSin);
-    const float cameraRightVelocity = -(
-        g_roomscaleSmoothedVelocity8[0] * yawCos -
-        g_roomscaleSmoothedVelocity8[1] * yawSin);
-    const float speed = std::sqrt(
-        cameraForwardVelocity * cameraForwardVelocity +
-        cameraRightVelocity * cameraRightVelocity);
-
-    std::uint32_t movementMask = SH3VR_ROOMSCALE_NONE;
-    if (std::isfinite(speed) &&
-        speed >= SH3VR_ROOMSCALE_START_SPEED_METERS_PER_SECOND)
-    {
-        constexpr float directionThreshold = 0.32f;
-        const float componentThreshold = speed * directionThreshold;
-        if (cameraForwardVelocity > componentThreshold)
-            movementMask |= SH3VR_ROOMSCALE_FORWARD;
-        else if (cameraForwardVelocity < -componentThreshold)
-            movementMask |= SH3VR_ROOMSCALE_BACKWARD;
-        if (cameraRightVelocity > componentThreshold)
-            movementMask |= SH3VR_ROOMSCALE_RIGHT;
-        else if (cameraRightVelocity < -componentThreshold)
-            movementMask |= SH3VR_ROOMSCALE_LEFT;
-    }
-    // Camera Mod exposes digital movement keys, while OpenXR reports analog
-    // physical velocity. Pulse the digital keys proportionally instead of
-    // holding them continuously for every movement above the dead zone. This
-    // keeps slow physical steps from producing a full-speed in-game stride.
-    float movementDuty = 0.0f;
-    if (movementMask != SH3VR_ROOMSCALE_NONE)
-    {
-        movementDuty = std::clamp(
-            speed * g_roomscaleHeightScale8 /
-                g_roomscaleFullKeySpeedMetersPerSecond8,
-            0.0f, 1.0f);
-        g_roomscaleMovementPulse8 += movementDuty;
-        if (g_roomscaleMovementPulse8 >= 1.0f)
-            g_roomscaleMovementPulse8 -= 1.0f;
-        else
-            movementMask = SH3VR_ROOMSCALE_NONE;
-    }
-    else
-    {
-        g_roomscaleMovementPulse8 = 0.0f;
-    }
-
-    InterlockedExchange(&g_roomscaleMovementMask8,
-        static_cast<LONG>(movementMask));
-
-    if (movementMask != SH3VR_ROOMSCALE_NONE)
+    InterlockedExchange(&g_roomscaleMovementMask8, SH3VR_ROOMSCALE_NONE);
+    // Height normalization is vertical-only.  Scaling X/Z by the player's
+    // height made a 1 m physical walk become as much as 1.4 m in the game.
+    const float localRightMeters = consumedReferenceLocal[0];
+    const float localForwardMeters = -consumedReferenceLocal[2];
+    const float movedDistance = std::sqrt(localRightMeters * localRightMeters +
+        localForwardMeters * localForwardMeters);
+    if (movedDistance > 0.0001f && ApplyDirectRoomscaleTranslation(
+            localRightMeters, localForwardMeters))
     {
         const LONG count = InterlockedIncrement(&g_roomscaleMovementLogCount8);
         if (count <= 8 || count % 900 == 0)
         {
-            Log("Roomscale movement %d: mask 0x%X, speed cm/s %d, duty "
-                "x1000 %d, height scale x1000 %d", count, movementMask,
-                static_cast<int>(std::lround(speed * 100.0f)),
-                static_cast<int>(std::lround(movementDuty * 1000.0f)),
-                static_cast<int>(std::lround(
-                    g_roomscaleHeightScale8 * 1000.0f)));
+            Log("Roomscale direct translation %d: right/forward mm %d/%d, "
+                "horizontal scale 1:1; no movement keys or locomotion animation",
+                count,
+                static_cast<int>(std::lround(localRightMeters * 1000.0f)),
+                static_cast<int>(std::lround(localForwardMeters * 1000.0f)));
         }
     }
 }
@@ -6432,6 +6650,7 @@ static void UpdateCameraModSnapTurn()
 
 static bool ReadRelativeHeadPose(float orientation[4], float position[3])
 {
+    RefreshRuntimeIpd8();
     Sh3VrHeadPose pose = {};
     if (g_headOrientationReferenceValid8 && g_haveLatchedFrameHeadPose8)
     {
@@ -6529,8 +6748,6 @@ static bool ReadRelativeHeadPose(float orientation[4], float position[3])
     orientation[0] = -orientation[0];
     orientation[2] = -orientation[2];
 
-    UpdateCameraModSnapTurn();
-
     const float openXrDelta[3] = {
         pose.position[0] - g_headPositionReference8[0],
         pose.position[1] - g_headPositionReference8[1],
@@ -6543,23 +6760,15 @@ static bool ReadRelativeHeadPose(float orientation[4], float position[3])
     // +X right, +Y up and -Z forward. Position is reported in app-space axes,
     // so first rotate it into the reference headset's local axes. Then convert
     // meters to SH3's centimeter-like world units.
-    const float trackingScale = g_enableRoomscale8
+    const float verticalTrackingScale = g_enableRoomscale8
         ? g_roomscaleHeightScale8 : 1.0f;
-    position[0] = headLocalDelta[0] * g_worldScale8 *
-        trackingScale;
+    // Physical X/Z translation must remain metrically 1:1.  The calibrated
+    // player-height correction applies only to vertical head movement.
+    position[0] = headLocalDelta[0] * g_worldScale8;
     position[1] = -headLocalDelta[1] * g_worldScale8 *
-        trackingScale;
-    position[2] = -headLocalDelta[2] * g_worldScale8 *
-        trackingScale;
+        verticalTrackingScale;
+    position[2] = -headLocalDelta[2] * g_worldScale8;
 
-    // Render parallel stereo cameras on alternating game frames. Left is
-    // negative camera X and right is positive camera X.
-    if (g_enableAlternatingStereo8 || g_applyStereoEyeOffset8)
-    {
-        const float eyeSign = g_renderEye8 == 0 ? -1.0f : 1.0f;
-        position[0] += eyeSign * 0.5f * SH3VR_IPD_METERS *
-            g_worldScale8;
-    }
     Interop8_SetFrameRenderPose(pose);
     return true;
 }
@@ -6583,6 +6792,25 @@ static void AddHeadViewTranslation(const float position[3],
     }
 }
 
+static void AddStereoEyeViewTranslation(D3DMATRIX& columnView,
+    D3DMATRIX* rowView)
+{
+    if (!g_enableAlternatingStereo8 && !g_applyStereoEyeOffset8)
+        return;
+
+    // IPD is a camera-local offset, not a tracking/reference-space position.
+    // Rotating it together with the HMD translation makes the stereo baseline
+    // turn away from the final camera X axis: at 90 degrees it becomes mostly
+    // depth separation, which produces severe double vision for nearby
+    // geometry. Apply it directly in view space after head rotation instead.
+    const float eyeSign = g_renderEye8 == 0 ? -1.0f : 1.0f;
+    const float viewOffset = -eyeSign * 0.5f * g_runtimeIpdMeters8 *
+        g_worldScale8;
+    columnView.m[0][3] += viewOffset;
+    if (rowView)
+        rowView->m[3][0] += viewOffset;
+}
+
 static bool ApplyHeadRotationToShaderCamera(const float gameView[12],
     float output[12])
 {
@@ -6600,6 +6828,7 @@ static bool ApplyHeadRotationToShaderCamera(const float gameView[12],
         for (int column = 0; column < 3; ++column)
             headViewColumn.m[row][column] = headPoseRotation.m[column][row];
     AddHeadViewTranslation(relativePosition, headViewColumn, nullptr);
+    AddStereoEyeViewTranslation(headViewColumn, nullptr);
 
     // The shader constants are a column-vector 3x4 view matrix. The matrix
     // built above is the equivalent row-vector pose rotation, so transpose its
@@ -6683,6 +6912,7 @@ static bool ApplyHeadRotationToColumnView(const D3DMATRIX& gameView,
         for (int column = 0; column < 3; ++column)
             headViewColumn.m[row][column] = headPoseRotation.m[column][row];
     AddHeadViewTranslation(relativePosition, headViewColumn, nullptr);
+    AddStereoEyeViewTranslation(headViewColumn, nullptr);
     output = gameView;
 
     for (int row = 0; row < 3; ++row)
@@ -6848,6 +7078,7 @@ static bool ApplyHeadRotationToViewProjection(const float gameViewProjection[16]
         for (int column = 0; column < 3; ++column)
             headViewColumn.m[row][column] = headPoseRotation.m[column][row];
     AddHeadViewTranslation(relativePosition, headViewColumn, nullptr);
+    AddStereoEyeViewTranslation(headViewColumn, nullptr);
 
     D3DMATRIX rotatedView = {};
     D3DMATRIX rotatedViewProjection = {};
@@ -6904,6 +7135,7 @@ static bool ApplyHeadRotationToMainCamera(const D3DMATRIX& gameView,
         for (int column = 0; column < 3; ++column)
             headViewColumn.m[row][column] = headViewRotation.m[column][row];
     AddHeadViewTranslation(relativePosition, headViewColumn, &headViewRotation);
+    AddStereoEyeViewTranslation(headViewColumn, &headViewRotation);
     MultiplyD3D8Matrices(gameView, headViewRotation, output);
 
     if (InterlockedIncrement(&g_headRotationApplications8) == 1)
@@ -7835,6 +8067,33 @@ static bool IsGamePostProcessDraw8(DWORD primitiveType,
 
     return textureDesc.Width == targetDesc.Width &&
         textureDesc.Height == targetDesc.Height;
+}
+
+static bool IsGameNoiseDraw8(DWORD primitiveType,
+    UINT primitiveCount, UINT stride, const void* caller)
+{
+    if (!g_device8 || g_currentVertexShader8 != 0x00000004u ||
+        primitiveType != D3DPT_TRIANGLESTRIP || primitiveCount != 2u ||
+        stride != 16u || !caller)
+    {
+        return false;
+    }
+
+    const BYTE* executable = reinterpret_cast<const BYTE*>(
+        GetModuleHandleA(nullptr));
+    const BYTE* returnAddress = reinterpret_cast<const BYTE*>(caller);
+    if (!executable || returnAddress < executable ||
+        static_cast<std::size_t>(returnAddress - executable) != 0x0001C361u)
+    {
+        return false;
+    }
+
+    // 0x72C839 is SH3's native Noise Effect switch.  The draw above is the
+    // exact four-vertex fullscreen noise pass (not subtitles or another HUD
+    // quad), identified from the game's own render routine.
+    std::uint8_t enabled = 0;
+    return ReadProcessBytes(executable + (0x0072C839u - 0x00400000u),
+        &enabled, sizeof(enabled)) && enabled != 0;
 }
 
 static bool IsLowResolutionLightCompositeDraw8(DWORD primitiveType,
@@ -9716,7 +9975,7 @@ static bool DrawLeftHandEye8(std::uint32_t eye, const D3DMATRIX& world)
     if (eye < 2)
     {
         const float eyeSign = eye == 0 ? -1.0f : 1.0f;
-        view.m[3][0] = -eyeSign * 0.5f * SH3VR_IPD_METERS * g_worldScale8;
+        view.m[3][0] = -eyeSign * 0.5f * g_runtimeIpdMeters8 * g_worldScale8;
     }
 
     D3DMATRIX projection = {};
@@ -10928,7 +11187,7 @@ static bool BuildWeaponGuideTransforms8(std::uint32_t eye, D3DMATRIX* view,
     if (eye < 2)
     {
         const float eyeSign = eye == 0 ? -1.0f : 1.0f;
-        view->m[3][0] = -eyeSign * 0.5f * SH3VR_IPD_METERS * g_worldScale8;
+        view->m[3][0] = -eyeSign * 0.5f * g_runtimeIpdMeters8 * g_worldScale8;
     }
 
     if (!BuildImmersiveProjection(g_lastProjection8, *projection))
@@ -11747,7 +12006,8 @@ static HRESULT WINAPI hk_D3D8_Present(IDirect3DDevice8* device, const RECT* src,
             g_perDrawStereoBudgetLogged8 = false;
             g_perDrawStereoReplayOverflow8 = false;
             Log("Continuous native stereo draw replay armed for the next "
-                "gameplay frame with 64 mm IPD");
+                "gameplay frame with runtime IPD %.2f mm",
+                g_runtimeIpdMeters8 * 1000.0f);
         }
     }
     const bool synchronizedStereo = immersive &&
@@ -11856,6 +12116,15 @@ static HRESULT WINAPI hk_D3D8_Present(IDirect3DDevice8* device, const RECT* src,
     if (use90FpsTiming || useProxyNativeTiming || useProxyFrameTimeOverride ||
         useProxyVirtualMode4)
         PaceGameFrame();
+
+    // Apply Camera Mod snap turns only after the completed scene and its
+    // native eye pair have been submitted.  Updating Camera Mod yaw from
+    // ReadRelativeHeadPose changed the base camera while the current scene
+    // was still being assembled, so a 90/180 degree turn could leave the two
+    // replayed eyes describing different camera states.  The new yaw now
+    // becomes visible atomically at the start of the next game frame.
+    if (immersive)
+        UpdateCameraModSnapTurn();
     return result;
 }
 
@@ -12445,33 +12714,11 @@ bool D3D9Hook_Install()
     roomscalePlayerHeightCm = std::clamp(roomscalePlayerHeightCm, 120, 220);
     g_roomscalePlayerHeightMeters8 =
         static_cast<float>(roomscalePlayerHeightCm) / 100.0f;
-    int roomscaleFullKeySpeedCmPerSecond = ReadIniIntSetting(
-        "Roomscale", "FullSpeedCmPerSecond", 150);
-    roomscaleFullKeySpeedCmPerSecond = std::clamp(
-        roomscaleFullKeySpeedCmPerSecond, 50, 400);
-    g_roomscaleFullKeySpeedMetersPerSecond8 =
-        static_cast<float>(roomscaleFullKeySpeedCmPerSecond) / 100.0f;
-    int worldScale = ReadIniIntSetting("Roomscale", "WorldScale",
-        static_cast<int>(SH3VR_DEFAULT_WORLD_SCALE));
-    worldScale = std::clamp(worldScale, 200, 600);
-    // WorldScale is a user-facing perceived-size control: values below the
-    // 360 baseline must make the world smaller. Internally the renderer needs
-    // the inverse quantity (SH3 game units per physical metre) for IPD, head
-    // translation, controllers, weapons, and the tracked hand. Keeping the
-    // conversion in one place prevents the world and held objects from
-    // drifting to different physical scales.
-    g_worldScale8 = (SH3VR_DEFAULT_WORLD_SCALE *
-        SH3VR_DEFAULT_WORLD_SCALE) / static_cast<float>(worldScale);
+    // World scale is intentionally internal.  Roomscale must use the same
+    // fixed metre-to-game-unit conversion as head and hand tracking.
+    g_worldScale8 = SH3VR_DEFAULT_WORLD_SCALE;
     g_autoLoadCameraModFirstPerson8 =
         ReadIniIntSetting("CameraMod", "AutoLoadFirstPerson", 1) != 0;
-    int cameraModAutoLoadDelaySeconds = ReadIniIntSetting("CameraMod",
-        "AutoLoadFirstPersonDelaySeconds", 180);
-    cameraModAutoLoadDelaySeconds = std::clamp(
-        cameraModAutoLoadDelaySeconds, 0, 600);
-    g_cameraModAutoLoadDelaySeconds8 = static_cast<DWORD>(
-        cameraModAutoLoadDelaySeconds);
-    g_cameraModStartupTick8 = GetTickCount64();
-    g_cameraModAutoLoadDelayLogged8 = false;
     g_cameraModAutoLoadDone8 = false;
     g_cameraModImmersiveFrameStreak8 = 0;
     g_enableCameraModSnapTurn8 =
@@ -12576,9 +12823,8 @@ bool D3D9Hook_Install()
     Log("Loaded [Stereo] ReplayWorldOnly=%s; per-draw replay shader "
         "filter %s", g_stereoReplayWorldOnly8 ? "1" : "0",
         g_stereoReplayWorldOnly8 ? "world shader 0x2D only" : "full allowlist");
-    Log("Loaded [Roomscale] WorldScale=%d perceived-size units; internal "
-        "tracking scale %.1f game units per meter",
-        worldScale, g_worldScale8);
+    Log("Loaded [Roomscale] fixed internal tracking scale %.1f game units "
+        "per meter", g_worldScale8);
     Log("Loaded [Input] Camera Mod integrated snap turn=%s; activation %d%%, "
         "angle %d degrees, Heather alignment pulse %d ms",
         g_enableCameraModSnapTurn8 ? "1" : "0",
@@ -12589,14 +12835,9 @@ bool D3D9Hook_Install()
         g_enableHeadTrackedFlashlight8 ? "1" : "0");
     Log("Loaded [CameraMod] AutoLoadFirstPerson=%s",
         g_autoLoadCameraModFirstPerson8 ? "1" : "0");
-    Log("Loaded [CameraMod] AutoLoadFirstPersonDelaySeconds=%u",
-        static_cast<unsigned>(g_cameraModAutoLoadDelaySeconds8));
-    Log("Loaded [Roomscale] Enable=%s; PlayerHeightCm=%d; "
-        "FullSpeedCmPerSecond=%d; follow radius %d cm",
-        g_enableRoomscale8 ? "1" : "0", roomscalePlayerHeightCm,
-        roomscaleFullKeySpeedCmPerSecond,
-        static_cast<int>(std::lround(
-            SH3VR_ROOMSCALE_FOLLOW_RADIUS_METERS * 100.0f)));
+    Log("Loaded [Roomscale] Enable=%s; PlayerHeightCm=%d; per-frame camera-"
+        "basis native translation without deadzone or locomotion animation",
+        g_enableRoomscale8 ? "1" : "0", roomscalePlayerHeightCm);
     if (g_enableFixedStep90Test8)
     {
         Log("Loaded [Timing] FixedStep90Test=1 from sh3vr.ini; "
@@ -12614,6 +12855,8 @@ bool D3D9Hook_Install()
     }
 
     LateHooks();
+
+    InstallCameraModDemoGuard();
 
     if (g_enableRuntimeDiagnostics8 || g_enableCompositeDuplicateTest8 ||
         g_enableStereoSurfaceProbe8 || g_enableSynchronizedStereo8 ||

@@ -1,4 +1,10 @@
 [OpenXR]
+; Auto = launcher override, then running SteamVR, then Virtual Desktop, then system.
+; Manual overrides: System or SteamVR. Selection is fixed until game restart.
+Runtime=Auto
+; Optional absolute path to SteamVR/steamxr_win64.json if automatic discovery fails.
+SteamVRRuntimePath=
+; SteamVR controls its own refresh rate when XR_FB_display_refresh_rate is absent.
 ; Set both to 0 to use the runtime recommendation.
 EyeWidth=1900
 EyeHeight=2076
@@ -36,26 +42,19 @@ EnableFullPassStereo=0
 
 [CameraMod]
 ; Automatically load Camera Mod's built-in First Person preset and enable the
-; camera mod after OpenXR tracking becomes active. Set to 0 to disable.
+; camera mod after tracking is active and the complete native event has ended.
+; Multi-part cutscenes stay protected across inner cleanup/loading transitions.
+; Native cutscenes temporarily suspend it; skipping needs no fixed delay.
+; Set to 0 to disable automatic camera management.
 AutoLoadFirstPerson=1
-; Safety fallback used only if a build does not expose the normal gameplay
-; projection.  In the regular build First Person is enabled automatically
-; as soon as the startup/new-game cutscene ends.
-AutoLoadFirstPersonDelaySeconds=180
 
 [Roomscale]
-; Move Heather through Camera Mod's collision-aware movement controls when the
-; headset walks beyond the small physical lean radius.
+; Every physical OpenXR X/Z delta directly moves Heather through the actual
+; game-camera world basis. There is no lean deadzone, catch-up, synthetic key,
+; or locomotion animation. Horizontal tracking is metric 1:1.
 Enable=1
 ; Normalize every standing player to Heather's canonical 165 cm body height.
 PlayerHeightCm=165
-; Perceived VR world size. 360 is the original calibrated size. Lower values
-; make the environment smaller; higher values make it larger. The physical
-; size and calibrated offsets of tracked hands and weapons remain unchanged.
-; Physical walking speed that maps to a continuously held movement key.
-; Increase this value if Heather still travels too far; decrease it if she
-; travels too little. The default is 150 centimetres per second.
-FullSpeedCmPerSecond=150
 
 [Input]
 ; Experimental shader-based head-tracked flashlight. Disabled because the
@@ -115,6 +114,12 @@ MeleeSwingMinTravelMm=300
 MeleeSwingMinNetTravelMm=220
 ; Minimum time between detected swings.
 MeleeSwingCooldownMs=280
+; Easier knife-only gesture. These values do not weaken the pipe, katana, or
+; maul thresholds above. The knife also uses a wider blade-centred hit capsule.
+KnifeSwingSpeedMmPerSecond=1750
+KnifeSwingMinTravelMm=140
+KnifeSwingMinNetTravelMm=90
+KnifeSwingCooldownMs=220
 
 [Debug]
 ; Draw controller P/Y/R after each completed OpenXR eye image.

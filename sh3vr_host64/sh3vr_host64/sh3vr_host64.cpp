@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "shared_frame.h"
+#include "runtime_selection.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -60,6 +61,7 @@ struct HostSettings
 };
 
 HostSettings g_settings = {};
+bool g_requireSteamRuntime = false;
 
 float ReadIniFloat(const wchar_t* path, const wchar_t* section,
     const wchar_t* key, float defaultValue, float minimum, float maximum)
@@ -471,6 +473,24 @@ public:
         InterlockedIncrement(reinterpret_cast<volatile LONG*>(&state->sequence));
     }
 
+    void PublishRuntimeIpd(float ipdMeters)
+    {
+        if (!m_header || !std::isfinite(ipdMeters) ||
+            ipdMeters < 0.04f || ipdMeters > 0.09f)
+        {
+            return;
+        }
+
+        auto* state = reinterpret_cast<Sh3VrRuntimeStereoState*>(
+            m_header->reserved + SH3VR_RUNTIME_STEREO_RESERVED_OFFSET);
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&state->sequence));
+        MemoryBarrier();
+        state->magic = SH3VR_RUNTIME_STEREO_MAGIC;
+        state->ipdMeters = ipdMeters;
+        MemoryBarrier();
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&state->sequence));
+    }
+
 private:
     bool ValidateHeader() const
     {
@@ -520,6 +540,13 @@ public:
         Shutdown();
     }
 
+    bool ProbeRuntime()
+    {
+        // No graphics session, game process, or frame loop. Exercise the actual
+        // installed runtime and the same action/profile declarations as gameplay.
+        return CreateInstance() && CreateSystem() && InitializeControllerInput(false);
+    }
+
     bool Initialize()
     {
         if (!CreateInstance() || !CreateSystem())
@@ -566,6 +593,7 @@ public:
             return false;
         if (!m_sessionRunning)
         {
+            consumer.PublishControllerState(Sh3VrControllerState{});
             consumer.Wait(10);
             return true;
         }
@@ -623,9 +651,32 @@ public:
                 const XrResult locateResult = xrLocateViews(m_session, &locateInfo,
                     &viewState, static_cast<std::uint32_t>(locatedViews.size()),
                     &viewCount, locatedViews.data());
-                if (XR_SUCCEEDED(locateResult) && viewCount == locatedViews.size())
+                if (XR_SUCCEEDED(locateResult) && viewCount == locatedViews.size() &&
+                    (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0 &&
+                    (headLocation.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) != 0)
                 {
                     submitProjection = true;
+                    const float eyeDx = locatedViews[1].pose.position.x -
+                        locatedViews[0].pose.position.x;
+                    const float eyeDy = locatedViews[1].pose.position.y -
+                        locatedViews[0].pose.position.y;
+                    const float eyeDz = locatedViews[1].pose.position.z -
+                        locatedViews[0].pose.position.z;
+                    const float runtimeIpd = std::sqrt(eyeDx * eyeDx +
+                        eyeDy * eyeDy + eyeDz * eyeDz);
+                    if (std::isfinite(runtimeIpd) && runtimeIpd >= 0.04f &&
+                        runtimeIpd <= 0.09f)
+                    {
+                        consumer.PublishRuntimeIpd(runtimeIpd);
+                        if (!m_runtimeIpdLogged ||
+                            std::fabs(runtimeIpd - m_lastRuntimeIpd) >= 0.0005f)
+                        {
+                            m_runtimeIpdLogged = true;
+                            m_lastRuntimeIpd = runtimeIpd;
+                            Log("OpenXR runtime IPD detected: %.2f mm",
+                                runtimeIpd * 1000.0f);
+                        }
+                    }
                     std::array<std::array<float, 4>, 2> projectionUvRects = {};
                     for (std::size_t eye = 0; eye < locatedViews.size(); ++eye)
                     {
@@ -694,14 +745,11 @@ public:
                 };
                 if (nativeEyeSourcesReady)
                 {
-                    // The game hook renders a parallel 64 mm stereo pair: the
-                    // two cameras differ only by +/-32 mm on head-local X.
-                    // Do not describe those textures with the runtime's eye
-                    // poses, which can contain small Y/Z offsets and per-eye
-                    // rotations. That pose mismatch is negligible at a
-                    // distance but creates strong vertical disparity for a
-                    // hand, weapon, or wall close to the lower lens area.
-                    constexpr float renderedHalfIpdMeters = 0.032f;
+                    // The game hook renders a parallel stereo pair using the
+                    // IPD reported by this OpenXR runtime. The two cameras
+                    // differ only on head-local X.
+                    const float renderedHalfIpdMeters =
+                        0.5f * m_lastRuntimeIpd;
                     const float eyeSign = eye == 0 ? -1.0f : 1.0f;
                     const XrVector3f localRenderedEyeOffset{
                         eyeSign * renderedHalfIpdMeters, 0.0f, 0.0f
@@ -713,13 +761,6 @@ public:
                         renderHeadPose.position.y + renderedEyeOffset.y,
                         renderHeadPose.position.z + renderedEyeOffset.z
                     };
-                    // Preserve the eye-relative orientation that belongs to
-                    // the runtime's asymmetric FOV. Removing it makes the
-                    // center look correct while the headset is level, but
-                    // after a menu transition and a larger head rotation the
-                    // two images diverge and distant geometry leaves the
-                    // submitted frustum. Only the positional Y/Z mismatch is
-                    // absent from the game's parallel camera pair.
                     const XrQuaternionf inverseCurrentHead{
                         -headLocation.pose.orientation.x,
                         -headLocation.pose.orientation.y,
@@ -735,9 +776,10 @@ public:
                     if (!m_nativeEyePoseMatchLogged && eye == 1)
                     {
                         m_nativeEyePoseMatchLogged = true;
-                        Log("Native eye submission uses the rendered parallel "
-                            "64 mm camera positions and runtime FOV-relative "
-                            "eye orientations");
+                        Log("Native eye submission uses rendered parallel "
+                            "runtime-IPD camera positions (%.2f mm) and "
+                            "runtime FOV-relative eye orientations",
+                            m_lastRuntimeIpd * 1000.0f);
                     }
                 }
                 else
@@ -839,6 +881,11 @@ private:
 
     bool CreateInstance()
     {
+        if (!HasInstanceExtension(XR_KHR_D3D11_ENABLE_EXTENSION_NAME))
+        {
+            Log("Selected OpenXR runtime does not expose XR_KHR_D3D11_enable");
+            return false;
+        }
         const char* extensions[2] = { XR_KHR_D3D11_ENABLE_EXTENSION_NAME,
             XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME };
         std::uint32_t extensionCount = 1;
@@ -848,8 +895,8 @@ private:
         if (m_refreshRateExtensionEnabled)
         {
             extensionCount++;
-            Log("OpenXR extension %s is available; 90 Hz request is enabled",
-                XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
+            Log("OpenXR extension %s is available; %u Hz request is enabled",
+                XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME, g_settings.targetRefreshRate);
         }
         else if (g_settings.requestRefreshRate &&
             g_settings.targetRefreshRate != 0)
@@ -867,14 +914,37 @@ private:
         createInfo.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 0, 0);
         createInfo.enabledExtensionCount = extensionCount;
         createInfo.enabledExtensionNames = extensions;
-        return CheckXr(xrCreateInstance(&createInfo, &m_instance), "xrCreateInstance");
+        if (!CheckXr(xrCreateInstance(&createInfo, &m_instance), "xrCreateInstance"))
+            return false;
+        XrInstanceProperties properties{ XR_TYPE_INSTANCE_PROPERTIES };
+        if (!CheckXr(xrGetInstanceProperties(m_instance, &properties), "xrGetInstanceProperties"))
+            return false;
+        Log("OpenXR runtime: %s, version %u.%u.%u", properties.runtimeName,
+            XR_VERSION_MAJOR(properties.runtimeVersion), XR_VERSION_MINOR(properties.runtimeVersion),
+            XR_VERSION_PATCH(properties.runtimeVersion));
+        if (g_requireSteamRuntime && !strstr(properties.runtimeName, "SteamVR"))
+        {
+            Log("SteamVR requested but a different runtime loaded. Run without administrator "
+                "privileges (elevated loaders can ignore XR_RUNTIME_JSON), or select SteamVR "
+                "as the system OpenXR runtime. Refusing silent fallback.");
+            m_retryAllowed = false;
+            return false;
+        }
+        return true;
     }
 
     bool CreateSystem()
     {
         XrSystemGetInfo getInfo{ XR_TYPE_SYSTEM_GET_INFO };
         getInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
-        return CheckXr(xrGetSystem(m_instance, &getInfo, &m_systemId), "xrGetSystem");
+        if (!CheckXr(xrGetSystem(m_instance, &getInfo, &m_systemId), "xrGetSystem"))
+            return false;
+        XrSystemProperties properties{ XR_TYPE_SYSTEM_PROPERTIES };
+        if (XR_SUCCEEDED(xrGetSystemProperties(m_instance, m_systemId, &properties)))
+            Log("OpenXR headset: %s; orientation=%u position=%u", properties.systemName,
+                properties.trackingProperties.orientationTracking,
+                properties.trackingProperties.positionTracking);
+        return true;
     }
 
     bool CreateGraphicsDevice()
@@ -1072,7 +1142,76 @@ private:
             name);
     }
 
-    bool InitializeControllerInput()
+    bool SuggestControllerBindings(const char* profile, int layout)
+    {
+        // 0: Touch, 1: Index, 2: Vive wands. All feed the same game-side
+        // controller state, including both grip and aim poses for motion combat.
+        XrPath profilePath = XR_NULL_PATH;
+        if (XR_FAILED(xrStringToPath(m_instance, profile, &profilePath)))
+            return false;
+        std::vector<XrActionSuggestedBinding> bindings;
+        bool valid = true;
+        const auto bind = [&](XrAction action, const char* path)
+        {
+            XrPath bindingPath = XR_NULL_PATH;
+            if (XR_SUCCEEDED(xrStringToPath(m_instance, path, &bindingPath)))
+                bindings.push_back({ action, bindingPath });
+            else
+                valid = false;
+        };
+        bind(m_triggerAction, "/user/hand/left/input/trigger/value");
+        bind(m_triggerAction, "/user/hand/right/input/trigger/value");
+        bind(m_gripPoseAction, "/user/hand/left/input/grip/pose");
+        bind(m_gripPoseAction, "/user/hand/right/input/grip/pose");
+        bind(m_aimPoseAction, "/user/hand/left/input/aim/pose");
+        bind(m_aimPoseAction, "/user/hand/right/input/aim/pose");
+        if (layout == 2)
+        {
+            // OpenXR converts a click binding to 0/1 for the float grip action.
+            bind(m_squeezeAction, "/user/hand/left/input/squeeze/click");
+            bind(m_squeezeAction, "/user/hand/right/input/squeeze/click");
+            bind(m_thumbstickAction, "/user/hand/left/input/trackpad");
+            bind(m_viveLeftPadTouchAction, "/user/hand/left/input/trackpad/touch");
+            bind(m_stickClickAction, "/user/hand/left/input/trackpad/click");
+            bind(m_vivePadAction, "/user/hand/right/input/trackpad");
+            bind(m_vivePadClickAction, "/user/hand/right/input/trackpad/click");
+            bind(m_vivePadTouchAction, "/user/hand/right/input/trackpad/touch");
+            bind(m_buttonXAction, "/user/hand/left/input/menu/click");
+            bind(m_buttonBAction, "/user/hand/right/input/menu/click");
+        }
+        else
+        {
+            bind(m_thumbstickAction, "/user/hand/left/input/thumbstick");
+            bind(m_thumbstickAction, "/user/hand/right/input/thumbstick");
+            bind(m_stickClickAction, "/user/hand/left/input/thumbstick/click");
+            bind(m_stickClickAction, "/user/hand/right/input/thumbstick/click");
+            bind(m_squeezeAction, "/user/hand/left/input/squeeze/value");
+            bind(m_squeezeAction, "/user/hand/right/input/squeeze/value");
+            bind(m_buttonAAction, "/user/hand/right/input/a/click");
+            bind(m_buttonBAction, "/user/hand/right/input/b/click");
+            bind(m_buttonXAction, layout == 1 ? "/user/hand/left/input/a/click" :
+                "/user/hand/left/input/x/click");
+            bind(m_buttonYAction, layout == 1 ? "/user/hand/left/input/b/click" :
+                "/user/hand/left/input/y/click");
+            // Index system buttons belong to SteamVR, not applications.
+            if (layout == 0)
+                bind(m_menuAction, "/user/hand/left/input/menu/click");
+        }
+        if (!valid)
+            return false;
+        XrInteractionProfileSuggestedBinding suggested{
+            XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING };
+        suggested.interactionProfile = profilePath;
+        suggested.countSuggestedBindings = static_cast<std::uint32_t>(bindings.size());
+        suggested.suggestedBindings = bindings.data();
+        const XrResult result = xrSuggestInteractionProfileBindings(m_instance, &suggested);
+        Log("Controller profile %s: %s (%d)", profile,
+            XR_SUCCEEDED(result) ? "bindings accepted" : "bindings unavailable",
+            static_cast<int>(result));
+        return XR_SUCCEEDED(result);
+    }
+
+    bool InitializeControllerInput(bool attachSession = true)
     {
         XrActionSetCreateInfo setInfo{ XR_TYPE_ACTION_SET_CREATE_INFO };
         strcpy_s(setInfo.actionSetName, "gameplay");
@@ -1122,6 +1261,14 @@ private:
             !CreateInputAction("button_y", "Y button",
                 XR_ACTION_TYPE_BOOLEAN_INPUT, &m_handPaths[0], 1,
                 &m_buttonYAction) ||
+            !CreateInputAction("vive_left_pad_touch", "Vive movement touch",
+                XR_ACTION_TYPE_BOOLEAN_INPUT, &m_handPaths[0], 1, &m_viveLeftPadTouchAction) ||
+            !CreateInputAction("vive_right_pad", "Vive turn / command pad",
+                XR_ACTION_TYPE_VECTOR2F_INPUT, &m_handPaths[1], 1, &m_vivePadAction) ||
+            !CreateInputAction("vive_right_pad_click", "Vive command select",
+                XR_ACTION_TYPE_BOOLEAN_INPUT, &m_handPaths[1], 1, &m_vivePadClickAction) ||
+            !CreateInputAction("vive_right_pad_touch", "Vive turn touch",
+                XR_ACTION_TYPE_BOOLEAN_INPUT, &m_handPaths[1], 1, &m_vivePadTouchAction) ||
             !CreateInputAction("menu", "Menu button",
                 XR_ACTION_TYPE_BOOLEAN_INPUT, &m_handPaths[0], 1,
                 &m_menuAction))
@@ -1129,51 +1276,16 @@ private:
             return false;
         }
 
-        XrPath touchProfile = XR_NULL_PATH;
-        if (!CheckXr(xrStringToPath(m_instance,
-            "/interaction_profiles/oculus/touch_controller", &touchProfile),
-            "xrStringToPath(Oculus Touch profile)"))
-        {
+        unsigned accepted = 0;
+        accepted += SuggestControllerBindings("/interaction_profiles/oculus/touch_controller", 0);
+        accepted += SuggestControllerBindings("/interaction_profiles/valve/index_controller", 1);
+        accepted += SuggestControllerBindings("/interaction_profiles/htc/vive_controller", 2);
+        // An unsupported optional profile must not disable working Touch input.
+        if (accepted == 0)
             return false;
-        }
 
-        std::vector<XrActionSuggestedBinding> bindings;
-        const auto bind = [&](XrAction action, const char* path)
-        {
-            XrPath bindingPath = XR_NULL_PATH;
-            if (XR_SUCCEEDED(xrStringToPath(m_instance, path, &bindingPath)))
-                bindings.push_back({ action, bindingPath });
-        };
-
-        bind(m_thumbstickAction, "/user/hand/left/input/thumbstick");
-        bind(m_thumbstickAction, "/user/hand/right/input/thumbstick");
-        bind(m_triggerAction, "/user/hand/left/input/trigger/value");
-        bind(m_triggerAction, "/user/hand/right/input/trigger/value");
-        bind(m_squeezeAction, "/user/hand/left/input/squeeze/value");
-        bind(m_squeezeAction, "/user/hand/right/input/squeeze/value");
-        bind(m_stickClickAction, "/user/hand/left/input/thumbstick/click");
-        bind(m_stickClickAction, "/user/hand/right/input/thumbstick/click");
-        bind(m_buttonAAction, "/user/hand/right/input/a/click");
-        bind(m_buttonBAction, "/user/hand/right/input/b/click");
-        bind(m_buttonXAction, "/user/hand/left/input/x/click");
-        bind(m_buttonYAction, "/user/hand/left/input/y/click");
-        bind(m_menuAction, "/user/hand/left/input/menu/click");
-        bind(m_gripPoseAction, "/user/hand/left/input/grip/pose");
-        bind(m_gripPoseAction, "/user/hand/right/input/grip/pose");
-        bind(m_aimPoseAction, "/user/hand/left/input/aim/pose");
-        bind(m_aimPoseAction, "/user/hand/right/input/aim/pose");
-
-        XrInteractionProfileSuggestedBinding suggested{
-            XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING };
-        suggested.interactionProfile = touchProfile;
-        suggested.countSuggestedBindings =
-            static_cast<std::uint32_t>(bindings.size());
-        suggested.suggestedBindings = bindings.data();
-        if (!CheckXr(xrSuggestInteractionProfileBindings(m_instance, &suggested),
-            "xrSuggestInteractionProfileBindings(Oculus Touch)"))
-        {
-            return false;
-        }
+        if (!attachSession)
+            return true;
 
         XrSessionActionSetsAttachInfo attachInfo{
             XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO };
@@ -1205,7 +1317,7 @@ private:
         }
 
         m_controllerInputInitialized = true;
-        Log("OpenXR Quest Touch controller actions initialized");
+        Log("OpenXR controller actions initialized (Touch / Index / Vive)");
         return true;
     }
 
@@ -1265,7 +1377,9 @@ private:
         syncInfo.countActiveActionSets = 1;
         syncInfo.activeActionSets = &activeSet;
         const XrResult syncResult = xrSyncActions(m_session, &syncInfo);
-        if (XR_FAILED(syncResult))
+        // XR_SESSION_NOT_FOCUSED is a positive result, not XR_FAILED.
+        // Never publish stale presses/poses while SteamVR Dashboard owns input.
+        if (syncResult != XR_SUCCESS)
         {
             if (!m_controllerSyncFailureLogged)
             {
@@ -1278,6 +1392,24 @@ private:
         }
 
         state.active = 1;
+        m_controllerSyncFailureLogged = false;
+        if (m_profilesDirty)
+        {
+            m_profilesDirty = false;
+            for (std::size_t hand = 0; hand < m_handPaths.size(); ++hand)
+            {
+                XrInteractionProfileState profile{ XR_TYPE_INTERACTION_PROFILE_STATE };
+                if (XR_SUCCEEDED(xrGetCurrentInteractionProfile(m_session, m_handPaths[hand], &profile)))
+                {
+                    char name[XR_MAX_PATH_LENGTH] = {};
+                    uint32_t length = 0;
+                    if (profile.interactionProfile != XR_NULL_PATH)
+                        xrPathToString(m_instance, profile.interactionProfile, sizeof(name), &length, name);
+                    Log("Active %s controller profile: %s", hand == 0 ? "left" : "right",
+                        name[0] ? name : "none (connect controllers / check SteamVR bindings)");
+                }
+            }
+        }
         for (std::size_t hand = 0; hand < m_handPaths.size(); ++hand)
         {
             XrActionStateGetInfo getInfo{ XR_TYPE_ACTION_STATE_GET_INFO };
@@ -1311,10 +1443,14 @@ private:
             ReadBooleanAction(m_stickClickAction, m_handPaths[hand],
                 hand == 0 ? SH3VR_BUTTON_LEFT_STICK :
                     SH3VR_BUTTON_RIGHT_STICK, state.buttons);
-            ReadControllerPose(m_gripSpaces[hand], displayTime,
-                state.gripPose[hand]);
-            ReadControllerPose(m_aimSpaces[hand], displayTime,
-                state.aimPose[hand]);
+            getInfo.action = m_gripPoseAction;
+            XrActionStatePose poseState{ XR_TYPE_ACTION_STATE_POSE };
+            if (XR_SUCCEEDED(xrGetActionStatePose(m_session, &getInfo, &poseState)) && poseState.isActive)
+                ReadControllerPose(m_gripSpaces[hand], displayTime, state.gripPose[hand]);
+            getInfo.action = m_aimPoseAction;
+            poseState = { XR_TYPE_ACTION_STATE_POSE };
+            if (XR_SUCCEEDED(xrGetActionStatePose(m_session, &getInfo, &poseState)) && poseState.isActive)
+                ReadControllerPose(m_aimSpaces[hand], displayTime, state.aimPose[hand]);
         }
 
         if (state.trigger[0] > 0.55f)
@@ -1335,6 +1471,35 @@ private:
             SH3VR_BUTTON_Y, state.buttons);
         ReadBooleanAction(m_menuAction, m_handPaths[0],
             SH3VR_BUTTON_MENU, state.buttons);
+        XrActionStateGetInfo leftTouchInfo{ XR_TYPE_ACTION_STATE_GET_INFO };
+        leftTouchInfo.action = m_viveLeftPadTouchAction;
+        leftTouchInfo.subactionPath = m_handPaths[0];
+        XrActionStateBoolean leftTouch{ XR_TYPE_ACTION_STATE_BOOLEAN };
+        if (XR_SUCCEEDED(xrGetActionStateBoolean(m_session, &leftTouchInfo, &leftTouch)) &&
+            leftTouch.isActive && !leftTouch.currentState)
+        {
+            // Some trackpads retain their last coordinate after finger lift.
+            state.thumbstick[0][0] = state.thumbstick[0][1] = 0.0f;
+        }
+        XrActionStateGetInfo padInfo{ XR_TYPE_ACTION_STATE_GET_INFO };
+        padInfo.subactionPath = m_handPaths[1];
+        padInfo.action = m_vivePadAction;
+        XrActionStateVector2f pad{ XR_TYPE_ACTION_STATE_VECTOR2F };
+        if (XR_SUCCEEDED(xrGetActionStateVector2f(m_session, &padInfo, &pad)) && pad.isActive)
+        {
+            std::uint32_t click = 0, touch = 0;
+            ReadBooleanAction(m_vivePadClickAction, m_handPaths[1], 1, click);
+            ReadBooleanAction(m_vivePadTouchAction, m_handPaths[1], 1, touch);
+            // Side touches turn; upper/lower clicks confirm / open map.
+            // Center click substitutes R3 (both pad centers together = F1).
+            if (touch && !click && std::fabs(pad.currentState.x) > std::fabs(pad.currentState.y))
+                state.thumbstick[1][0] = pad.currentState.x;
+            if (click)
+            {
+                state.buttons |= pad.currentState.y > 0.35f ? SH3VR_BUTTON_A :
+                    pad.currentState.y < -0.35f ? SH3VR_BUTTON_Y : SH3VR_BUTTON_RIGHT_STICK;
+            }
+        }
         consumer.PublishControllerState(state);
     }
 
@@ -1916,6 +2081,10 @@ float4 DebugPsMain(DebugVertexOutput input) : SV_Target
             else if (event.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING)
             {
                 m_exitRequested = true;
+            }
+            else if (event.type == XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED)
+            {
+                m_profilesDirty = true;
             }
             event = XrEventDataBuffer{ XR_TYPE_EVENT_DATA_BUFFER };
         }
@@ -3001,6 +3170,11 @@ float4 DebugPsMain(DebugVertexOutput input) : SV_Target
     XrAction m_buttonXAction = XR_NULL_HANDLE;
     XrAction m_buttonYAction = XR_NULL_HANDLE;
     XrAction m_menuAction = XR_NULL_HANDLE;
+    XrAction m_vivePadAction = XR_NULL_HANDLE;
+    XrAction m_viveLeftPadTouchAction = XR_NULL_HANDLE;
+    XrAction m_vivePadClickAction = XR_NULL_HANDLE;
+    XrAction m_vivePadTouchAction = XR_NULL_HANDLE;
+    bool m_profilesDirty = true;
     std::array<XrPath, 2> m_handPaths = { XR_NULL_PATH, XR_NULL_PATH };
     std::array<XrSpace, 2> m_gripSpaces = {
         XR_NULL_HANDLE, XR_NULL_HANDLE };
@@ -3063,6 +3237,8 @@ float4 DebugPsMain(DebugVertexOutput input) : SV_Target
     std::int32_t m_renderMode = SH3VR_RENDER_CINEMA;
     Sh3VrHeadPose m_frameRenderPose = {};
     bool m_haveFrameRenderPose = false;
+    float m_lastRuntimeIpd = 0.064f;
+    bool m_runtimeIpdLogged = false;
     bool m_frameRenderPoseLogged = false;
     std::uint32_t m_lastD3D12HandleGeneration = 0;
     std::uint32_t m_lastD3D12EyeTextureGeneration = 0;
@@ -3101,6 +3277,41 @@ int wmain(int argumentCount, wchar_t** arguments)
     SetConsoleCtrlHandler(ConsoleHandler, TRUE);
     Log("SH3VR x64 host starting");
     LoadSettings();
+
+    wchar_t iniPath[MAX_PATH] = {};
+    std::wstring runtimeDiagnostic;
+    if (!GetHostDirectory(iniPath, std::size(iniPath)))
+        return 1;
+    wcscat_s(iniPath, L"sh3vr.ini");
+    const bool runtimeConfigured = sh3vr::ConfigureRuntime(iniPath,
+        runtimeDiagnostic, g_requireSteamRuntime);
+    Log("Runtime selection: %ls", runtimeDiagnostic.c_str());
+    if (!runtimeConfigured)
+        return 1;
+
+    for (int index = 1; index < argumentCount; ++index)
+    {
+        if (wcscmp(arguments[index], L"--check-runtime-selection") == 0)
+        {
+            // Inspect selection without initializing either runtime or starting VR.
+            if (g_log) fclose(g_log);
+            g_log = nullptr;
+            return 0;
+        }
+        if (wcscmp(arguments[index], L"--probe-runtime") == 0)
+        {
+            bool success = false;
+            {
+                OpenXrHost probe;
+                success = probe.ProbeRuntime();
+            }
+            Log("Runtime / binding probe: %s (no headset rendering tested)", success ? "PASS" : "FAIL");
+            if (g_log)
+                fclose(g_log);
+            g_log = nullptr;
+            return success ? 0 : 1;
+        }
+    }
 
     DWORD parentPid = 0;
     for (int index = 1; index + 1 < argumentCount; ++index)

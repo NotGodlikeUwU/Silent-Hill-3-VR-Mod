@@ -5,7 +5,9 @@ A mod for *Silent Hill 3* that brings fully working VR mode into the game.
 **WARNING: You must install Silent Hill 3 PC Fix by Steam006 to play this mod.**
 
 ### Current status
-Tested on **Meta Quest 3** through **Virtual Desktop**. Other headsets and runtimes are not yet validated.
+Tested on **Meta Quest 3** through **Virtual Desktop**. The mod also includes
+SteamVR/OpenXR support with automatic runtime detection and Touch/Index/Vive
+controller bindings. See [SteamVR setup and testing](docs/steamvr.md).
 
 You can adjust the in-game VR resolution and FPS lock (not tested, i recommend leaving 90 FPS) in `sh3vr.ini` to better match different headsets.
 
@@ -21,6 +23,7 @@ You MUST install [Silent Hill 3 PC Fix by Steam006](https://community.pcgamingwi
 - Player Height adaptation
 - Motion-attached melee and firearm weapons
 - Controller-relative firearm aiming, native damage, and an in-world guide dot
+- SteamVR/OpenXR runtime support with automatic runtime selection
 - Per-weapon position, rotation, scale, and firearm aim offsets
 - Working UI and subtitles
 - Fully playable in the default camera mode
@@ -31,6 +34,9 @@ You MUST install [Silent Hill 3 PC Fix by Steam006](https://community.pcgamingwi
 - Sewer location has glitched water reflections
 - Missing shadows and enemy blood effects
 - Missing muzzle flash effects
+- Knife hit registration is still unreliable with motion strikes
+- Noise Effect is not rendered correctly in VR
+- No other technical blockers are expected in theory, but additional playtesting is still recommended
 - Not the entire game has been thoroughly tested — unexpected issues may appear during a full playthrough
 
 Please report any problems in the **Flat2VR Discord** or open an **Issue** on this repository.
@@ -59,7 +65,6 @@ The repository contains `sh3vr.ini.example` and `sh3vr_weapons.ini.example` temp
 
 ### Roadmap
 - Fixes for missing shadows and blood effects
-- SteamVR support
 - Various bug fixes
 
 ### Building from source

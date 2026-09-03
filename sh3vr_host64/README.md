@@ -26,6 +26,10 @@ the OpenXR loader library to have been generated under
 
 ## Runtime
 
+For SteamVR selection, supported controller bindings and validation status, see
+[SteamVR setup](../docs/steamvr.md). The existing OpenXR rendering path is shared
+by SteamVR and the system runtime; no separate OpenVR game hooks are installed.
+
 1. Make the intended headset runtime active before starting the game.
 2. Copy the host next to `sh3.exe` and the Win32 proxy.
 3. Start Silent Hill 3. The proxy starts the host without a console window and

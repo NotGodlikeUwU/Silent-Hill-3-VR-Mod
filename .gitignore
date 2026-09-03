@@ -6,6 +6,7 @@
 **/x64/
 **/build/
 **/build-*/
+/out/steamvr-probe/
 *.user
 *.suo
 *.VC.db

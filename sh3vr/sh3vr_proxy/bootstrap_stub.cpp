@@ -63,6 +63,13 @@ static float g_meleeSwingSpeedMetersPerSecond = 2.80f;
 static float g_meleeSwingMinTravelMeters = 0.30f;
 static float g_meleeSwingMinNetTravelMeters = 0.22f;
 static DWORD g_meleeSwingCooldownMilliseconds = 280;
+// The knife has a much shorter striking end than the other melee weapons.
+// Give it a separate, deliberately accessible gesture without weakening the
+// pipe/katana/maul thresholds that already feel correct.
+static float g_knifeSwingSpeedMetersPerSecond = 1.75f;
+static float g_knifeSwingMinTravelMeters = 0.14f;
+static float g_knifeSwingMinNetTravelMeters = 0.09f;
+static DWORD g_knifeSwingCooldownMilliseconds = 220;
 static bool g_meleeHandPositionValid = false;
 static int g_meleeLastWeaponProfile = -1;
 static std::int64_t g_meleeLastDisplayTime = 0;
@@ -676,6 +683,15 @@ static void UpdateMeleeSwing(const Sh3VrControllerState& controller)
     const int meleeProfile = gameWeapon == 4u ? 0 :
         (gameWeapon == 5u ? 1 : (gameWeapon == 6u ? 3 :
             (gameWeapon == 7u ? 2 : -1)));
+    const float requiredSpeed = meleeProfile == 0
+        ? g_knifeSwingSpeedMetersPerSecond
+        : g_meleeSwingSpeedMetersPerSecond;
+    const float requiredTravel = meleeProfile == 0
+        ? g_knifeSwingMinTravelMeters
+        : g_meleeSwingMinTravelMeters;
+    const float requiredNetTravel = meleeProfile == 0
+        ? g_knifeSwingMinNetTravelMeters
+        : g_meleeSwingMinNetTravelMeters;
     float weaponGripWorld[4] = {};
     float weaponTipWorld[4] = {};
     float weaponRadiusGameUnits = 0.0f;
@@ -787,7 +803,7 @@ static void UpdateMeleeSwing(const Sh3VrControllerState& controller)
             // metre-long virtual endpoint amplified tiny orientation jitter
             // into multi-metre-per-second false swings. A valid strike now
             // needs sustained path length, net displacement, and peak speed.
-            if (rawSpeed >= g_meleeSwingSpeedMetersPerSecond * 0.40f)
+            if (rawSpeed >= requiredSpeed * 0.40f)
             {
                 if (!g_meleeSwingPathActive)
                 {
@@ -808,21 +824,22 @@ static void UpdateMeleeSwing(const Sh3VrControllerState& controller)
                 g_meleeSwingTravelMeters = (std::min)(0.75f,
                     g_meleeSwingTravelMeters + segmentLength);
             }
-            else if (rawSpeed < g_meleeSwingSpeedMetersPerSecond * 0.25f)
+            else if (rawSpeed < requiredSpeed * 0.25f)
             {
                 g_meleeSwingTravelMeters = 0.0f;
                 g_meleeSwingPathActive = false;
             }
             const DWORD now = GetTickCount();
             const DWORD weaponCooldown = meleeProfile == 0
-                ? static_cast<DWORD>(260u) : (meleeProfile == 2
+                ? g_knifeSwingCooldownMilliseconds : (meleeProfile == 2
                     ? static_cast<DWORD>(560u)
                     : static_cast<DWORD>(380u));
             const bool cooldownElapsed = g_meleeLastSwingTick == 0 ||
                 static_cast<DWORD>(now - g_meleeLastSwingTick) >=
-                    (std::max)(g_meleeSwingCooldownMilliseconds,
-                        weaponCooldown);
-            if (speed <= g_meleeSwingSpeedMetersPerSecond * 0.25f)
+                    (meleeProfile == 0 ? weaponCooldown :
+                        (std::max)(g_meleeSwingCooldownMilliseconds,
+                            weaponCooldown));
+            if (speed <= requiredSpeed * 0.25f)
             {
                 g_meleeSwingArmed = true;
             }
@@ -839,9 +856,9 @@ static void UpdateMeleeSwing(const Sh3VrControllerState& controller)
                     netZ * netZ);
             }
             if (g_meleeSwingArmed && cooldownElapsed &&
-                speed >= g_meleeSwingSpeedMetersPerSecond &&
-                g_meleeSwingTravelMeters >= g_meleeSwingMinTravelMeters &&
-                netTravel >= g_meleeSwingMinNetTravelMeters)
+                speed >= requiredSpeed &&
+                g_meleeSwingTravelMeters >= requiredTravel &&
+                netTravel >= requiredNetTravel)
             {
                 const float completedTravel = g_meleeSwingTravelMeters;
                 g_meleeSwingArmed = false;
@@ -1547,6 +1564,23 @@ void InputBridge_OnDirectInputCreated(IUnknown* pInterface)
         ReadMotionControlIntSetting("MeleeSwingCooldownMs", 280), 80, 1000);
     g_meleeSwingCooldownMilliseconds = static_cast<DWORD>(
         meleeSwingCooldown);
+    const int knifeSwingSpeedMmPerSecond = std::clamp(
+        ReadMotionControlIntSetting("KnifeSwingSpeedMmPerSecond", 1750),
+        400, 4000);
+    g_knifeSwingSpeedMetersPerSecond = static_cast<float>(
+        knifeSwingSpeedMmPerSecond) * 0.001f;
+    const int knifeSwingMinTravelMm = std::clamp(
+        ReadMotionControlIntSetting("KnifeSwingMinTravelMm", 140), 40, 500);
+    g_knifeSwingMinTravelMeters = static_cast<float>(
+        knifeSwingMinTravelMm) * 0.001f;
+    const int knifeSwingMinNetTravelMm = std::clamp(
+        ReadMotionControlIntSetting("KnifeSwingMinNetTravelMm", 90), 30, 400);
+    g_knifeSwingMinNetTravelMeters = static_cast<float>(
+        knifeSwingMinNetTravelMm) * 0.001f;
+    const int knifeSwingCooldown = std::clamp(
+        ReadMotionControlIntSetting("KnifeSwingCooldownMs", 220), 80, 1000);
+    g_knifeSwingCooldownMilliseconds = static_cast<DWORD>(
+        knifeSwingCooldown);
     Log("InputBridge: [MotionControls] RightTriggerAutoAim=%s",
         g_rightTriggerAutoAim ? "1" : "0");
     Log("InputBridge: [MotionControls] EnableRightHandAim=%s; "
@@ -1561,6 +1595,10 @@ void InputBridge_OnDirectInputCreated(IUnknown* pInterface)
         g_enableMeleeMotion ? "1" : "0", meleeSwingSpeedMmPerSecond,
         meleeSwingMinTravelMm, meleeSwingMinNetTravelMm,
         meleeSwingCooldown);
+    Log("InputBridge: accessible knife gesture: speed=%d mm/s; path=%d mm; "
+        "net=%d mm; cooldown=%d ms",
+        knifeSwingSpeedMmPerSecond, knifeSwingMinTravelMm,
+        knifeSwingMinNetTravelMm, knifeSwingCooldown);
 
     // Firearm motion aiming uses the same native combat queue hook and must
     // remain available even when the optional melee gesture detector is off.

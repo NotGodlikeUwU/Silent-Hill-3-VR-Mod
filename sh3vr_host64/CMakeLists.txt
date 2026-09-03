@@ -19,6 +19,7 @@ add_subdirectory(
 
 add_executable(sh3vr_host64
     sh3vr_host64/sh3vr_host64.cpp
+    sh3vr_host64/runtime_selection.h
     ../sh3vr/common/shared_frame.h
 )
 
@@ -30,6 +31,7 @@ target_link_libraries(sh3vr_host64 PRIVATE
     d3d11
     d3dcompiler
     dxgi
+    advapi32
 )
 
 if(MSVC)

@@ -734,6 +734,36 @@ bool Interop8_ReadHeadPose(Sh3VrHeadPose* output)
     return false;
 }
 
+bool Interop8_ReadRuntimeIpd(float* outputMeters)
+{
+    if (!g_header || !outputMeters)
+        return false;
+
+    const auto* state = reinterpret_cast<const Sh3VrRuntimeStereoState*>(
+        g_header->reserved + SH3VR_RUNTIME_STEREO_RESERVED_OFFSET);
+    volatile LONG* sequence = reinterpret_cast<volatile LONG*>(
+        const_cast<volatile std::int32_t*>(&state->sequence));
+    for (int attempt = 0; attempt < 4; ++attempt)
+    {
+        const LONG before = InterlockedCompareExchange(sequence, 0, 0);
+        if ((before & 1) != 0)
+            continue;
+        MemoryBarrier();
+        const std::uint32_t magic = state->magic;
+        const float ipdMeters = state->ipdMeters;
+        MemoryBarrier();
+        const LONG after = InterlockedCompareExchange(sequence, 0, 0);
+        if (before == after && (after & 1) == 0 &&
+            magic == SH3VR_RUNTIME_STEREO_MAGIC &&
+            ipdMeters >= 0.04f && ipdMeters <= 0.09f)
+        {
+            *outputMeters = ipdMeters;
+            return true;
+        }
+    }
+    return false;
+}
+
 void Interop8_SetFrameRenderPose(const Sh3VrHeadPose& pose)
 {
     g_frameRenderPose = pose;
