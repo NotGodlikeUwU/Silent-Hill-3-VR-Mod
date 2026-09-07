@@ -39,7 +39,7 @@ You MUST install [Silent Hill 3 PC Fix by Steam006](https://community.pcgamingwi
 - Missing shadows and enemy blood effects
 - Missing muzzle flash effects
 - Knife hit registration is still unreliable with motion strikes
-- Noise Effect should work but neesd testing
+- Noise Effect should work but needs testing
 - No other technical blockers are expected in theory, but additional playtesting is still recommended
 - Not the entire game has been thoroughly tested — unexpected issues may appear during a full playthrough
 
