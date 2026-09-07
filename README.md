@@ -33,7 +33,6 @@ IF you wanna change Smooth Turn to Snap Turn, change `CameraModTurnMode=1` to `C
 ### Known Issues & Limitations
 - Some textures or models might be invisible in certain locations of the game
 - Sewer location has glitched water reflections
-  and Camera Mod revisions
 - Missing shadows and enemy blood effects
 - Knife hit registration is still unreliable with motion strikes
 - Not the entire game has been thoroughly tested — unexpected issues may appear during a full playthrough
