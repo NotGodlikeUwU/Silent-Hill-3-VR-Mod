@@ -8,6 +8,10 @@
 ; Set ShowGuideDot=0 in an individual profile to hide its in-world guide dot.
 ; Firearms also support AimPitchDegrees and AimYawDegrees. A negative aim
 ; pitch lowers both the bullet ray and reticle; yaw adjusts them horizontally.
+; Firearms use ShowMuzzleFlash/MuzzleFlashSizePercent and
+; ShowMuzzleSmoke/MuzzleSmokeSizePercent for the tracked barrel effects.
+; Both effects follow the same calibrated ray as bullets. Stun Gun smoke is
+; disabled by default because it has no powder discharge.
 
 ; Optional immersive left hand rendered from sh3vr_lefthand.mesh.
 ; These values are independent from every weapon profile below.
@@ -62,6 +66,10 @@ RotationYawDegrees=90
 RotationRollDegrees=45
 
 [Stun Gun]
+ShowMuzzleFlash=1
+MuzzleFlashSizePercent=100
+ShowMuzzleSmoke=0
+MuzzleSmokeSizePercent=100
 ScalePercent=100
 PositionX=0
 PositionY=0
@@ -73,6 +81,10 @@ AimPitchDegrees=-18
 AimYawDegrees=0
 
 [Handgun]
+ShowMuzzleFlash=1
+MuzzleFlashSizePercent=100
+ShowMuzzleSmoke=1
+MuzzleSmokeSizePercent=100
 ScalePercent=100
 PositionX=0
 PositionY=0
@@ -84,6 +96,10 @@ AimPitchDegrees=-18
 AimYawDegrees=0
 
 [Shotgun]
+ShowMuzzleFlash=1
+MuzzleFlashSizePercent=100
+ShowMuzzleSmoke=1
+MuzzleSmokeSizePercent=100
 ScalePercent=100
 PositionX=0
 PositionY=0
@@ -95,6 +111,10 @@ AimPitchDegrees=-18
 AimYawDegrees=0
 
 [Submachine Gun]
+ShowMuzzleFlash=1
+MuzzleFlashSizePercent=100
+ShowMuzzleSmoke=1
+MuzzleSmokeSizePercent=100
 ScalePercent=100
 PositionX=0
 PositionY=0

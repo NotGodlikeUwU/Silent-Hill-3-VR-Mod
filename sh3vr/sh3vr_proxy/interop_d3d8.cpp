@@ -282,6 +282,27 @@ void Interop8_SetLeftHandDebugOrientation(bool valid, float pitchDegrees,
     }
 }
 
+void Interop8_RequestHaptics(std::uint32_t handMask, float amplitude,
+    float durationSeconds, float frequency)
+{
+    if (!g_header || handMask == 0u)
+        return;
+
+    auto* state = reinterpret_cast<Sh3VrHapticRequestState*>(
+        g_header->reserved + SH3VR_HAPTIC_REQUEST_RESERVED_OFFSET);
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&state->sequence));
+    MemoryBarrier();
+    state->magic = SH3VR_HAPTIC_REQUEST_MAGIC;
+    state->handMask = handMask;
+    state->amplitude = amplitude;
+    state->durationSeconds = durationSeconds;
+    state->frequency = frequency;
+    state->reserved[0] = 0u;
+    state->reserved[1] = 0u;
+    MemoryBarrier();
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&state->sequence));
+}
+
 void Interop8_SetD3D12BackBufferHandles(HANDLE first, HANDLE second,
     std::uint32_t currentIndex, std::uint32_t bufferCount)
 {
@@ -503,6 +524,10 @@ static bool SharedFrame_Init()
     g_header->gamePostProcessIntensity = g_gamePostProcessIntensity;
     memcpy(g_header->reserved, &g_weaponDebugState,
         sizeof(g_weaponDebugState));
+    auto* hapticState = reinterpret_cast<Sh3VrHapticRequestState*>(
+        g_header->reserved + SH3VR_HAPTIC_REQUEST_RESERVED_OFFSET);
+    hapticState->magic = SH3VR_HAPTIC_REQUEST_MAGIC;
+    hapticState->sequence = 0;
 
     QueryPerformanceFrequency(reinterpret_cast<LARGE_INTEGER*>(&g_qpcFrequency));
     g_header->qpcFrequency = g_qpcFrequency;
@@ -520,6 +545,14 @@ static void SharedFrame_Publish(const BYTE* source, INT sourcePitch,
 {
     if (!g_header)
         return;
+
+    // A launcher, compatibility shim, or a second game instance can leave the
+    // named mapping alive briefly. Reassert the process that is actually
+    // publishing frames so the x64 host follows the live producer instead of
+    // remaining tied to the PID that first created the mapping.
+    g_header->producerPid = GetCurrentProcessId();
+    InterlockedExchange(reinterpret_cast<volatile LONG*>(
+        &g_header->producerAlive), 1);
 
     const UINT slot = (g_header->publishedFrame + 1) % SH3VR_SLOT_COUNT;
     const UINT destPitch = g_width * SH3VR_BYTES_PER_PX;
@@ -578,6 +611,10 @@ static void SharedFrame_PublishGpuMetadata()
     if (!g_header || g_width == 0 || g_height == 0)
         return;
 
+    g_header->producerPid = GetCurrentProcessId();
+    InterlockedExchange(reinterpret_cast<volatile LONG*>(
+        &g_header->producerAlive), 1);
+
     LARGE_INTEGER now = {};
     QueryPerformanceCounter(&now);
 
@@ -604,6 +641,10 @@ static bool SharedFrame_CopyStereoEye(const BYTE* source, INT sourcePitch,
 {
     if (!g_header || eye > 1)
         return false;
+
+    g_header->producerPid = GetCurrentProcessId();
+    InterlockedExchange(reinterpret_cast<volatile LONG*>(
+        &g_header->producerAlive), 1);
 
     volatile LONG* pairSequence = reinterpret_cast<volatile LONG*>(
         &g_header->stereoPairSequence);
@@ -681,10 +722,15 @@ static void SharedFrame_Shutdown()
 {
     if (g_header)
     {
-        g_header->producerAlive = 0;
-        MemoryBarrier();
-        if (g_frameEvent)
-            SetEvent(g_frameEvent);   // let the host notice immediately
+        // Do not mark a different process dead when two short-lived launch
+        // instances happened to share the global transport mapping.
+        if (g_header->producerPid == GetCurrentProcessId())
+        {
+            g_header->producerAlive = 0;
+            MemoryBarrier();
+            if (g_frameEvent)
+                SetEvent(g_frameEvent);   // let the host notice immediately
+        }
         UnmapViewOfFile(g_header);
         g_header = nullptr;
     }

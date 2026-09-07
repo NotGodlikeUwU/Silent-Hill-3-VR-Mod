@@ -38,6 +38,14 @@ ProxyVirtualFPSMode4=1
 [Stereo]
 EnablePerDrawReplay=1
 ReplayWorldOnly=0
+; Base ceiling for ordinary stereo replay. Character-heavy scenes use the
+; separate indexed ceiling below so NPC material batches do not trigger the
+; much more expensive full-scene fallback.
+PerDrawReplayBudget=384
+IndexedReplayBudget=768
+; Keep the original game pass wide enough that geometry behind the desktop
+; heading is submitted before native-eye replay. Set 0 only for diagnostics.
+EnableCullingGuardband=1
 EnableFullPassStereo=0
 
 [CameraMod]
@@ -49,9 +57,10 @@ EnableFullPassStereo=0
 AutoLoadFirstPerson=1
 
 [Roomscale]
-; Every physical OpenXR X/Z delta directly moves Heather through the actual
-; game-camera world basis. There is no lean deadzone, catch-up, synthetic key,
-; or locomotion animation. Horizontal tracking is metric 1:1.
+; Every physical OpenXR X/Z delta moves Heather through the actual game-camera
+; world basis. The HMD position is converted to a body-centre position using
+; a 12 cm neck-pivot compensation, so turning in place does not move Heather.
+; Genuine roomscale steps remain metric 1:1.
 Enable=1
 ; Normalize every standing player to Heather's canonical 165 cm body height.
 PlayerHeightCm=165
@@ -60,15 +69,21 @@ PlayerHeightCm=165
 ; Experimental shader-based head-tracked flashlight. Disabled because the
 ; visible flashlight follows Heather rather than the tested shader constants.
 HeadTrackedFlashlight=0
-; Apply horizontal snap turns to Camera Mod's own yaw while OTSMod.dll is
-; loaded. This keeps stereo rendering and character-relative movement aligned.
+; Apply horizontal turns to Camera Mod's own yaw while OTSMod.dll is loaded.
+; This keeps stereo rendering and character-relative movement aligned.
 EnableCameraModRightStick=1
+; 0 = Snap turn, 1 = Smooth turn.
+CameraModTurnMode=1
 ; Stick activation threshold expressed as a percentage from 20 to 95.
 CameraModSnapTurnActivation=65
 ; Exact snap angle in degrees, independent of Camera Mod mouse sensitivity.
 CameraModSnapTurnDegrees=45
+; Smooth-turn maximum angular speed and radial stick deadzone.
+CameraModSmoothTurnSpeed=120
+CameraModSmoothTurnDeadzone=20
 ; Duration of the brief forward alignment input sent after each Camera Mod
-; snap turn. It uses Camera Mod's regular 2D movement path to align Heather.
+; snap, or once after smooth turning stops. It uses Camera Mod's regular 2D
+; movement path to align Heather.
 CameraModCharacterAlignMilliseconds=34
 
 [MotionControls]
@@ -87,17 +102,19 @@ WeaponScanDiagnostics=0
 ; Temporary read-only render probe. Set to 1 only while identifying a weapon
 ; model, then return it to 0. Press the right grip during active gameplay.
 WeaponRenderProbe=0
-; Experimental visual attachment for a verified melee model. It changes no
-; combat input. Keep this disabled unless the matching draw profile exists.
-EnableWeaponPosePrototype=0
-; Enable only after a validated per-weapon bone profile exists. The initial
-; safe prototype keeps this disabled to avoid stretching multi-bone meshes.
-WeaponPoseRotation=0
+; Attach supported weapon models to the tracked right controller.
+; Keep enabled for motion-controlled melee and firearms.
+EnableWeaponPosePrototype=1
+; Apply the controller orientation and per-weapon calibration profile.
+WeaponPoseRotation=1
 ; Do not enable until the complete hierarchy of the selected weapon is known.
 WeaponPoseRotateSecondaryBone=0
 ; Use the right controller as the absolute visual root instead of layering its
 ; movement over Heather's original weapon animation.
 WeaponPoseAbsolutePosition=1
+; Keep HMD, weapon, and hand tracking on one OpenXR prediction per game frame.
+; This prevents tracked meshes from flickering and removes pose micro-jumps.
+FrameCoherentTrackedMeshes=1
 ; Per-weapon size, position, and rotation are configured in
 ; sh3vr_weapons.ini.
 ; Detect right-hand grip velocity and inject one normal game attack pulse.
@@ -120,6 +137,11 @@ KnifeSwingSpeedMmPerSecond=1750
 KnifeSwingMinTravelMm=140
 KnifeSwingMinNetTravelMm=90
 KnifeSwingCooldownMs=220
+; Vibrate both OpenXR controllers when Heather's actual health decreases.
+DamageHaptics=1
+; Feedback duration and strength. 3000 ms is three seconds.
+DamageHapticsDurationMs=3000
+DamageHapticsAmplitudePercent=100
 
 [Debug]
 ; Draw controller P/Y/R after each completed OpenXR eye image.

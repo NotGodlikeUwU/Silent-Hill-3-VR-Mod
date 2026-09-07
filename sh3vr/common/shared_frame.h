@@ -14,8 +14,10 @@ inline constexpr std::uint32_t SH3VR_VERSION = 11;
 inline constexpr std::uint32_t SH3VR_HEADER_BYTES = 1024;
 inline constexpr std::uint32_t SH3VR_SLOT_COUNT = 2;
 inline constexpr std::uint32_t SH3VR_BYTES_PER_PX = 4;
-inline constexpr std::uint32_t SH3VR_MAX_WIDTH = 2560;
-inline constexpr std::uint32_t SH3VR_MAX_HEIGHT = 1440;
+// Keep enough room for a native 4K desktop backbuffer. Both the 32-bit
+// proxy and 64-bit host map this exact ABI-sized section.
+inline constexpr std::uint32_t SH3VR_MAX_WIDTH = 3840;
+inline constexpr std::uint32_t SH3VR_MAX_HEIGHT = 2160;
 inline constexpr std::uint32_t SH3VR_SLOT_BYTES =
     SH3VR_MAX_WIDTH * SH3VR_MAX_HEIGHT * SH3VR_BYTES_PER_PX;
 inline constexpr std::uint32_t SH3VR_SECTION_BYTES =
@@ -172,6 +174,28 @@ struct Sh3VrRuntimeStereoState
 
 static_assert(sizeof(Sh3VrRuntimeStereoState) == 16,
     "Runtime stereo state must fit in the reserved frame-header area.");
+
+// Proxy-owned OpenXR haptic request.  Damage is detected inside the 32-bit
+// game process, while feedback must be submitted by the 64-bit OpenXR host.
+// Keeping this message in the reserved header area avoids changing the frame
+// transport ABI used by existing installations.
+inline constexpr std::uint32_t SH3VR_HAPTIC_REQUEST_MAGIC = 0x54504148u;
+inline constexpr std::uint32_t SH3VR_HAPTIC_REQUEST_RESERVED_OFFSET = 160u;
+inline constexpr std::uint32_t SH3VR_HAPTIC_LEFT_HAND = 1u << 0;
+inline constexpr std::uint32_t SH3VR_HAPTIC_RIGHT_HAND = 1u << 1;
+struct Sh3VrHapticRequestState
+{
+    std::uint32_t magic;
+    volatile std::int32_t sequence;
+    std::uint32_t handMask;
+    float amplitude;
+    float durationSeconds;
+    float frequency;
+    std::uint32_t reserved[2];
+};
+
+static_assert(sizeof(Sh3VrHapticRequestState) == 32,
+    "Haptic request state must fit in the reserved frame-header area.");
 
 struct Sh3VrFrameHeader
 {

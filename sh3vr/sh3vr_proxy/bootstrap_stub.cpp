@@ -25,12 +25,16 @@ extern bool Interop8_ReadControllerState(Sh3VrControllerState* state);
 extern bool Interop8_ReadHeadPose(Sh3VrHeadPose* pose);
 extern std::uint32_t D3D9Hook_GetRoomscaleMovementMask();
 extern bool D3D9Hook_GetCameraModCharacterAlignForward();
+extern bool D3D9Hook_GetRelativeHeadYawRadians(float* yawRadians);
 extern bool D3D9Hook_GetMeleeWeaponHitbox(std::uint8_t gameWeapon,
     float gripWorld[4], float tipWorld[4], float* radiusGameUnits);
 extern bool D3D9Hook_GetFirearmAimRay(std::uint8_t gameWeapon,
     float muzzleWorld[4], float rayEndWorld[4]);
 extern bool D3D9Hook_GetActiveFirearmAimRay(float muzzleWorld[4],
     float rayEndWorld[4]);
+extern void D3D9Hook_NotifyFirearmDischarge();
+extern void Interop8_RequestHaptics(std::uint32_t handMask, float amplitude,
+    float durationSeconds, float frequency);
 
 using DirectInputCreateDeviceFn = HRESULT(STDMETHODCALLTYPE*)(void*,
     REFGUID, void**, IUnknown*);
@@ -91,6 +95,7 @@ static float g_meleeSwingStartGripWorld[4] = {};
 static float g_meleeSwingStartTipWorld[4] = {};
 static LONG g_meleeNativeHitboxLogCount = 0;
 static LONG g_firearmNativeAimLogCount = 0;
+static PVOID volatile g_cachedNativePlayer = nullptr;
 static volatile LONG g_meleePendingCollision = 0;
 static float g_meleePendingPreviousGripWorld[4] = {};
 static float g_meleePendingPreviousTipWorld[4] = {};
@@ -103,6 +108,13 @@ static DWORD g_meleePendingCollisionUntilTick = 0;
 // this legacy read-only probe disabled unless a developer is investigating a
 // specific build; it can otherwise scan a large amount of unrelated memory.
 static bool g_enableWeaponScanDiagnostics = false;
+static bool g_enableDamageHaptics = true;
+static float g_damageHapticsDurationSeconds = 3.0f;
+static float g_damageHapticsAmplitude = 1.0f;
+static void* g_damageHapticsPlayer = nullptr;
+static float g_damageHapticsLastHealth = 0.0f;
+static bool g_damageHapticsHealthValid = false;
+static DWORD g_damageHapticsLastPollTick = 0;
 static volatile LONG g_weaponScanStarted = 0;
 static volatile LONG g_gameFlashlightEnabled = 0;
 static volatile LONG g_gameFlashlightInputStateKnown = 0;
@@ -369,6 +381,8 @@ static void SetVirtualKey(BYTE* keyboardState, DWORD stateBytes,
         keyboardState[dik] |= 0x80;
 }
 
+static void UpdateDamageHaptics();
+
 static bool ReadFreshControllerState(Sh3VrControllerState& state)
 {
     static std::int64_t lastDisplayTime = 0;
@@ -386,6 +400,7 @@ static bool ReadFreshControllerState(Sh3VrControllerState& state)
     {
         return false;
     }
+    UpdateDamageHaptics();
     return true;
 }
 
@@ -432,21 +447,17 @@ static bool ReadGameBytes(const void* address, void* output, SIZE_T size)
             &bytesRead) != FALSE && bytesRead == size;
 }
 
-static bool ReadNativePlayerWeaponContext(std::uint8_t* weapon,
-    void** player)
+static bool ReadNativePlayerContext(void** player)
 {
-    if (!weapon || !player)
+    if (!player)
         return false;
 
     const auto moduleBase = reinterpret_cast<std::uintptr_t>(
         GetModuleHandleA(nullptr));
     constexpr std::uintptr_t preferredBase = 0x00400000u;
-    const void* weaponAddress = reinterpret_cast<const void*>(moduleBase +
-        (0x0712C656u - preferredBase));
     const void* playerAddress = reinterpret_cast<const void*>(moduleBase +
         (0x0712C100u - preferredBase));
-    if (!ReadGameBytes(weaponAddress, weapon, sizeof(*weapon)) ||
-        !ReadGameBytes(playerAddress, player, sizeof(*player)) || !*player)
+    if (!ReadGameBytes(playerAddress, player, sizeof(*player)) || !*player)
     {
         return false;
     }
@@ -457,9 +468,88 @@ static bool ReadNativePlayerWeaponContext(std::uint8_t* weapon,
     {
         return false;
     }
+    InterlockedExchangePointer(&g_cachedNativePlayer, *player);
+    return true;
+}
+
+static bool ReadNativePlayerWeaponContext(std::uint8_t* weapon,
+    void** player)
+{
+    if (!weapon || !ReadNativePlayerContext(player))
+        return false;
+
+    const auto moduleBase = reinterpret_cast<std::uintptr_t>(
+        GetModuleHandleA(nullptr));
+    constexpr std::uintptr_t preferredBase = 0x00400000u;
+    const void* weaponAddress = reinterpret_cast<const void*>(moduleBase +
+        (0x0712C656u - preferredBase));
+    if (!ReadGameBytes(weaponAddress, weapon, sizeof(*weapon)))
+        return false;
+
     // PC SH3 uses one compact weapon index: 0 Handgun, 1 Shotgun,
     // 2 Submachine Gun, 3 Stun Gun, then melee weapons 4..7.
     return *weapon <= 7u;
+}
+
+static void UpdateDamageHaptics()
+{
+    if (!g_enableDamageHaptics)
+        return;
+
+    const DWORD now = GetTickCount();
+    if (g_damageHapticsLastPollTick != 0 &&
+        now - g_damageHapticsLastPollTick < 8u)
+    {
+        return;
+    }
+    g_damageHapticsLastPollTick = now;
+
+    void* player = nullptr;
+    if (!ReadNativePlayerContext(&player))
+    {
+        g_damageHapticsPlayer = nullptr;
+        g_damageHapticsHealthValid = false;
+        return;
+    }
+
+    // PC SH3's player work stores current/max HP at +0x180/+0x184.  These
+    // fields are used by the game's health getter, healing and life-bar code.
+    float health = 0.0f;
+    float maximumHealth = 0.0f;
+    if (!ReadGameBytes(static_cast<const BYTE*>(player) + 0x180u,
+            &health, sizeof(health)) ||
+        !ReadGameBytes(static_cast<const BYTE*>(player) + 0x184u,
+            &maximumHealth, sizeof(maximumHealth)) ||
+        !std::isfinite(health) || !std::isfinite(maximumHealth) ||
+        maximumHealth <= 0.0f || maximumHealth > 100000.0f ||
+        health < 0.0f || health > maximumHealth * 1.01f)
+    {
+        g_damageHapticsPlayer = player;
+        g_damageHapticsHealthValid = false;
+        return;
+    }
+
+    if (player != g_damageHapticsPlayer || !g_damageHapticsHealthValid)
+    {
+        g_damageHapticsPlayer = player;
+        g_damageHapticsLastHealth = health;
+        g_damageHapticsHealthValid = true;
+        return;
+    }
+
+    const float damage = g_damageHapticsLastHealth - health;
+    const float minimumDamage = (std::max)(0.01f,
+        maximumHealth * 0.0001f);
+    g_damageHapticsLastHealth = health;
+    if (damage < minimumDamage)
+        return;
+
+    Interop8_RequestHaptics(SH3VR_HAPTIC_LEFT_HAND |
+        SH3VR_HAPTIC_RIGHT_HAND, g_damageHapticsAmplitude,
+        g_damageHapticsDurationSeconds, 0.0f);
+    Log("MotionControls: Heather damage %.3f detected; both-controller "
+        "haptics requested for %.2f seconds", damage,
+        g_damageHapticsDurationSeconds);
 }
 
 static bool ReadNativeMeleeContext(std::uint8_t* weapon, void** player)
@@ -605,9 +695,15 @@ static void __cdecl HookedNativeBuildAttackRay(void* character,
     if (!character || !origin || !direction)
         return;
 
-    std::uint16_t characterKind = 0;
-    if (!ReadGameBytes(static_cast<const BYTE*>(character) + 0x80u,
-        &characterKind, sizeof(characterKind)) || characterKind != 0x0100u)
+    // This function is also called for every attacking enemy. Reading and
+    // validating each enemy object through ReadProcessMemory made rooms with
+    // several enemies much more expensive. Resolve Heather once, then reject
+    // every non-player call with a single pointer comparison.
+    void* player = InterlockedCompareExchangePointer(&g_cachedNativePlayer,
+        nullptr, nullptr);
+    if (!player && !ReadNativePlayerContext(&player))
+        return;
+    if (character != player)
     {
         return;
     }
@@ -636,6 +732,7 @@ static void __cdecl HookedNativeBuildAttackRay(void* character,
     }
     origin[3] = 1.0f;
     direction[3] = 0.0f;
+    D3D9Hook_NotifyFirearmDischarge();
 
     const LONG count = InterlockedIncrement(&g_firearmNativeAimLogCount);
     if (count <= 24 || count % 120 == 0)
@@ -1172,6 +1269,18 @@ static bool ControllerPressesVirtualKey(
         (buttons & SH3VR_BUTTON_RIGHT_STICK) != 0;
     const bool cameraModMenuChord = leftStickPressed && rightStickPressed;
     const bool cameraModLoaded = IsCameraModLoaded();
+    float moveX = controller.thumbstick[0][0];
+    float moveY = controller.thumbstick[0][1];
+    float headYaw = 0.0f;
+    if (cameraModLoaded && D3D9Hook_GetRelativeHeadYawRadians(&headYaw))
+    {
+        const float cosine = std::cos(headYaw);
+        const float sine = std::sin(headYaw);
+        const float rotatedX = moveX * cosine + moveY * sine;
+        const float rotatedY = moveY * cosine - moveX * sine;
+        moveX = rotatedX;
+        moveY = rotatedY;
+    }
 
     switch (virtualKey)
     {
@@ -1201,9 +1310,11 @@ static bool ControllerPressesVirtualKey(
     case 'M':
         return (buttons & SH3VR_BUTTON_Y) != 0;
     case 'W':
+        return moveY > movementThreshold;
     case VK_UP:
         return controller.thumbstick[0][1] > movementThreshold;
     case 'S':
+        return moveY < -movementThreshold;
     case VK_DOWN:
         return controller.thumbstick[0][1] < -movementThreshold;
     case VK_LEFT:
@@ -1212,16 +1323,16 @@ static bool ControllerPressesVirtualKey(
         return controller.thumbstick[0][0] > movementThreshold;
     case 'A':
         return !cameraModLoaded &&
-            controller.thumbstick[0][0] < -movementThreshold;
+            moveX < -movementThreshold;
     case 'D':
         return !cameraModLoaded &&
-            controller.thumbstick[0][0] > movementThreshold;
+            moveX > movementThreshold;
     case 'Q':
         return cameraModLoaded &&
-            controller.thumbstick[0][0] < -movementThreshold;
+            moveX < -movementThreshold;
     case 'E':
         return cameraModLoaded &&
-            controller.thumbstick[0][0] > movementThreshold;
+            moveX > movementThreshold;
     default:
         return false;
     }
@@ -1309,9 +1420,21 @@ static HRESULT InjectControllerState(void* device, DWORD stateBytes,
     previousButtons = buttons;
 
     const bool cameraModLoaded = IsCameraModLoaded();
+    float moveX = controller.thumbstick[0][0];
+    float moveY = controller.thumbstick[0][1];
+    float headYaw = 0.0f;
+    if (cameraModLoaded && D3D9Hook_GetRelativeHeadYawRadians(&headYaw))
+    {
+        const float cosine = std::cos(headYaw);
+        const float sine = std::sin(headYaw);
+        const float rotatedX = moveX * cosine + moveY * sine;
+        const float rotatedY = moveY * cosine - moveX * sine;
+        moveX = rotatedX;
+        moveY = rotatedY;
+    }
     const bool movingWithLeftStick =
-        std::fabs(controller.thumbstick[0][0]) > movementThreshold ||
-        std::fabs(controller.thumbstick[0][1]) > movementThreshold;
+        std::fabs(moveX) > movementThreshold ||
+        std::fabs(moveY) > movementThreshold;
     const std::uint32_t roomscaleMovement = movingWithLeftStick
         ? SH3VR_ROOMSCALE_NONE
         : D3D9Hook_GetRoomscaleMovementMask();
@@ -1324,7 +1447,7 @@ static HRESULT InjectControllerState(void* device, DWORD stateBytes,
             &g_cameraModCharacterAlignLogCount);
         if (count == 1)
         {
-            Log("InputBridge: Camera Mod snap turn requests Heather "
+            Log("InputBridge: Camera Mod right-stick turn requests Heather "
                 "alignment through the game's normal forward movement path");
         }
     }
@@ -1336,34 +1459,34 @@ static HRESULT InjectControllerState(void* device, DWORD stateBytes,
     }
 
     SetVirtualKey(keys, stateBytes, DIK_W,
-        controller.thumbstick[0][1] > movementThreshold ||
+        moveY > movementThreshold ||
         (roomscaleMovement & SH3VR_ROOMSCALE_FORWARD) != 0 ||
         cameraModCharacterAlign);
     SetVirtualKey(keys, stateBytes, DIK_UP,
         controller.thumbstick[0][1] > movementThreshold);
     SetVirtualKey(keys, stateBytes, DIK_S,
-        controller.thumbstick[0][1] < -movementThreshold ||
+        moveY < -movementThreshold ||
         (roomscaleMovement & SH3VR_ROOMSCALE_BACKWARD) != 0);
     SetVirtualKey(keys, stateBytes, DIK_DOWN,
         controller.thumbstick[0][1] < -movementThreshold);
     SetVirtualKey(keys, stateBytes, DIK_A,
         (!cameraModLoaded &&
-            controller.thumbstick[0][0] < -movementThreshold));
+            moveX < -movementThreshold));
     SetVirtualKey(keys, stateBytes, DIK_LEFT,
         controller.thumbstick[0][0] < -movementThreshold);
     SetVirtualKey(keys, stateBytes, DIK_D,
         (!cameraModLoaded &&
-            controller.thumbstick[0][0] > movementThreshold));
+            moveX > movementThreshold));
     SetVirtualKey(keys, stateBytes, DIK_RIGHT,
         controller.thumbstick[0][0] > movementThreshold);
     SetVirtualKey(keys, stateBytes, DIK_Q,
         cameraModLoaded
-            ? controller.thumbstick[0][0] < -movementThreshold ||
+            ? moveX < -movementThreshold ||
                 (roomscaleMovement & SH3VR_ROOMSCALE_LEFT) != 0
             : controller.thumbstick[1][0] < -turnThreshold);
     SetVirtualKey(keys, stateBytes, DIK_E,
         cameraModLoaded
-            ? controller.thumbstick[0][0] > movementThreshold ||
+            ? moveX > movementThreshold ||
                 (roomscaleMovement & SH3VR_ROOMSCALE_RIGHT) != 0
             : controller.thumbstick[1][0] > turnThreshold);
 
@@ -1540,6 +1663,18 @@ void InputBridge_OnDirectInputCreated(IUnknown* pInterface)
         "EnableRightHandAim", false);
     g_enableWeaponScanDiagnostics = ReadMotionControlSetting(
         "WeaponScanDiagnostics", false);
+    g_enableDamageHaptics = ReadMotionControlSetting(
+        "DamageHaptics", true);
+    const int damageHapticsDurationMs = std::clamp(
+        ReadMotionControlIntSetting("DamageHapticsDurationMs", 3000),
+        50, 10000);
+    const int damageHapticsAmplitudePercent = std::clamp(
+        ReadMotionControlIntSetting("DamageHapticsAmplitudePercent", 100),
+        1, 100);
+    g_damageHapticsDurationSeconds = static_cast<float>(
+        damageHapticsDurationMs) * 0.001f;
+    g_damageHapticsAmplitude = static_cast<float>(
+        damageHapticsAmplitudePercent) * 0.01f;
     g_enableMeleeMotion = ReadMotionControlSetting(
         "MeleeMotion", true);
     const int aimMouseCountsPerDegree = std::clamp(
@@ -1588,6 +1723,10 @@ void InputBridge_OnDirectInputCreated(IUnknown* pInterface)
         aimMouseCountsPerDegree);
     Log("InputBridge: [MotionControls] WeaponScanDiagnostics=%s",
         g_enableWeaponScanDiagnostics ? "1" : "0");
+    Log("InputBridge: [MotionControls] DamageHaptics=%s; "
+        "DamageHapticsDurationMs=%d; DamageHapticsAmplitudePercent=%d",
+        g_enableDamageHaptics ? "1" : "0", damageHapticsDurationMs,
+        damageHapticsAmplitudePercent);
     Log("InputBridge: [MotionControls] MeleeMotion=%s; "
         "MeleeSwingSpeedMmPerSecond=%d; MeleeSwingMinTravelMm=%d; "
         "MeleeSwingMinNetTravelMm=%d; MeleeSwingCooldownMs=%d; "

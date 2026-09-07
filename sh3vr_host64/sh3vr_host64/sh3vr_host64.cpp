@@ -386,6 +386,17 @@ public:
             Sleep(milliseconds);
     }
 
+    bool HasLiveProducer() const
+    {
+        return ValidateHeader() && m_header->producerAlive != 0 &&
+            m_header->producerPid != 0;
+    }
+
+    std::uint32_t ProducerPid() const
+    {
+        return ValidateHeader() ? m_header->producerPid : 0;
+    }
+
     void PublishRequestedEyeResolution(std::uint32_t width,
         std::uint32_t height, std::uint32_t sampleCount)
     {
@@ -489,6 +500,37 @@ public:
         state->ipdMeters = ipdMeters;
         MemoryBarrier();
         InterlockedIncrement(reinterpret_cast<volatile LONG*>(&state->sequence));
+    }
+
+    bool ReadHapticRequest(Sh3VrHapticRequestState& request) const
+    {
+        if (!m_header)
+            return false;
+
+        const auto* state = reinterpret_cast<const Sh3VrHapticRequestState*>(
+            m_header->reserved + SH3VR_HAPTIC_REQUEST_RESERVED_OFFSET);
+        for (int attempt = 0; attempt < 3; ++attempt)
+        {
+            const LONG before = InterlockedCompareExchange(
+                reinterpret_cast<volatile LONG*>(
+                    const_cast<volatile std::int32_t*>(&state->sequence)),
+                0, 0);
+            if ((before & 1) != 0 ||
+                state->magic != SH3VR_HAPTIC_REQUEST_MAGIC)
+            {
+                continue;
+            }
+            MemoryBarrier();
+            std::memcpy(&request, state, sizeof(request));
+            MemoryBarrier();
+            const LONG after = InterlockedCompareExchange(
+                reinterpret_cast<volatile LONG*>(
+                    const_cast<volatile std::int32_t*>(&state->sequence)),
+                0, 0);
+            if (before == after && (after & 1) == 0)
+                return true;
+        }
+        return false;
     }
 
 private:
@@ -848,6 +890,11 @@ public:
         endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
         endInfo.layerCount = submitLayer ? 1u : 0u;
         endInfo.layers = submitLayer ? layers : nullptr;
+        // Submit both eye blits as one command batch. Flushing inside
+        // RenderEye serialized the D3D11 queue twice per OpenXR frame and
+        // amplified CPU frame-time spikes in actor-heavy rooms.
+        if (submitLayer)
+            m_context->Flush();
         return CheckXr(xrEndFrame(m_session, &endInfo), "xrEndFrame");
     }
 
@@ -1165,6 +1212,8 @@ private:
         bind(m_gripPoseAction, "/user/hand/right/input/grip/pose");
         bind(m_aimPoseAction, "/user/hand/left/input/aim/pose");
         bind(m_aimPoseAction, "/user/hand/right/input/aim/pose");
+        bind(m_hapticAction, "/user/hand/left/output/haptic");
+        bind(m_hapticAction, "/user/hand/right/output/haptic");
         if (layout == 2)
         {
             // OpenXR converts a click binding to 0/1 for the float grip action.
@@ -1249,6 +1298,9 @@ private:
             !CreateInputAction("aim_pose", "Aim pose",
                 XR_ACTION_TYPE_POSE_INPUT, m_handPaths.data(), 2,
                 &m_aimPoseAction) ||
+            !CreateInputAction("haptic", "Damage haptics",
+                XR_ACTION_TYPE_VIBRATION_OUTPUT, m_handPaths.data(), 2,
+                &m_hapticAction) ||
             !CreateInputAction("button_a", "A button",
                 XR_ACTION_TYPE_BOOLEAN_INPUT, &m_handPaths[1], 1,
                 &m_buttonAAction) ||
@@ -1367,6 +1419,10 @@ private:
         if (!m_controllerInputInitialized ||
             m_sessionState != XR_SESSION_STATE_FOCUSED)
         {
+            m_triggerPressed.fill(false);
+            m_triggerArmed.fill(false);
+            m_squeezePressed.fill(false);
+            m_squeezeArmed.fill(false);
             consumer.PublishControllerState(state);
             return;
         }
@@ -1387,12 +1443,17 @@ private:
                     static_cast<int>(syncResult));
                 m_controllerSyncFailureLogged = true;
             }
+            m_triggerPressed.fill(false);
+            m_triggerArmed.fill(false);
+            m_squeezePressed.fill(false);
+            m_squeezeArmed.fill(false);
             consumer.PublishControllerState(state);
             return;
         }
 
         state.active = 1;
         m_controllerSyncFailureLogged = false;
+        ProcessHapticRequests(consumer);
         if (m_profilesDirty)
         {
             m_profilesDirty = false;
@@ -1453,13 +1514,50 @@ private:
                 ReadControllerPose(m_aimSpaces[hand], displayTime, state.aimPose[hand]);
         }
 
-        if (state.trigger[0] > 0.55f)
+        // Some OpenXR runtimes report noisy trigger/squeeze values around a
+        // single threshold.  The old 0.55 test could therefore alternate
+        // pressed/released every frame, repeatedly injecting mouse input and
+        // effectively locking out the rest of the controller.  Arm each
+        // analog control only after it has first been observed released, then
+        // use separate press/release thresholds (Schmitt-trigger hysteresis).
+        constexpr float analogPressThreshold = 0.72f;
+        constexpr float analogReleaseThreshold = 0.30f;
+        const auto updateAnalogButton = [](float value, bool& armed,
+            bool& pressed)
+        {
+            value = std::isfinite(value)
+                ? (std::clamp)(value, 0.0f, 1.0f) : 0.0f;
+            if (!armed)
+            {
+                if (value <= analogReleaseThreshold)
+                    armed = true;
+                pressed = false;
+                return;
+            }
+            if (pressed)
+            {
+                if (value <= analogReleaseThreshold)
+                    pressed = false;
+            }
+            else if (value >= analogPressThreshold)
+            {
+                pressed = true;
+            }
+        };
+        for (std::size_t hand = 0; hand < m_handPaths.size(); ++hand)
+        {
+            updateAnalogButton(state.trigger[hand], m_triggerArmed[hand],
+                m_triggerPressed[hand]);
+            updateAnalogButton(state.squeeze[hand], m_squeezeArmed[hand],
+                m_squeezePressed[hand]);
+        }
+        if (m_triggerPressed[0])
             state.buttons |= SH3VR_BUTTON_LEFT_TRIGGER;
-        if (state.trigger[1] > 0.55f)
+        if (m_triggerPressed[1])
             state.buttons |= SH3VR_BUTTON_RIGHT_TRIGGER;
-        if (state.squeeze[0] > 0.55f)
+        if (m_squeezePressed[0])
             state.buttons |= SH3VR_BUTTON_LEFT_GRIP;
-        if (state.squeeze[1] > 0.55f)
+        if (m_squeezePressed[1])
             state.buttons |= SH3VR_BUTTON_RIGHT_GRIP;
         ReadBooleanAction(m_buttonAAction, m_handPaths[1],
             SH3VR_BUTTON_A, state.buttons);
@@ -1503,6 +1601,51 @@ private:
         consumer.PublishControllerState(state);
     }
 
+    void ProcessHapticRequests(SharedFrameConsumer& consumer)
+    {
+        Sh3VrHapticRequestState request = {};
+        if (!consumer.ReadHapticRequest(request) || request.sequence == 0 ||
+            request.sequence == m_lastHapticRequestSequence)
+        {
+            return;
+        }
+        m_lastHapticRequestSequence = request.sequence;
+        if (m_hapticAction == XR_NULL_HANDLE || request.handMask == 0u ||
+            !std::isfinite(request.amplitude) ||
+            !std::isfinite(request.durationSeconds))
+        {
+            return;
+        }
+
+        XrHapticVibration vibration{ XR_TYPE_HAPTIC_VIBRATION };
+        vibration.amplitude = std::clamp(request.amplitude, 0.0f, 1.0f);
+        const float durationSeconds = std::clamp(
+            request.durationSeconds, 0.01f, 10.0f);
+        vibration.duration = static_cast<XrDuration>(
+            durationSeconds * 1000000000.0f);
+        vibration.frequency = request.frequency > 0.0f &&
+            std::isfinite(request.frequency) ? request.frequency :
+            XR_FREQUENCY_UNSPECIFIED;
+
+        unsigned applied = 0;
+        for (std::size_t hand = 0; hand < m_handPaths.size(); ++hand)
+        {
+            if ((request.handMask & (1u << hand)) == 0u)
+                continue;
+            XrHapticActionInfo info{ XR_TYPE_HAPTIC_ACTION_INFO };
+            info.action = m_hapticAction;
+            info.subactionPath = m_handPaths[hand];
+            if (XR_SUCCEEDED(xrApplyHapticFeedback(m_session, &info,
+                reinterpret_cast<const XrHapticBaseHeader*>(&vibration))))
+            {
+                ++applied;
+            }
+        }
+        Log("Damage haptics request %d: applied to %u controller(s), %.2f s, "
+            "amplitude %.2f", request.sequence, applied, durationSeconds,
+            vibration.amplitude);
+    }
+
     void ShutdownControllerInput()
     {
         for (XrSpace& space : m_gripSpaces)
@@ -1520,6 +1663,7 @@ private:
         if (m_controllerActionSet != XR_NULL_HANDLE)
             xrDestroyActionSet(m_controllerActionSet);
         m_controllerActionSet = XR_NULL_HANDLE;
+        m_hapticAction = XR_NULL_HANDLE;
         m_controllerInputInitialized = false;
     }
 
@@ -3085,7 +3229,6 @@ float4 DebugPsMain(DebugVertexOutput input) : SV_Target
         // It cannot modify D3D8 hand/weapon state or either native eye depth.
         DrawControllerOrientationDebug(target.width, target.height);
 
-        m_context->Flush();
         XrSwapchainImageReleaseInfo releaseInfo{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
         return CheckXr(xrReleaseSwapchainImage(target.handle, &releaseInfo),
             "xrReleaseSwapchainImage");
@@ -3165,6 +3308,7 @@ float4 DebugPsMain(DebugVertexOutput input) : SV_Target
     XrAction m_stickClickAction = XR_NULL_HANDLE;
     XrAction m_gripPoseAction = XR_NULL_HANDLE;
     XrAction m_aimPoseAction = XR_NULL_HANDLE;
+    XrAction m_hapticAction = XR_NULL_HANDLE;
     XrAction m_buttonAAction = XR_NULL_HANDLE;
     XrAction m_buttonBAction = XR_NULL_HANDLE;
     XrAction m_buttonXAction = XR_NULL_HANDLE;
@@ -3182,6 +3326,11 @@ float4 DebugPsMain(DebugVertexOutput input) : SV_Target
         XR_NULL_HANDLE, XR_NULL_HANDLE };
     bool m_controllerInputInitialized = false;
     bool m_controllerSyncFailureLogged = false;
+    std::array<bool, 2> m_triggerPressed = { false, false };
+    std::array<bool, 2> m_triggerArmed = { false, false };
+    std::array<bool, 2> m_squeezePressed = { false, false };
+    std::array<bool, 2> m_squeezeArmed = { false, false };
+    std::int32_t m_lastHapticRequestSequence = 0;
     bool m_debugWeaponOrientationValid = false;
     float m_debugWeaponPitch = 0.0f;
     float m_debugWeaponYaw = 0.0f;
@@ -3367,7 +3516,10 @@ int wmain(int argumentCount, wchar_t** arguments)
 
     SharedFrameConsumer consumer;
     bool reportedWaiting = false;
-    while (g_keepRunning && parentIsAlive())
+    HANDLE producerProcess = nullptr;
+    DWORD monitoredProducerPid = 0;
+    ULONGLONG noLiveProcessSince = 0;
+    while (g_keepRunning)
     {
         const bool connected = consumer.TryConnect();
         if (!connected && !reportedWaiting)
@@ -3380,11 +3532,60 @@ int wmain(int argumentCount, wchar_t** arguments)
             consumer.PublishRequestedEyeResolution(host->EyeWidth(),
                 host->EyeHeight(), g_settings.eyeSamples);
         }
+
+        const DWORD publishedProducerPid = consumer.HasLiveProducer()
+            ? consumer.ProducerPid() : 0;
+        if (publishedProducerPid != 0 &&
+            publishedProducerPid != monitoredProducerPid)
+        {
+            if (producerProcess)
+                CloseHandle(producerProcess);
+            producerProcess = OpenProcess(SYNCHRONIZE, FALSE,
+                publishedProducerPid);
+            monitoredProducerPid = publishedProducerPid;
+            if (producerProcess)
+            {
+                Log("Following active frame producer PID %u%s",
+                    monitoredProducerPid,
+                    monitoredProducerPid == parentPid ? "" :
+                    " instead of the startup process");
+            }
+            else
+            {
+                Log("Could not monitor frame producer PID %u, error %u",
+                    monitoredProducerPid, GetLastError());
+            }
+        }
+
+        const bool producerProcessAlive = producerProcess &&
+            WaitForSingleObject(producerProcess, 0) == WAIT_TIMEOUT;
+        const bool anyTrackedProcessAlive = parentIsAlive() ||
+            (consumer.HasLiveProducer() && producerProcessAlive);
+        if (anyTrackedProcessAlive)
+        {
+            noLiveProcessSince = 0;
+        }
+        else
+        {
+            const ULONGLONG now = GetTickCount64();
+            if (noLiveProcessSince == 0)
+            {
+                noLiveProcessSince = now;
+                Log("Startup process exited; waiting 5 seconds for an active frame producer");
+            }
+            else if (now - noLiveProcessSince >= 5000)
+            {
+                Log("No live game frame producer remains");
+                break;
+            }
+        }
         if (!host->PumpFrame(consumer))
             break;
     }
 
     Log("SH3VR x64 host stopping");
+    if (producerProcess)
+        CloseHandle(producerProcess);
     if (parentProcess)
         CloseHandle(parentProcess);
     if (g_log)

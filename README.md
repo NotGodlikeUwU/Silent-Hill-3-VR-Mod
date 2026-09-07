@@ -24,14 +24,18 @@ You MUST install [Silent Hill 3 PC Fix by Steam006](https://community.pcgamingwi
 - Motion-attached melee and firearm weapons
 - Controller-relative firearm aiming, native damage, and an in-world guide dot
 - SteamVR/OpenXR runtime support with automatic runtime selection
+- Automatic First Person suspension during native cutscenes, with Heather's
+  player model restored before the cutscene starts and First Person re-enabled
+  after the demo ends
 - Per-weapon position, rotation, scale, and firearm aim offsets
 - Working UI and subtitles
 - Fully playable in the default camera mode
 
 ### Known Issues & Limitations
 - Some textures or models might be invisible in certain locations of the game
-- Intro cutscene has invisible environment
 - Sewer location has glitched water reflections
+- Some scene-specific cutscene assets still need testing on different PC Fix
+  and Camera Mod revisions
 - Missing shadows and enemy blood effects
 - Missing muzzle flash effects
 - Knife hit registration is still unreliable with motion strikes
