@@ -12,7 +12,9 @@ controller bindings. See [SteamVR setup and testing](docs/steamvr.md).
 You can adjust the in-game VR resolution and FPS lock (not tested, i recommend leaving 90 FPS) in `sh3vr.ini` to better match different headsets.
 
 ### Installing
-You MUST install [Silent Hill 3 PC Fix by Steam006](https://community.pcgamingwiki.com/files/file/1331-silent-hill-3-pc-fix-by-steam006/) and [Silent Hill 3 Camera Mod](https://github.com/zealottormunds/sh3cammod). Download the [Release](https://github.com/NotGodlikeUwU/Silent-Hill-3-VR-Mod/releases/tag/Beta_0.1), then copy its contents next to `sh3.exe`. The package includes `dinput8.dll`, `sh3vr_host64.exe`, `sh3vr.ini`, `sh3vr_weapons.ini`, and the `sh3vr_assets` folder.
+You MUST install [Silent Hill 3 PC Fix by Steam006](https://community.pcgamingwiki.com/files/file/1331-silent-hill-3-pc-fix-by-steam006/) and [Silent Hill 3 Camera Mod](https://github.com/zealottormunds/sh3cammod). Download the [Release](https://github.com/NotGodlikeUwU/Silent-Hill-3-VR-Mod/releases/tag/Beta_0.1.6), then copy its contents next to `sh3.exe`. The package includes `dinput8.dll`, `sh3vr_host64.exe`, `sh3vr.ini`, `sh3vr_weapons.ini`, and the `sh3vr_assets` folder. If you see gray screen in VR, copy contents from `GRAY SCREEN FIX` folder to the game .exe with OVERWRITE. Just run `sh3.exe` to play the game.
+
+IF you wanna change Smooth Turn to Snap Turn, change `CameraModTurnMode=1` to `CameraModTurnMode=0` in `sh3vr.ini`.
 
 **Features in the current build:**
 - Unlocked 90 FPS
@@ -20,27 +22,19 @@ You MUST install [Silent Hill 3 PC Fix by Steam006](https://community.pcgamingwi
 - Controller input (mapped for Quest 3 controllers)
 - First Person using ZealotTormund's Camera mod
 - Roomscale
-- Player Height adaptation
-- Motion-attached melee and firearm weapons
-- Controller-relative firearm aiming, native damage, and an in-world guide dot
+- Player Height adaptation to Heather's height
+- Motion-attached melee and firearm weapons with an in-world guide dot
 - SteamVR/OpenXR runtime support with automatic runtime selection
-- Automatic First Person suspension during native cutscenes, with Heather's
-  player model restored before the cutscene starts and First Person re-enabled
-  after the demo ends
 - Per-weapon position, rotation, scale, and firearm aim offsets
 - Working UI and subtitles
-- Fully playable in the default camera mode
+- Fully playable in the first person
+- Smooth Turn and Snap Turn camera
 
 ### Known Issues & Limitations
 - Some textures or models might be invisible in certain locations of the game
 - Sewer location has glitched water reflections
-- Some scene-specific cutscene assets still need testing on different PC Fix
-  and Camera Mod revisions
 - Missing shadows and enemy blood effects
-- Missing muzzle flash effects
 - Knife hit registration is still unreliable with motion strikes
-- Noise Effect should work but needs testing
-- No other technical blockers are expected in theory, but additional playtesting is still recommended
 - Not the entire game has been thoroughly tested — unexpected issues may appear during a full playthrough
 
 Please report any problems in the **Flat2VR Discord** or open an **Issue** on this repository.
