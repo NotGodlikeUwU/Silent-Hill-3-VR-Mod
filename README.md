@@ -12,7 +12,7 @@ controller bindings. See [SteamVR setup and testing](docs/steamvr.md).
 You can adjust the in-game VR resolution and FPS lock (not tested, i recommend leaving 90 FPS) in `sh3vr.ini` to better match different headsets.
 
 ### Installing
-You MUST install [Silent Hill 3 PC Fix by Steam006](https://community.pcgamingwiki.com/files/file/1331-silent-hill-3-pc-fix-by-steam006/) and [Silent Hill 3 Camera Mod](https://github.com/zealottormunds/sh3cammod). Download the [Release](https://github.com/NotGodlikeUwU/Silent-Hill-3-VR-Mod/releases/tag/Beta_0.1), then copy its contents next to `sh3.exe`. The package includes `dinput8.dll`, `sh3vr_host64.exe`, `sh3vr.ini`, `sh3vr_weapons.ini`, and the `sh3vr_assets` folder. If you see gray screen in VR, copy contents from `GRAY SCREEN FIX` folder to the game .exe with OVERWRITE. Just run `sh3.exe` to play the game.
+You MUST install [Silent Hill 3 PC Fix by Steam006](https://community.pcgamingwiki.com/files/file/1331-silent-hill-3-pc-fix-by-steam006/) and [Silent Hill 3 Camera Mod](https://github.com/zealottormunds/sh3cammod). Download the [Release](https://github.com/NotGodlikeUwU/Silent-Hill-3-VR-Mod/releases/tag/Beta_0.1.6), then copy its contents next to `sh3.exe`. The package includes `dinput8.dll`, `sh3vr_host64.exe`, `sh3vr.ini`, `sh3vr_weapons.ini`, and the `sh3vr_assets` folder. If you see gray screen in VR, copy contents from `GRAY SCREEN FIX` folder to the game .exe with OVERWRITE. Just run `sh3.exe` to play the game.
 
 IF you wanna change Smooth Turn to Snap Turn, change `CameraModTurnMode=1` to `CameraModTurnMode=0` in `sh3vr.ini`.
 
