@@ -88,6 +88,8 @@ extern bool Interop8_GetRequestedEyeResolution(std::uint32_t* width,
     std::uint32_t* height, std::uint32_t* sampleCount);
 extern bool Interop8_CaptureStereoEye(IDirect3DDevice8* device,
     IDirect3DSurface8* source, std::uint32_t eye);
+extern bool Interop8_CaptureNativeStereoPair(IDirect3DDevice8* device,
+    IDirect3DSurface8* left, IDirect3DSurface8* right);
 extern void Interop8_ProbeSurface(IDirect3DDevice8* device,
     IDirect3DSurface8* source, const char* label);
 extern void Interop8_CompareSurfaces(IDirect3DDevice8* device,
@@ -577,6 +579,11 @@ static UINT g_nativeEyeHeight = 0;
 static UINT g_nativeEyeFormat = 0;
 static UINT g_nativeEyeSampleCount = 1;
 static bool g_nativeEyeSharedSetInitialized[2] = {};
+static LONG g_nativeEyeGpuPrepareMisses = 0;
+static LONG g_nativeEyeCpuPublishFailures = 0;
+static bool g_cpuNativeStereoPublishedThisFrame8 = false;
+static bool g_loggedNativeEyeGpuTransport8 = false;
+static bool g_loggedNativeEyeCpuTransport8 = false;
 static UINT g_nativeEyeCopyTargetSet = 0;
 static UINT g_nativeEyeCompletedSet = 0;
 static UINT64 g_nativeEyeGameFenceValue = 0;
@@ -3608,6 +3615,61 @@ static void PollNativeEyeAsyncCopy()
             g_nativeEyeFrameSequence, g_nativeEyeCompletedSet);
     }
     InterlockedExchange(&g_nativeEyeCopyState, 3);
+}
+
+// Prefer the zero-copy D3D12 transport, but do not leave native eye targets
+// stranded inside a stock D3D8 process. Some PC Fix/wrapper combinations do
+// not load D3D9On12 at all, so their only portable route to the x64 OpenXR
+// Host is the shared-memory CPU stereo pair.
+static bool PublishNativeEyeFrame()
+{
+    if (PrepareNativeEyeAsyncCopy())
+    {
+        g_nativeEyeGpuPrepareMisses = 0;
+        if (!g_loggedNativeEyeGpuTransport8)
+        {
+            g_loggedNativeEyeGpuTransport8 = true;
+            Log("Stereo transport selected: D3D12 GPU shared eye textures");
+        }
+        return true;
+    }
+
+    if (!g_device8 || !g_stereoLeftColor8 || !g_stereoRightColor8)
+        return false;
+
+    const LONG misses = InterlockedIncrement(&g_nativeEyeGpuPrepareMisses);
+    const bool d3d12BackendVisible =
+        GetModuleHandleA("d3d12.dll") != nullptr ||
+        GetModuleHandleA("d3d9on12.dll") != nullptr ||
+        g_d3d12DirectQueue != nullptr ||
+        g_d3d12NativeEyeResourceCount != 0;
+    if (d3d12BackendVisible && misses < 120)
+        return false;
+
+    const bool published = Interop8_CaptureNativeStereoPair(g_device8,
+        g_stereoLeftColor8, g_stereoRightColor8);
+    if (published)
+    {
+        g_cpuNativeStereoPublishedThisFrame8 = true;
+        g_nativeEyeCpuPublishFailures = 0;
+        if (!g_loggedNativeEyeCpuTransport8)
+        {
+            g_loggedNativeEyeCpuTransport8 = true;
+            Log("Stereo transport selected: D3D8 compatibility CPU eye pair "
+                "(D3D12 shared-eye transport unavailable after %d attempt(s))",
+                misses);
+        }
+        return true;
+    }
+
+    const LONG failures = InterlockedIncrement(
+        &g_nativeEyeCpuPublishFailures);
+    if (failures == 1 || failures == 60 || failures % 600 == 0)
+    {
+        Log("D3D8 compatibility stereo publication failed %d time(s); "
+            "native eye targets remain local to the game process", failures);
+    }
+    return false;
 }
 
 static HRESULT STDMETHODCALLTYPE hk_D3D12_CreateCommittedResource(
@@ -12964,6 +13026,7 @@ static HRESULT WINAPI hk_D3D8_Present(IDirect3DDevice8* device, const RECT* src,
     const RECT* dest, HWND window, const void* dirty)
 {
     g_device8 = device;
+    g_cpuNativeStereoPublishedThisFrame8 = false;
     ProbeD3D8Device(device);
     UpdateMotionWeaponDrawCapture8();
     TryAutoLoadCameraModFirstPerson();
@@ -13112,7 +13175,7 @@ static HRESULT WINAPI hk_D3D8_Present(IDirect3DDevice8* device, const RECT* src,
     if (immersive && g_fullSceneStereoPairReady8)
     {
         if (!holdPreviousNativeEyeFrame)
-            PrepareNativeEyeAsyncCopy();
+            PublishNativeEyeFrame();
         g_fullSceneStereoPairReady8 = false;
         g_perDrawStereoProbeDraws8 = 0;
         g_perDrawStereoIndexedReplayDraws8 = 0;
@@ -13208,7 +13271,7 @@ static HRESULT WINAPI hk_D3D8_Present(IDirect3DDevice8* device, const RECT* src,
                     "frame(s)", g_consecutiveStereoReplayOverflowFrames8);
                 g_consecutiveStereoReplayOverflowFrames8 = 0;
             }
-            PrepareNativeEyeAsyncCopy();
+            PublishNativeEyeFrame();
         }
         g_perDrawStereoProbeDraws8 = 0;
         g_perDrawStereoIndexedReplayDraws8 = 0;
@@ -13225,7 +13288,7 @@ static HRESULT WINAPI hk_D3D8_Present(IDirect3DDevice8* device, const RECT* src,
         // Menus and subtitle-only frames may not contain a selected 3D draw,
         // but their native eye targets still need to be published.
         if (!holdPreviousNativeEyeFrame)
-            PrepareNativeEyeAsyncCopy();
+            PublishNativeEyeFrame();
         g_uiStereoOverlayDraws8 = 0;
     }
     g_holdPreviousNativeEyeFrame8 = false;
@@ -13253,18 +13316,21 @@ static HRESULT WINAPI hk_D3D8_Present(IDirect3DDevice8* device, const RECT* src,
     const bool synchronizedStereo = immersive &&
         g_enableSynchronizedStereo8 &&
         g_stereoPairPublishedThisFrame8;
+    const bool compatibilityStereo = immersive &&
+        g_cpuNativeStereoPublishedThisFrame8;
     if (immersive && g_probePresentBackBufferThisFrame8)
     {
         ProbeStereoBackBuffer("explicit backbuffer immediately before Present");
         g_probePresentBackBufferThisFrame8 = false;
     }
     Interop8_SetRenderMode(immersive
-        ? (synchronizedStereo || g_enableAlternatingStereo8
+        ? (synchronizedStereo || compatibilityStereo ||
+            g_enableAlternatingStereo8
             ? SH3VR_RENDER_IMMERSIVE_STEREO
             : SH3VR_RENDER_IMMERSIVE_MONO)
         : SH3VR_RENDER_CINEMA);
     Interop8_SetRenderFlags(SH3VR_RENDER_FLAG_NONE);
-    Interop8_SetRenderEye(synchronizedStereo ? 1 :
+    Interop8_SetRenderEye((synchronizedStereo || compatibilityStereo) ? 1 :
         (immersive && g_enableAlternatingStereo8
         ? g_renderEye8 : 0));
     g_viewProjectionAppliedThisFrame8 = false;
@@ -13280,7 +13346,7 @@ static HRESULT WINAPI hk_D3D8_Present(IDirect3DDevice8* device, const RECT* src,
     g_shaderDrawGroupCount8 = 0;
 
     // Publish every frame into the shared section for sh3vr_host64.exe.
-    if (!synchronizedStereo)
+    if (!synchronizedStereo && !compatibilityStereo)
         Interop8_GrabFrame(device);
     g_haveLatchedFrameHeadPose8 = false;
     g_haveLatchedFrameControllerState8 = false;

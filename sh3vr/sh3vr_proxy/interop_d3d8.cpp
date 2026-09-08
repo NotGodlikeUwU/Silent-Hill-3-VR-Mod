@@ -118,6 +118,10 @@ static const char* FormatName(DWORD format)
 
 static IDirect3DSurface8* g_staging = nullptr;
 static IDirect3DSurface8* g_stereoStaging[2] = {};
+static IDirect3DSurface8* g_nativeStereoStaging[2] = {};
+static UINT               g_nativeStereoWidth = 0;
+static UINT               g_nativeStereoHeight = 0;
+static DWORD              g_nativeStereoFormat = 0;
 static UINT               g_width = 0;
 static UINT               g_height = 0;
 static DWORD              g_format = 0;
@@ -718,6 +722,96 @@ static bool SharedFrame_CopyStereoEye(const BYTE* source, INT sourcePitch,
     return true;
 }
 
+// Publishes two native eye surfaces as one atomic CPU-backed stereo frame.
+// This path is used only when the D3D8 wrapper does not expose D3D12 shared
+// resources. Keeping the pair sequence odd while both slots are copied stops
+// the x64 Host from observing one new eye alongside one old eye.
+static bool SharedFrame_CopyNativeStereoPair(const BYTE* sources[2],
+    const INT sourcePitches[2], UINT width, UINT height)
+{
+    if (!g_header || !sources || !sources[0] || !sources[1] ||
+        !sourcePitches || width == 0 || height == 0 ||
+        width > SH3VR_MAX_WIDTH || height > SH3VR_MAX_HEIGHT)
+    {
+        return false;
+    }
+
+    const UINT destPitch = width * SH3VR_BYTES_PER_PX;
+    const SIZE_T byteCount = static_cast<SIZE_T>(destPitch) * height;
+    if (byteCount > SH3VR_SLOT_BYTES)
+        return false;
+
+    g_header->producerPid = GetCurrentProcessId();
+    InterlockedExchange(reinterpret_cast<volatile LONG*>(
+        &g_header->producerAlive), 1);
+
+    volatile LONG* pairSequence = reinterpret_cast<volatile LONG*>(
+        &g_header->stereoPairSequence);
+    volatile LONG* readyMask = reinterpret_cast<volatile LONG*>(
+        &g_header->stereoReadyMask);
+    const LONG sequence = InterlockedCompareExchange(pairSequence, 0, 0);
+    if ((sequence & 1) != 0)
+        InterlockedIncrement(pairSequence);
+    InterlockedExchange(readyMask, 0);
+    InterlockedIncrement(pairSequence);
+
+    for (UINT eye = 0; eye < 2; ++eye)
+    {
+        BYTE* dest = g_slotBase + static_cast<SIZE_T>(eye) *
+            SH3VR_SLOT_BYTES;
+        if (sourcePitches[eye] == static_cast<INT>(destPitch))
+        {
+            memcpy(dest, sources[eye], byteCount);
+        }
+        else
+        {
+            for (UINT y = 0; y < height; ++y)
+            {
+                memcpy(dest + static_cast<SIZE_T>(y) * destPitch,
+                    sources[eye] + static_cast<SIZE_T>(y) *
+                        sourcePitches[eye], destPitch);
+            }
+        }
+    }
+
+    InterlockedExchange(readyMask, 3);
+    g_header->width = width;
+    g_header->height = height;
+    g_header->pitch = destPitch;
+    g_header->contentLeft = 0;
+    g_header->contentTop = 0;
+    g_header->contentWidth = width;
+    g_header->contentHeight = height;
+    LARGE_INTEGER now = {};
+    QueryPerformanceCounter(&now);
+    g_header->qpcCapture = now.QuadPart;
+    g_header->frameRenderPose = g_frameRenderPose;
+    g_header->renderMode = SH3VR_RENDER_IMMERSIVE_STEREO;
+    g_header->renderFlags = SH3VR_RENDER_FLAG_NONE;
+    g_header->renderEye = 1;
+
+    // A zero sequence explicitly selects the CPU stereo slots in the Host,
+    // even if a previous device generation published GPU eye handles.
+    g_d3d12EyeTextureFrameSequence = 0;
+    g_header->d3d12EyeTextureFrameSequence = 0;
+    g_stereoPairOpen = false;
+
+    MemoryBarrier();
+    InterlockedIncrement(pairSequence);
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(
+        &g_header->publishedFrame));
+
+    const LONG pair = InterlockedIncrement(&g_stereoPairCounter);
+    if (pair == 1 || pair == 60 || pair % 600 == 0)
+    {
+        Log("D3D8 compatibility stereo pair %d published at %ux%u",
+            pair, width, height);
+    }
+    if (g_frameEvent)
+        SetEvent(g_frameEvent);
+    return true;
+}
+
 static void SharedFrame_Shutdown()
 {
     if (g_header)
@@ -996,6 +1090,138 @@ bool Interop8_CaptureStereoEye(IDirect3DDevice8* device,
     const bool published = SharedFrame_CopyStereoEye(pixels, locked.Pitch,
         eye, left, top, width, height);
     Slot<PFNS8_UnlockRect>(staging, VTS8_UnlockRect)(staging);
+    return published;
+}
+
+static bool EnsureNativeStereoStaging(IDirect3DDevice8* device,
+    IDirect3DSurface8* left, IDirect3DSurface8* right)
+{
+    if (!device || !left || !right)
+        return false;
+
+    D3D8SurfaceDesc leftDesc = {};
+    D3D8SurfaceDesc rightDesc = {};
+    HRESULT hr = Slot<PFNS8_GetDesc>(left, VTS8_GetDesc)(left, &leftDesc);
+    if (FAILED(hr))
+        return false;
+    hr = Slot<PFNS8_GetDesc>(right, VTS8_GetDesc)(right, &rightDesc);
+    if (FAILED(hr) || leftDesc.Width != rightDesc.Width ||
+        leftDesc.Height != rightDesc.Height ||
+        leftDesc.Format != rightDesc.Format || leftDesc.Width == 0 ||
+        leftDesc.Height == 0 || leftDesc.Width > SH3VR_MAX_WIDTH ||
+        leftDesc.Height > SH3VR_MAX_HEIGHT)
+    {
+        Log("D3D8 compatibility stereo rejected mismatched eye surfaces: "
+            "left %ux%u fmt %u, right %ux%u fmt %u",
+            leftDesc.Width, leftDesc.Height,
+            static_cast<unsigned>(leftDesc.Format), rightDesc.Width,
+            rightDesc.Height, static_cast<unsigned>(rightDesc.Format));
+        return false;
+    }
+
+    if (g_nativeStereoStaging[0] && g_nativeStereoStaging[1] &&
+        g_nativeStereoWidth == leftDesc.Width &&
+        g_nativeStereoHeight == leftDesc.Height &&
+        g_nativeStereoFormat == leftDesc.Format)
+    {
+        return true;
+    }
+
+    for (UINT eye = 0; eye < 2; ++eye)
+    {
+        ReleaseSurface(g_nativeStereoStaging[eye]);
+        g_nativeStereoStaging[eye] = nullptr;
+    }
+    g_nativeStereoWidth = 0;
+    g_nativeStereoHeight = 0;
+    g_nativeStereoFormat = 0;
+
+    for (UINT eye = 0; eye < 2; ++eye)
+    {
+        hr = Slot<PFN8_CreateImageSurface>(device, VT8_CreateImageSurface)(
+            device, leftDesc.Width, leftDesc.Height, leftDesc.Format,
+            &g_nativeStereoStaging[eye]);
+        if (FAILED(hr) || !g_nativeStereoStaging[eye])
+        {
+            Log("D3D8 compatibility stereo staging eye %u failed, "
+                "hr = 0x%08X", eye, static_cast<unsigned>(hr));
+            for (UINT releaseEye = 0; releaseEye < 2; ++releaseEye)
+            {
+                ReleaseSurface(g_nativeStereoStaging[releaseEye]);
+                g_nativeStereoStaging[releaseEye] = nullptr;
+            }
+            return false;
+        }
+    }
+
+    g_nativeStereoWidth = leftDesc.Width;
+    g_nativeStereoHeight = leftDesc.Height;
+    g_nativeStereoFormat = leftDesc.Format;
+    Log("D3D8 compatibility stereo staging created at %ux%u, format %u",
+        g_nativeStereoWidth, g_nativeStereoHeight,
+        static_cast<unsigned>(g_nativeStereoFormat));
+    return true;
+}
+
+bool Interop8_CaptureNativeStereoPair(IDirect3DDevice8* device,
+    IDirect3DSurface8* left, IDirect3DSurface8* right)
+{
+    if (g_broken || !device || !left || !right)
+        return false;
+    if (!g_initialised && !Interop8_Init(device))
+        return false;
+    if (!EnsureNativeStereoStaging(device, left, right))
+        return false;
+
+    IDirect3DSurface8* sources[2] = { left, right };
+    for (UINT eye = 0; eye < 2; ++eye)
+    {
+        const HRESULT hr = Slot<PFN8_CopyRects>(device, VT8_CopyRects)(
+            device, sources[eye], nullptr, 0,
+            g_nativeStereoStaging[eye], nullptr);
+        if (FAILED(hr))
+        {
+            Log("D3D8 compatibility stereo CopyRects eye %u failed, "
+                "hr = 0x%08X", eye, static_cast<unsigned>(hr));
+            return false;
+        }
+    }
+
+    D3D8LockedRect locked[2] = {};
+    UINT lockedCount = 0;
+    for (UINT eye = 0; eye < 2; ++eye)
+    {
+        const HRESULT hr = Slot<PFNS8_LockRect>(
+            g_nativeStereoStaging[eye], VTS8_LockRect)(
+                g_nativeStereoStaging[eye], &locked[eye], nullptr,
+                D3D8_LOCK_READONLY);
+        if (FAILED(hr) || !locked[eye].pBits)
+        {
+            Log("D3D8 compatibility stereo LockRect eye %u failed, "
+                "hr = 0x%08X", eye, static_cast<unsigned>(hr));
+            for (UINT releaseEye = 0; releaseEye < lockedCount; ++releaseEye)
+            {
+                Slot<PFNS8_UnlockRect>(g_nativeStereoStaging[releaseEye],
+                    VTS8_UnlockRect)(g_nativeStereoStaging[releaseEye]);
+            }
+            return false;
+        }
+        ++lockedCount;
+    }
+
+    const BYTE* pixels[2] = {
+        static_cast<const BYTE*>(locked[0].pBits),
+        static_cast<const BYTE*>(locked[1].pBits)
+    };
+    const INT pitches[2] = { locked[0].Pitch, locked[1].Pitch };
+    const bool published = SharedFrame_CopyNativeStereoPair(pixels, pitches,
+        g_nativeStereoWidth, g_nativeStereoHeight);
+
+    for (UINT eye = 0; eye < 2; ++eye)
+    {
+        Slot<PFNS8_UnlockRect>(g_nativeStereoStaging[eye],
+            VTS8_UnlockRect)(g_nativeStereoStaging[eye]);
+    }
     return published;
 }
 
@@ -1282,7 +1508,13 @@ void Interop8_OnDeviceReset()
     {
         ReleaseSurface(g_stereoStaging[eye]);
         g_stereoStaging[eye] = nullptr;
+        ReleaseSurface(g_nativeStereoStaging[eye]);
+        g_nativeStereoStaging[eye] = nullptr;
     }
+
+    g_nativeStereoWidth = 0;
+    g_nativeStereoHeight = 0;
+    g_nativeStereoFormat = 0;
 
     g_initialised = false;
     g_broken = false;
@@ -1301,7 +1533,13 @@ void Interop8_Shutdown()
     {
         ReleaseSurface(g_stereoStaging[eye]);
         g_stereoStaging[eye] = nullptr;
+        ReleaseSurface(g_nativeStereoStaging[eye]);
+        g_nativeStereoStaging[eye] = nullptr;
     }
+
+    g_nativeStereoWidth = 0;
+    g_nativeStereoHeight = 0;
+    g_nativeStereoFormat = 0;
 
     SharedFrame_Shutdown();
 

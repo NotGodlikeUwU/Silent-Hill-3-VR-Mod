@@ -36,6 +36,8 @@ ProxyFrameTimeOverride90Hz=0
 ProxyVirtualFPSMode4=1
 
 [Stereo]
+; Eye-frame transport is selected automatically. D3D12 shared textures are
+; preferred; a D3D8 shared-memory stereo fallback is used when unavailable.
 EnablePerDrawReplay=1
 ReplayWorldOnly=0
 ; Base ceiling for ordinary stereo replay. Character-heavy scenes use the
