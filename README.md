@@ -10,7 +10,7 @@ A mod for *Silent Hill 3* that brings fully working VR mode into the game.
 ### Current status
 Tested on **Meta Quest 3** through **Virtual Desktop**. The mod also includes
 SteamVR/OpenXR support with automatic runtime detection and Touch/Index/Vive
-controller bindings. See [SteamVR setup and testing](docs/steamvr.md).
+controller bindings.
 
 You can adjust the in-game VR resolution and FPS lock (not tested, i recommend leaving 90 FPS) in `sh3vr.ini` to better match different headsets.
 
