@@ -1,5 +1,6 @@
 
-<img width="1201" height="631" alt="SH3VR LOGO WHITE" src="https://github.com/user-attachments/assets/be864641-855d-4bd0-ba70-7670b1a6f750" />
+<img width="1201" height="233" alt="SH3VR LOGO WHITE" src="https://github.com/user-attachments/assets/61613126-f076-46d6-b200-966a48ea1418" />
+
 **Silent Hill 3 VR Mod**
 
 A mod for *Silent Hill 3* that brings fully working VR mode into the game.
