@@ -1,8 +1,6 @@
 
 <img width="1201" height="233" alt="SH3VR LOGO WHITE" src="https://github.com/user-attachments/assets/61613126-f076-46d6-b200-966a48ea1418" />
 
-**Silent Hill 3 VR Mod**
-
 A mod for *Silent Hill 3* that brings fully working VR mode into the game.
 
 **WARNING: You must install Silent Hill 3 PC Fix by Steam006 and ZealotTormund's Camera Mod to play this mod.**
