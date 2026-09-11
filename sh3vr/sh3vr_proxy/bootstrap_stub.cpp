@@ -24,8 +24,10 @@ extern void D3D9Hook_Remove();
 extern bool Interop8_ReadControllerState(Sh3VrControllerState* state);
 extern bool Interop8_ReadHeadPose(Sh3VrHeadPose* pose);
 extern std::uint32_t D3D9Hook_GetRoomscaleMovementMask();
-extern bool D3D9Hook_GetCameraModCharacterAlignForward();
 extern bool D3D9Hook_GetRelativeHeadYawRadians(float* yawRadians);
+extern bool D3D9Hook_IsGameplayInputActive();
+extern bool D3D9Hook_ApplyCameraRelativeMovementHeading(float localRight,
+    float localForward);
 extern bool D3D9Hook_GetMeleeWeaponHitbox(std::uint8_t gameWeapon,
     float gripWorld[4], float tipWorld[4], float* radiusGameUnits);
 extern bool D3D9Hook_GetFirearmAimRay(std::uint8_t gameWeapon,
@@ -409,6 +411,93 @@ static bool TickIsBefore(DWORD now, DWORD end)
     return end != 0 && static_cast<LONG>(end - now) > 0;
 }
 
+struct MenuAxisRepeatState
+{
+    int direction;
+    DWORD pressedUntil;
+    DWORD nextRepeat;
+};
+
+struct MenuNavigationPulse
+{
+    bool left;
+    bool right;
+    bool up;
+    bool down;
+};
+
+static MenuAxisRepeatState g_menuHorizontalRepeat = {};
+static MenuAxisRepeatState g_menuVerticalRepeat = {};
+
+static bool UpdateMenuAxisRepeat(float axis, MenuAxisRepeatState& state,
+    int* directionOutput)
+{
+    constexpr float activationThreshold = 0.55f;
+    constexpr float releaseThreshold = 0.30f;
+    constexpr DWORD initialPulseMilliseconds = 80;
+    constexpr DWORD initialRepeatDelayMilliseconds = 420;
+    constexpr DWORD repeatPulseMilliseconds = 65;
+    constexpr DWORD repeatIntervalMilliseconds = 170;
+
+    int requestedDirection = state.direction;
+    if (axis <= -activationThreshold)
+        requestedDirection = -1;
+    else if (axis >= activationThreshold)
+        requestedDirection = 1;
+    else if (std::fabs(axis) <= releaseThreshold)
+        requestedDirection = 0;
+
+    const DWORD now = GetTickCount();
+    if (requestedDirection != state.direction)
+    {
+        state.direction = requestedDirection;
+        if (requestedDirection == 0)
+        {
+            state.pressedUntil = 0;
+            state.nextRepeat = 0;
+        }
+        else
+        {
+            state.pressedUntil = now + initialPulseMilliseconds;
+            state.nextRepeat = now + initialRepeatDelayMilliseconds;
+        }
+    }
+    else if (requestedDirection != 0 && state.nextRepeat != 0 &&
+        static_cast<LONG>(now - state.nextRepeat) >= 0)
+    {
+        state.pressedUntil = now + repeatPulseMilliseconds;
+        state.nextRepeat = now + repeatIntervalMilliseconds;
+    }
+
+    if (directionOutput)
+        *directionOutput = state.direction;
+    return state.direction != 0 && TickIsBefore(now, state.pressedUntil);
+}
+
+static MenuNavigationPulse GetMenuNavigationPulse(float rawX, float rawY,
+    bool gameplayInputActive)
+{
+    MenuNavigationPulse pulse = {};
+    if (gameplayInputActive)
+    {
+        g_menuHorizontalRepeat = {};
+        g_menuVerticalRepeat = {};
+        return pulse;
+    }
+
+    int horizontalDirection = 0;
+    int verticalDirection = 0;
+    const bool horizontalPulse = UpdateMenuAxisRepeat(rawX,
+        g_menuHorizontalRepeat, &horizontalDirection);
+    const bool verticalPulse = UpdateMenuAxisRepeat(rawY,
+        g_menuVerticalRepeat, &verticalDirection);
+    pulse.left = horizontalPulse && horizontalDirection < 0;
+    pulse.right = horizontalPulse && horizontalDirection > 0;
+    pulse.up = verticalPulse && verticalDirection > 0;
+    pulse.down = verticalPulse && verticalDirection < 0;
+    return pulse;
+}
+
 #pragma pack(push, 1)
 struct Sh3NativeBattleCollision
 {
@@ -713,10 +802,19 @@ static void __cdecl HookedNativeBuildAttackRay(void* character,
     if (!D3D9Hook_GetActiveFirearmAimRay(muzzleWorld, rayEndWorld))
         return;
 
+    // SH3's battle collision expects the ray to begin at the native weapon
+    // socket.  A controller-derived muzzle can be visually correct but still
+    // sit outside the character/room collision space used by clBattleAddQue,
+    // which makes every firearm attack miss.  Keep the native origin and aim
+    // it through the far end of the tracked-controller ray instead.
+    const float nativeOrigin[3] = { origin[0], origin[1], origin[2] };
+    const float nativeDirection[3] = {
+        direction[0], direction[1], direction[2]
+    };
     float rayDirection[3] = {
-        rayEndWorld[0] - muzzleWorld[0],
-        rayEndWorld[1] - muzzleWorld[1],
-        rayEndWorld[2] - muzzleWorld[2]
+        rayEndWorld[0] - nativeOrigin[0],
+        rayEndWorld[1] - nativeOrigin[1],
+        rayEndWorld[2] - nativeOrigin[2]
     };
     const float rayLength = std::sqrt(
         rayDirection[0] * rayDirection[0] +
@@ -727,18 +825,30 @@ static void __cdecl HookedNativeBuildAttackRay(void* character,
 
     for (int axis = 0; axis < 3; ++axis)
     {
-        origin[axis] = muzzleWorld[axis];
         direction[axis] = rayDirection[axis] / rayLength;
     }
-    origin[3] = 1.0f;
     direction[3] = 0.0f;
     D3D9Hook_NotifyFirearmDischarge();
 
     const LONG count = InterlockedIncrement(&g_firearmNativeAimLogCount);
     if (count <= 24 || count % 120 == 0)
     {
-        Log("MotionControls: native firearm origin/direction replaced %d: "
-            "attack %u", count, static_cast<unsigned>(attackId));
+        Log("MotionControls: native firearm direction replaced %d: attack "
+            "%u; native dir x1000 %d/%d/%d, VR dir x1000 %d/%d/%d; "
+            "native-to-tracked-muzzle delta x1000 %d/%d/%d",
+            count, static_cast<unsigned>(attackId),
+            static_cast<int>(std::lround(nativeDirection[0] * 1000.0f)),
+            static_cast<int>(std::lround(nativeDirection[1] * 1000.0f)),
+            static_cast<int>(std::lround(nativeDirection[2] * 1000.0f)),
+            static_cast<int>(std::lround(direction[0] * 1000.0f)),
+            static_cast<int>(std::lround(direction[1] * 1000.0f)),
+            static_cast<int>(std::lround(direction[2] * 1000.0f)),
+            static_cast<int>(std::lround(
+                (muzzleWorld[0] - nativeOrigin[0]) * 1000.0f)),
+            static_cast<int>(std::lround(
+                (muzzleWorld[1] - nativeOrigin[1]) * 1000.0f)),
+            static_cast<int>(std::lround(
+                (muzzleWorld[2] - nativeOrigin[2]) * 1000.0f)));
     }
 }
 
@@ -1269,15 +1379,24 @@ static bool ControllerPressesVirtualKey(
         (buttons & SH3VR_BUTTON_RIGHT_STICK) != 0;
     const bool cameraModMenuChord = leftStickPressed && rightStickPressed;
     const bool cameraModLoaded = IsCameraModLoaded();
+    const bool gameplayInputActive = D3D9Hook_IsGameplayInputActive();
+    const MenuNavigationPulse menuNavigation = GetMenuNavigationPulse(
+        controller.thumbstick[0][0], controller.thumbstick[0][1],
+        gameplayInputActive);
     float moveX = controller.thumbstick[0][0];
     float moveY = controller.thumbstick[0][1];
     float headYaw = 0.0f;
-    if (cameraModLoaded && D3D9Hook_GetRelativeHeadYawRadians(&headYaw))
+    if (gameplayInputActive && cameraModLoaded &&
+        D3D9Hook_GetRelativeHeadYawRadians(&headYaw))
     {
         const float cosine = std::cos(headYaw);
         const float sine = std::sin(headYaw);
-        const float rotatedX = moveX * cosine + moveY * sine;
-        const float rotatedY = moveY * cosine - moveX * sine;
+        // OpenXR's positive yaw turns toward -X because forward is -Z, while
+        // SH3's positive movement heading turns toward +X with +Z forward.
+        // Apply the inverse OpenXR yaw so pushing the stick forward follows
+        // the direction the player is physically looking.
+        const float rotatedX = moveX * cosine - moveY * sine;
+        const float rotatedY = moveY * cosine + moveX * sine;
         moveX = rotatedX;
         moveY = rotatedY;
     }
@@ -1310,29 +1429,35 @@ static bool ControllerPressesVirtualKey(
     case 'M':
         return (buttons & SH3VR_BUTTON_Y) != 0;
     case 'W':
-        return moveY > movementThreshold;
+        return gameplayInputActive
+            ? (cameraModLoaded
+                ? std::fabs(moveX) > movementThreshold ||
+                    std::fabs(moveY) > movementThreshold
+                : moveY > movementThreshold)
+            : menuNavigation.up;
     case VK_UP:
-        return controller.thumbstick[0][1] > movementThreshold;
+        return menuNavigation.up;
     case 'S':
-        return moveY < -movementThreshold;
+        return gameplayInputActive && !cameraModLoaded
+            ? moveY < -movementThreshold : menuNavigation.down;
     case VK_DOWN:
-        return controller.thumbstick[0][1] < -movementThreshold;
+        return menuNavigation.down;
     case VK_LEFT:
-        return controller.thumbstick[0][0] < -movementThreshold;
+        return menuNavigation.left;
     case VK_RIGHT:
-        return controller.thumbstick[0][0] > movementThreshold;
+        return menuNavigation.right;
     case 'A':
-        return !cameraModLoaded &&
-            moveX < -movementThreshold;
+        return gameplayInputActive
+            ? !cameraModLoaded && moveX < -movementThreshold
+            : menuNavigation.left;
     case 'D':
-        return !cameraModLoaded &&
-            moveX > movementThreshold;
+        return gameplayInputActive
+            ? !cameraModLoaded && moveX > movementThreshold
+            : menuNavigation.right;
     case 'Q':
-        return cameraModLoaded &&
-            moveX < -movementThreshold;
+        return !gameplayInputActive && menuNavigation.left;
     case 'E':
-        return cameraModLoaded &&
-            moveX > movementThreshold;
+        return !gameplayInputActive && menuNavigation.right;
     default:
         return false;
     }
@@ -1420,75 +1545,87 @@ static HRESULT InjectControllerState(void* device, DWORD stateBytes,
     previousButtons = buttons;
 
     const bool cameraModLoaded = IsCameraModLoaded();
+    const bool gameplayInputActive = D3D9Hook_IsGameplayInputActive();
+    const MenuNavigationPulse menuNavigation = GetMenuNavigationPulse(
+        controller.thumbstick[0][0], controller.thumbstick[0][1],
+        gameplayInputActive);
     float moveX = controller.thumbstick[0][0];
     float moveY = controller.thumbstick[0][1];
     float headYaw = 0.0f;
-    if (cameraModLoaded && D3D9Hook_GetRelativeHeadYawRadians(&headYaw))
+    if (gameplayInputActive && cameraModLoaded &&
+        D3D9Hook_GetRelativeHeadYawRadians(&headYaw))
     {
         const float cosine = std::cos(headYaw);
         const float sine = std::sin(headYaw);
-        const float rotatedX = moveX * cosine + moveY * sine;
-        const float rotatedY = moveY * cosine - moveX * sine;
+        // Convert OpenXR yaw to SH3's opposite horizontal heading convention.
+        const float rotatedX = moveX * cosine - moveY * sine;
+        const float rotatedY = moveY * cosine + moveX * sine;
         moveX = rotatedX;
         moveY = rotatedY;
     }
     const bool movingWithLeftStick =
         std::fabs(moveX) > movementThreshold ||
         std::fabs(moveY) > movementThreshold;
-    const std::uint32_t roomscaleMovement = movingWithLeftStick
-        ? SH3VR_ROOMSCALE_NONE
-        : D3D9Hook_GetRoomscaleMovementMask();
-    const bool cameraModCharacterAlign = cameraModLoaded &&
-        D3D9Hook_GetCameraModCharacterAlignForward();
-    static LONG g_cameraModCharacterAlignLogCount = 0;
-    if (cameraModCharacterAlign)
-    {
-        const LONG count = InterlockedIncrement(
-            &g_cameraModCharacterAlignLogCount);
-        if (count == 1)
-        {
-            Log("InputBridge: Camera Mod right-stick turn requests Heather "
-                "alignment through the game's normal forward movement path");
-        }
-    }
-    if (cameraModLoaded && movingWithLeftStick &&
+    // Always notify the movement bridge, including stick release. The render
+    // thread supplies the camera basis and SH3's native movement-vector stage
+    // consumes the requested heading without changing native speed.
+    const bool cameraRelativeForward =
+        D3D9Hook_ApplyCameraRelativeMovementHeading(
+            gameplayInputActive && cameraModLoaded && movingWithLeftStick
+                ? moveX : 0.0f,
+            gameplayInputActive && cameraModLoaded && movingWithLeftStick
+                ? moveY : 0.0f);
+    const std::uint32_t roomscaleMovement = gameplayInputActive &&
+        !movingWithLeftStick ? D3D9Hook_GetRoomscaleMovementMask()
+            : SH3VR_ROOMSCALE_NONE;
+    if (cameraRelativeForward &&
         InterlockedCompareExchange(&g_cameraModStrafeLogged, 1, 0) == 0)
     {
-        Log("InputBridge: Camera Mod 2D movement active: W/S/Q/E directions; "
-            "arrow-key duplicates retained for menus");
+        Log("InputBridge: Camera-relative 2D movement active: every stick "
+            "direction uses native forward speed with its horizontal vector "
+            "rotated before SH3 collision and position integration");
     }
 
     SetVirtualKey(keys, stateBytes, DIK_W,
-        moveY > movementThreshold ||
-        (roomscaleMovement & SH3VR_ROOMSCALE_FORWARD) != 0 ||
-        cameraModCharacterAlign);
+        (!gameplayInputActive && menuNavigation.up) ||
+        (gameplayInputActive && (cameraRelativeForward ||
+            ((!cameraModLoaded || !cameraRelativeForward) &&
+                moveY > movementThreshold) ||
+            (roomscaleMovement & SH3VR_ROOMSCALE_FORWARD) != 0)));
     SetVirtualKey(keys, stateBytes, DIK_UP,
-        controller.thumbstick[0][1] > movementThreshold);
+        menuNavigation.up);
     SetVirtualKey(keys, stateBytes, DIK_S,
-        moveY < -movementThreshold ||
+        (!gameplayInputActive && menuNavigation.down) ||
+        (gameplayInputActive &&
+            (!cameraModLoaded || !cameraRelativeForward) &&
+            moveY < -movementThreshold) ||
         (roomscaleMovement & SH3VR_ROOMSCALE_BACKWARD) != 0);
     SetVirtualKey(keys, stateBytes, DIK_DOWN,
-        controller.thumbstick[0][1] < -movementThreshold);
+        menuNavigation.down);
     SetVirtualKey(keys, stateBytes, DIK_A,
-        (!cameraModLoaded &&
-            moveX < -movementThreshold));
+        (!gameplayInputActive && menuNavigation.left) ||
+        (gameplayInputActive &&
+            (!cameraModLoaded || !cameraRelativeForward) &&
+            moveX < -movementThreshold) ||
+        (roomscaleMovement & SH3VR_ROOMSCALE_LEFT) != 0);
     SetVirtualKey(keys, stateBytes, DIK_LEFT,
-        controller.thumbstick[0][0] < -movementThreshold);
+        menuNavigation.left);
     SetVirtualKey(keys, stateBytes, DIK_D,
-        (!cameraModLoaded &&
-            moveX > movementThreshold));
+        (!gameplayInputActive && menuNavigation.right) ||
+        (gameplayInputActive &&
+            (!cameraModLoaded || !cameraRelativeForward) &&
+            moveX > movementThreshold) ||
+        (roomscaleMovement & SH3VR_ROOMSCALE_RIGHT) != 0);
     SetVirtualKey(keys, stateBytes, DIK_RIGHT,
-        controller.thumbstick[0][0] > movementThreshold);
+        menuNavigation.right);
     SetVirtualKey(keys, stateBytes, DIK_Q,
-        cameraModLoaded
-            ? moveX < -movementThreshold ||
-                (roomscaleMovement & SH3VR_ROOMSCALE_LEFT) != 0
-            : controller.thumbstick[1][0] < -turnThreshold);
+        (!gameplayInputActive && menuNavigation.left) ||
+        (gameplayInputActive && !cameraModLoaded &&
+            controller.thumbstick[1][0] < -turnThreshold));
     SetVirtualKey(keys, stateBytes, DIK_E,
-        cameraModLoaded
-            ? moveX > movementThreshold ||
-                (roomscaleMovement & SH3VR_ROOMSCALE_RIGHT) != 0
-            : controller.thumbstick[1][0] > turnThreshold);
+        (!gameplayInputActive && menuNavigation.right) ||
+        (gameplayInputActive && !cameraModLoaded &&
+            controller.thumbstick[1][0] > turnThreshold));
 
     SetVirtualKey(keys, stateBytes, DIK_SPACE,
         (buttons & SH3VR_BUTTON_A) != 0);
@@ -1615,7 +1752,8 @@ static HRESULT STDMETHODCALLTYPE HookedCreateDevice(void* directInput,
 static void LogModulePresence(const char* name)
 {
     const bool loaded = GetModuleHandleA(name) != nullptr;
-    Log("  module %-28s : %s", name, loaded ? "LOADED" : "absent");
+    Log("  module %-28s : %s", name,
+        loaded ? "LOADED" : "not loaded yet");
 }
 
 void VR_Bootstrap()

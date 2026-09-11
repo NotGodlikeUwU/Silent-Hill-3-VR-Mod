@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "shared_frame.h"
+#include "parallel_copy.h"
 #include "runtime_selection.h"
 
 using Microsoft::WRL::ComPtr;
@@ -58,6 +59,7 @@ struct HostSettings
     // Drawn by the D3D11 OpenXR compositor, after the game image for each eye.
     // This deliberately never touches the legacy D3D8 state used by hands.
     bool controllerOrientationDebug = false;
+    bool multicoreRendering = true;
 };
 
 HostSettings g_settings = {};
@@ -124,6 +126,8 @@ void LoadSettings()
         L"EnableGamePostProcess", 0, path);
     const UINT controllerOrientationDebug = GetPrivateProfileIntW(L"Debug",
         L"ControllerOrientationOverlay", 0, path);
+    const UINT multicoreRendering = GetPrivateProfileIntW(L"Performance",
+        L"MulticoreRendering", 1, path);
     if ((width == 0 && height == 0) ||
         (width >= 64 && width <= 4096 && height >= 64 && height <= 4096))
     {
@@ -154,6 +158,7 @@ void LoadSettings()
     g_settings.enableColorCorrection = enableColorCorrection != 0;
     g_settings.enableGamePostProcess = enableGamePostProcess != 0;
     g_settings.controllerOrientationDebug = controllerOrientationDebug != 0;
+    g_settings.multicoreRendering = multicoreRendering != 0;
     g_settings.exposureStops = ReadIniFloat(path, L"Image", L"ExposureStops",
         -1.5f, -4.0f, 2.0f);
     g_settings.contrast = ReadIniFloat(path, L"Image", L"Contrast",
@@ -191,6 +196,9 @@ void LoadSettings()
         g_settings.gamePostProcessExposureStops);
     Log("Debug: ControllerOrientationOverlay=%u (host compositor)",
         g_settings.controllerOrientationDebug ? 1u : 0u);
+    Log("Performance: MulticoreRendering=%u; CPU stereo-pair copies %s",
+        g_settings.multicoreRendering ? 1u : 0u,
+        g_settings.multicoreRendering ? "use two cores" : "are single-threaded");
 }
 
 void Log(const char* format, ...)
@@ -268,6 +276,7 @@ class SharedFrameConsumer
 public:
     ~SharedFrameConsumer()
     {
+        m_copyWorker.Shutdown();
         Close();
     }
 
@@ -349,8 +358,18 @@ public:
                 for (std::size_t eye = 0; eye < pixels.size(); ++eye)
                 {
                     pixels[eye].resize(byteCount);
-                    std::memcpy(pixels[eye].data(),
-                        m_slots + eye * SH3VR_SLOT_BYTES, byteCount);
+                }
+                const bool copiedOnTwoCores = m_copyWorker.CopyPair(
+                    pixels[0].data(), metadata.pitch, m_slots, metadata.pitch,
+                    pixels[1].data(), metadata.pitch,
+                    m_slots + SH3VR_SLOT_BYTES, metadata.pitch,
+                    metadata.pitch, metadata.height,
+                    g_settings.multicoreRendering);
+                if (copiedOnTwoCores && !m_multicoreCopyLogged)
+                {
+                    m_multicoreCopyLogged = true;
+                    Log("Multicore rendering active: host CPU stereo copies "
+                        "use the OpenXR thread and one Windows thread-pool worker");
                 }
             }
             else
@@ -563,6 +582,8 @@ private:
     Sh3VrFrameHeader* m_header = nullptr;
     const std::uint8_t* m_slots = nullptr;
     std::int32_t m_lastFrame = 0;
+    Sh3VrParallelCopyWorker m_copyWorker;
+    bool m_multicoreCopyLogged = false;
 };
 
 struct EyeSwapchain
@@ -1641,7 +1662,7 @@ private:
                 ++applied;
             }
         }
-        Log("Damage haptics request %d: applied to %u controller(s), %.2f s, "
+        Log("Haptics request %d: applied to %u controller(s), %.2f s, "
             "amplitude %.2f", request.sequence, applied, durationSeconds,
             vibration.amplitude);
     }

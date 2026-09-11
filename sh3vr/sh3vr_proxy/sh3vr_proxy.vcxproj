@@ -146,6 +146,7 @@
     <ClInclude Include="..\..\thirds\minhook-master\src\buffer.h" />
     <ClInclude Include="..\..\thirds\minhook-master\src\trampoline.h" />
     <ClInclude Include="..\common\shared_frame.h" />
+    <ClInclude Include="..\common\parallel_copy.h" />
     <ClInclude Include="framework.h" />
     <ClInclude Include="pch.h" />
     <ClInclude Include="exports.h" />

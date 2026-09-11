@@ -17,6 +17,10 @@
 ; These values are independent from every weapon profile below.
 [LeftHand]
 Enabled=1
+; Set to 0 for fixed neutral hand lighting (environment and flashlight adaptation off).
+AdaptiveLighting=1
+; Environment-light samples per second. Valid range: 1-60.
+LightingUpdateHz=20
 ScalePercent=100
 PositionX=0
 PositionY=0

@@ -12,6 +12,7 @@ $solutionHostPath = Join-Path $repositoryRoot "sh3vr_host64\x64\$Configuration\s
 $legacyHostPath = Join-Path $repositoryRoot "sh3vr_host64\build-vs18\$Configuration\sh3vr_host64.exe"
 $configPath = Join-Path $repositoryRoot 'sh3vr.ini.example'
 $weaponConfigPath = Join-Path $repositoryRoot 'sh3vr_weapons.ini.example'
+$configToolPath = Join-Path $repositoryRoot 'sh3vr_config\bin\Release\SH3VRConfig.exe'
 $assetSourcePath = Join-Path $repositoryRoot 'sh3vr\sh3vr_assets'
 
 if (-not (Test-Path -LiteralPath $proxyPath)) {
@@ -32,6 +33,9 @@ if (-not (Test-Path -LiteralPath $configPath)) {
 if (-not (Test-Path -LiteralPath $weaponConfigPath)) {
     throw "Weapon configuration template not found: $weaponConfigPath"
 }
+if (-not (Test-Path -LiteralPath $configToolPath)) {
+    throw "Configuration tool not found: $configToolPath"
+}
 if (-not (Test-Path -LiteralPath $assetSourcePath)) {
     throw "Runtime asset directory not found: $assetSourcePath"
 }
@@ -42,6 +46,7 @@ Copy-Item -LiteralPath $proxyPath -Destination (Join-Path $stage 'dinput8.dll') 
 Copy-Item -LiteralPath $hostPath -Destination (Join-Path $stage 'sh3vr_host64.exe') -Force
 Copy-Item -LiteralPath $configPath -Destination (Join-Path $stage 'sh3vr.ini') -Force
 Copy-Item -LiteralPath $weaponConfigPath -Destination (Join-Path $stage 'sh3vr_weapons.ini') -Force
+Copy-Item -LiteralPath $configToolPath -Destination (Join-Path $stage 'SH3VRConfig.exe') -Force
 $assetDestinationPath = Join-Path $stage 'sh3vr_assets'
 New-Item -ItemType Directory -Force -Path $assetDestinationPath | Out-Null
 Get-ChildItem -LiteralPath $assetSourcePath -File | Copy-Item -Destination $assetDestinationPath -Force
@@ -55,6 +60,8 @@ $hashLines += ((Get-FileHash -Algorithm SHA256 (
     Join-Path $stage 'sh3vr.ini')).Hash + '  sh3vr.ini')
 $hashLines += ((Get-FileHash -Algorithm SHA256 (
     Join-Path $stage 'sh3vr_weapons.ini')).Hash + '  sh3vr_weapons.ini')
+$hashLines += ((Get-FileHash -Algorithm SHA256 (
+    Join-Path $stage 'SH3VRConfig.exe')).Hash + '  SH3VRConfig.exe')
 Get-ChildItem -LiteralPath $assetDestinationPath -File | Sort-Object Name | ForEach-Object {
     $hashLines += ((Get-FileHash -Algorithm SHA256 $_.FullName).Hash +
         ('  sh3vr_assets/{0}' -f $_.Name))

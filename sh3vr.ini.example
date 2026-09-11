@@ -25,6 +25,16 @@ Contrast=1.0
 Saturation=1.0
 VignetteStrength=0.5
 
+[Performance]
+; Enable the PC Fix D3D12 backend before D3D8 starts when the matching x86
+; D3D9On12 system component is available. This avoids the slow GPU-to-CPU
+; stereo fallback. Set to 0 only when troubleshooting PC Fix compatibility.
+AutoEnablePcFixD3D12=1
+; Parallelize the two large CPU eye-frame memory transfers when the automatic
+; D3D8 compatibility transport is active. Graphics API calls stay on the game
+; render thread for stability. Set to 0 only for troubleshooting.
+MulticoreRendering=1
+
 [Timing]
 ; Stable PC Fix timing path. Do not enable the experimental alternatives
 ; unless you are testing a matching development build.
@@ -83,10 +93,10 @@ CameraModSnapTurnDegrees=45
 ; Smooth-turn maximum angular speed and radial stick deadzone.
 CameraModSmoothTurnSpeed=120
 CameraModSmoothTurnDeadzone=20
-; Duration of the brief forward alignment input sent after each Camera Mod
-; snap, or once after smooth turning stops. It uses Camera Mod's regular 2D
-; movement path to align Heather.
-CameraModCharacterAlignMilliseconds=34
+; Keep Heather's locomotion heading synchronized with Camera Mod yaw. This
+; turns left/right into camera-relative lateral strafe instead of rotating
+; Heather and her flashlight toward the movement direction.
+CameraRelativeStrafe=1
 
 [MotionControls]
 ; Hold the game's aim state automatically while the right trigger fires.
@@ -117,6 +127,11 @@ WeaponPoseAbsolutePosition=1
 ; Keep HMD, weapon, and hand tracking on one OpenXR prediction per game frame.
 ; This prevents tracked meshes from flickering and removes pose micro-jumps.
 FrameCoherentTrackedMeshes=1
+; Apply a medium-strength recoil pulse to the right controller for each
+; confirmed firearm discharge. Automatic fire follows the native shot cadence.
+FirearmHaptics=1
+FirearmHapticsDurationMs=80
+FirearmHapticsAmplitudePercent=50
 ; Per-weapon size, position, and rotation are configured in
 ; sh3vr_weapons.ini.
 ; Detect right-hand grip velocity and inject one normal game attack pulse.

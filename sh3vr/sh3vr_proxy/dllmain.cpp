@@ -106,6 +106,75 @@ static void CloseLog()
     }
 }
 
+// The PC Fix selects its rendering backend before the game creates D3D8.
+// Configure it while our proxy is still attaching so installations that kept
+// the PC Fix default do not silently fall back to two synchronous GPU readbacks
+// per VR frame. D3D9On12 remains an operating-system component; copying a DLL
+// from another Windows build next to the game would be ABI-unsafe.
+static void ConfigurePcFixD3D12Transport()
+{
+    wchar_t gamePath[MAX_PATH] = {};
+    if (GetModuleFileNameW(g_selfModule, gamePath, MAX_PATH) == 0)
+        return;
+
+    wchar_t* slash = wcsrchr(gamePath, L'\\');
+    if (!slash)
+        return;
+    slash[1] = L'\0';
+
+    wchar_t vrIniPath[MAX_PATH] = {};
+    lstrcpyW(vrIniPath, gamePath);
+    lstrcatW(vrIniPath, L"sh3vr.ini");
+    const bool autoEnable = GetPrivateProfileIntW(L"Performance",
+        L"AutoEnablePcFixD3D12", 1, vrIniPath) != 0;
+    if (!autoEnable)
+    {
+        Log("PC Fix D3D12 transport auto-configuration disabled by sh3vr.ini");
+        return;
+    }
+
+    wchar_t systemPath[MAX_PATH] = {};
+    const UINT systemLength = GetSystemDirectoryW(systemPath, MAX_PATH);
+    if (systemLength == 0 || systemLength >= MAX_PATH - 16)
+        return;
+    lstrcatW(systemPath, L"\\d3d9on12.dll");
+    if (GetFileAttributesW(systemPath) == INVALID_FILE_ATTRIBUTES)
+    {
+        Log("System x86 D3D9On12 is unavailable; PC Fix D3D12 transport "
+            "cannot be enabled safely");
+        return;
+    }
+
+    wchar_t pcFixIniPath[MAX_PATH] = {};
+    lstrcpyW(pcFixIniPath, gamePath);
+    lstrcatW(pcFixIniPath, L"Silent_Hill_3_PC_Fix.ini");
+    const UINT hookDx = GetPrivateProfileIntW(L"DirectX", L"HookDX", 0,
+        pcFixIniPath);
+    const UINT useDirectX12 = GetPrivateProfileIntW(L"DirectX",
+        L"UseDirectX12", 0, pcFixIniPath);
+    if (hookDx != 0 && useDirectX12 != 0)
+    {
+        Log("PC Fix D3D12 transport is enabled; system x86 D3D9On12 is available");
+        return;
+    }
+
+    const BOOL hookWritten = WritePrivateProfileStringW(L"DirectX",
+        L"HookDX", L"1", pcFixIniPath);
+    const BOOL d3d12Written = WritePrivateProfileStringW(L"DirectX",
+        L"UseDirectX12", L"1", pcFixIniPath);
+    WritePrivateProfileStringW(nullptr, nullptr, nullptr, pcFixIniPath);
+    if (hookWritten && d3d12Written)
+    {
+        Log("Enabled PC Fix HookDX=1 and UseDirectX12=1 before D3D8 startup; "
+            "system x86 D3D9On12 is available");
+    }
+    else
+    {
+        Log("Failed to enable PC Fix D3D12 transport in "
+            "Silent_Hill_3_PC_Fix.ini, error %u", GetLastError());
+    }
+}
+
 // =============================================================================
 //  Hidden x64 OpenXR companion
 // =============================================================================
@@ -262,6 +331,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
 
         OpenLog();
         Log("=== sh3vr proxy attached, pid %u ===", GetCurrentProcessId());
+
+        ConfigurePcFixD3D12Transport();
 
         // The d3d8 wrapper creates its device very early, long before VrThread
         // could ever run. Hook its factory export right now, while the process

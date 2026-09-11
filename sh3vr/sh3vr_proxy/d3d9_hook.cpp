@@ -62,6 +62,7 @@ extern void InputBridge_ObserveFlashlightEnabled();
 extern void Interop8_GrabFrame(struct IDirect3DDevice8* device);
 extern void Interop8_OnDeviceReset();
 extern void Interop8_Shutdown();
+extern void Interop8_SetMulticoreRendering(bool enabled);
 extern bool Interop8_ReadHeadPose(Sh3VrHeadPose* output);
 extern bool Interop8_ReadRuntimeIpd(float* outputMeters);
 extern bool Interop8_ReadControllerState(Sh3VrControllerState* state);
@@ -83,6 +84,8 @@ extern void Interop8_SetWeaponDebugOrientation(bool valid,
     float rollDegrees);
 extern void Interop8_SetLeftHandDebugOrientation(bool valid,
     float pitchDegrees, float yawDegrees, float rollDegrees);
+extern void Interop8_RequestHaptics(std::uint32_t handMask, float amplitude,
+    float durationSeconds, float frequency);
 extern bool Interop8_ReadProjectionUvRects(float eyeRects[2][4]);
 extern bool Interop8_GetRequestedEyeResolution(std::uint32_t* width,
     std::uint32_t* height, std::uint32_t* sampleCount);
@@ -274,6 +277,8 @@ typedef HRESULT(STDMETHODCALLTYPE* PFN_D3D12_CreatePlacedResource)(
 typedef HRESULT(STDMETHODCALLTYPE* PFN_DXGI_Present)(IDXGISwapChain*, UINT,
     UINT);
 typedef void(__cdecl* PFN_SH3_RenderFrame)();
+typedef void(__cdecl* PFN_SH3_AdjustMovementVector)(float* first,
+    float* second);
 typedef HRESULT(WINAPI* PFN8_CreateRenderTarget)(IDirect3DDevice8*, UINT, UINT,
     DWORD, DWORD, BOOL, IDirect3DSurface8**);
 typedef HRESULT(WINAPI* PFN8_CreateDepthStencilSurface)(IDirect3DDevice8*, UINT,
@@ -352,6 +357,7 @@ static PFN_SH3_RenderFrame o_SH3_RenderFrame = nullptr;
 static PFN_SH3_RenderFrame o_SH3_PrepareFrame = nullptr;
 static PFN_SH3_RenderFrame o_SH3_RenderComposite = nullptr;
 static PFN_SH3_RenderFrame o_SH3_PostFrame = nullptr;
+static PFN_SH3_AdjustMovementVector o_SH3_AdjustMovementVector = nullptr;
 
 // -----------------------------------------------------------------------------
 //  State
@@ -646,6 +652,7 @@ static bool g_loggedGameNoiseStereo8 = false;
 static float g_leftHandSceneLightScale8 = 1.0f;
 static float g_leftHandSceneLightColor8[3] = { 1.0f, 1.0f, 1.0f };
 static bool g_leftHandSceneLightValid8 = false;
+static bool g_loggedLeftHandSceneLighting8 = false;
 static bool g_loggedScreenSpaceState8[32] = {};
 static LONG g_screenSpaceStateLogCount8 = 0;
 static IDirect3DBaseTexture8* g_currentTextures8[8] = {};
@@ -751,8 +758,17 @@ static float g_cameraModSnapTurnActivation8 = 0.65f;
 static float g_cameraModSnapTurnDegrees8 = 45.0f;
 static float g_cameraModSmoothTurnDeadzone8 = 0.20f;
 static float g_cameraModSmoothTurnDegreesPerSecond8 = 120.0f;
-static DWORD g_cameraModCharacterAlignMilliseconds8 = 34;
-static volatile LONG g_cameraModCharacterAlignEndTick8 = 0;
+static bool g_enableCameraRelativeStrafe8 = true;
+static LONG g_cameraModHeadingSyncPresent8 = -1;
+static LONG g_cameraModHeadingSyncLogCount8 = 0;
+static volatile LONG g_cameraModLastRenderHeadingBits8 = 0;
+static volatile LONG g_cameraModLastRenderHeadingValid8 = 0;
+static volatile LONG g_cameraModPendingMovementHeadingBits8 = 0;
+static volatile LONG g_cameraModPendingLocalRightBits8 = 0;
+static volatile LONG g_cameraModPendingLocalForwardBits8 = 0;
+static volatile LONG g_cameraModPendingMovementActive8 = 0;
+static LONG g_cameraModMovementVectorLogCount8 = 0;
+static int g_cameraModForwardAxisSign8 = 0;
 static bool g_autoLoadCameraModFirstPerson8 = true;
 static bool g_cameraModAutoLoadDone8 = false;
 // Rendering alone does not identify gameplay: native demos render stereo too.
@@ -1034,6 +1050,9 @@ static volatile LONG g_muzzleSmokeStartTick8 = 0;
 static volatile LONG g_muzzleSmokeUntilTick8 = 0;
 static bool g_muzzleSmokeLogged8 = false;
 static bool g_muzzleSmokeNativeSuppressionLogged8 = false;
+static bool g_enableFirearmHaptics8 = true;
+static float g_firearmHapticsAmplitude8 = 0.5f;
+static float g_firearmHapticsDurationSeconds8 = 0.08f;
 static ULONGLONG g_weaponIniLastPollTick8 = 0;
 static ULONGLONG g_weaponIniReloadAfterTick8 = 0;
 static FILETIME g_weaponIniObservedWriteTime8 = {};
@@ -1043,6 +1062,8 @@ static bool g_weaponIniReloadPending8 = false;
 struct LeftHandPoseProfile8
 {
     bool enabled;
+    bool adaptiveLighting;
+    int lightingUpdateHz;
     float position[3];
     float pitchRadians;
     float yawRadians;
@@ -1713,7 +1734,13 @@ static void LoadLeftHandPoseProfile8()
 {
     constexpr float degreesToRadians = 0.01745329251994329577f;
     LeftHandPoseProfile8& profile = g_leftHandPoseProfile8;
+    const bool previousAdaptiveLighting = profile.adaptiveLighting;
+    const int previousLightingUpdateHz = profile.lightingUpdateHz;
     profile.enabled = ReadWeaponIniIntSetting("LeftHand", "Enabled", 1) != 0;
+    profile.adaptiveLighting = ReadWeaponIniIntSetting("LeftHand",
+        "AdaptiveLighting", 1) != 0;
+    profile.lightingUpdateHz = std::clamp(ReadWeaponIniIntSetting("LeftHand",
+        "LightingUpdateHz", 20), 1, 60);
     profile.position[0] = static_cast<float>(std::clamp(
         ReadWeaponIniIntSetting("LeftHand", "PositionX", 0), -300, 300));
     profile.position[1] = static_cast<float>(std::clamp(
@@ -1732,6 +1759,23 @@ static void LoadLeftHandPoseProfile8()
     profile.yawRadians = static_cast<float>(yawDegrees) * degreesToRadians;
     profile.rollRadians = static_cast<float>(rollDegrees) * degreesToRadians;
     profile.scale = static_cast<float>(scalePercent) / 100.0f;
+
+    if (previousAdaptiveLighting != profile.adaptiveLighting ||
+        previousLightingUpdateHz != profile.lightingUpdateHz)
+    {
+        g_loggedLeftHandSceneLighting8 = false;
+    }
+    if (!profile.adaptiveLighting)
+    {
+        g_leftHandSceneLightScale8 = 1.0f;
+        for (float& channel : g_leftHandSceneLightColor8)
+            channel = 1.0f;
+        g_leftHandSceneLightValid8 = true;
+    }
+    else if (!previousAdaptiveLighting)
+    {
+        g_leftHandSceneLightValid8 = false;
+    }
 }
 
 static void ApplyActiveWeaponPoseProfileValues8()
@@ -1810,6 +1854,12 @@ static void PollWeaponIniHotReload8()
     LoadWeaponPoseProfiles8();
     LoadLeftHandPoseProfile8();
     ApplyActiveWeaponPoseProfileValues8();
+
+    Log("LeftHand: live-reloaded sh3vr_weapons.ini; enabled=%d, adaptive "
+        "lighting=%d, update rate=%d Hz",
+        g_leftHandPoseProfile8.enabled ? 1 : 0,
+        g_leftHandPoseProfile8.adaptiveLighting ? 1 : 0,
+        g_leftHandPoseProfile8.lightingUpdateHz);
 
     if (g_activeWeaponPoseProfile8 >= 0 &&
         g_activeWeaponPoseProfile8 < SH3VR_WEAPON_PROFILE_COUNT8)
@@ -1978,16 +2028,6 @@ std::uint32_t D3D9Hook_GetRoomscaleMovementMask()
         SH3VR_ROOMSCALE_NONE));
 }
 
-bool D3D9Hook_GetCameraModCharacterAlignForward()
-{
-    const DWORD endTick = static_cast<DWORD>(InterlockedCompareExchange(
-        &g_cameraModCharacterAlignEndTick8, 0, 0));
-    const DWORD now = GetTickCount();
-    if (static_cast<LONG>(endTick - now) <= 0)
-        return false;
-    return true;
-}
-
 static bool ReadProcessBytes(const BYTE* address, BYTE* output, SIZE_T size)
 {
     SIZE_T bytesRead = 0;
@@ -2062,7 +2102,14 @@ static void UpdateGamePostProcessState8()
     // Until the first small backbuffer lighting sample is available, retain
     // the location-specific post-process multiplier as a conservative
     // fallback. Afterwards the hand follows the actual illuminated scene.
-    if (!g_leftHandSceneLightValid8)
+    if (!g_leftHandPoseProfile8.adaptiveLighting)
+    {
+        g_leftHandSceneLightScale8 = 1.0f;
+        for (float& channel : g_leftHandSceneLightColor8)
+            channel = 1.0f;
+        g_leftHandSceneLightValid8 = true;
+    }
+    else if (!g_leftHandSceneLightValid8)
     {
         g_leftHandSceneLightScale8 = (std::min)(1.0f,
             (std::max)(0.0f, postProcessLight));
@@ -6163,15 +6210,21 @@ bool D3D9Hook_GetFirearmAimRay(std::uint8_t gameWeapon,
     float orientation[4] = {};
     float localPosition[3] = {};
     if (!ReadRightHandRelativePoseForWeapon8(orientation, localPosition) ||
-        !g_haveFlashlightViewPair8)
+        (!g_haveMotionCombatView8 && !g_haveFlashlightViewPair8))
     {
         return false;
     }
 
+    // Damage and the reticle use the same centre-eye shader camera as the
+    // tracked weapon. The legacy flashlight view can still contain Heather's
+    // base camera and would rotate the hit ray away from the visible gun.
+    const D3DMATRIX& combatView = g_haveMotionCombatView8
+        ? g_motionCombatView8
+        : g_flashlightVrView8;
     D3DMATRIX inverseVrView = {};
-    if (!InvertD3D8Matrix(g_flashlightVrView8, inverseVrView))
+    if (!InvertD3D8Matrix(combatView, inverseVrView))
         return false;
-    const bool rowVectorView = IsMainCameraView(g_flashlightVrView8);
+    const bool rowVectorView = IsMainCameraView(combatView);
 
     const WeaponPoseProfile8& profile = g_weaponPoseProfiles8[profileIndex];
     const float weaponWorldCompensation = g_worldScale8 /
@@ -6324,12 +6377,19 @@ void D3D9Hook_NotifyFirearmDischarge()
     PollWeaponIniHotReload8();
     const WeaponPoseProfile8& profile =
         g_weaponPoseProfiles8[profileIndex];
-    if (!profile.showMuzzleFlash && !profile.showMuzzleSmoke)
+    if (!profile.showMuzzleFlash && !profile.showMuzzleSmoke &&
+        !g_enableFirearmHaptics8)
         return;
 
     InterlockedExchange(&g_muzzleFlashLastPulseTick8,
         static_cast<LONG>(now));
     InterlockedExchange(&g_muzzleFlashLastPulseProfile8, profileIndex);
+    if (g_enableFirearmHaptics8)
+    {
+        Interop8_RequestHaptics(SH3VR_HAPTIC_RIGHT_HAND,
+            g_firearmHapticsAmplitude8,
+            g_firearmHapticsDurationSeconds8, 0.0f);
+    }
     if (profile.showMuzzleFlash)
     {
         InterlockedExchange(&g_muzzleFlashProfile8, profileIndex);
@@ -6468,6 +6528,281 @@ static bool ReadCameraModYaw(float* yawOutput)
     }
 
     *yawOutput = *cameraYaw;
+    return true;
+}
+
+static float NormalizeHeadingRadians(float angle)
+{
+    constexpr float pi = 3.14159265358979323846f;
+    constexpr float tau = 6.28318530717958647692f;
+    while (angle > pi)
+        angle -= tau;
+    while (angle < -pi)
+        angle += tau;
+    return angle;
+}
+
+static bool GetHeatherAndCameraModHeading(const D3DMATRIX& baseView,
+    BYTE** playerOutput, float* headingOutput, float* cameraModYawOutput)
+{
+    if (!playerOutput || !headingOutput || !cameraModYawOutput)
+        return false;
+
+    float cameraModYawDegrees = 0.0f;
+    if (!ReadCameraModYaw(&cameraModYawDegrees) ||
+        !IsMainCameraView(baseView))
+        return false;
+
+    BYTE* executable = reinterpret_cast<BYTE*>(GetModuleHandleA(nullptr));
+    if (!executable)
+        return false;
+    auto** playerPointer = reinterpret_cast<BYTE**>(
+        executable + (0x0712C100u - 0x00400000u));
+    if (!IsWritableMemoryRange(playerPointer, sizeof(*playerPointer)) ||
+        !*playerPointer)
+        return false;
+
+    BYTE* player = *playerPointer;
+    if (!IsWritableMemoryRange(player, 0x90u))
+        return false;
+    const std::uint16_t characterKind =
+        *reinterpret_cast<const std::uint16_t*>(player + 0x80u);
+    const float currentYaw = *reinterpret_cast<const float*>(player + 0x14u);
+    if (characterKind != 0x0100u || !std::isfinite(currentYaw))
+        return false;
+
+    D3DMATRIX cameraWorld = {};
+    if (!InvertD3D8Matrix(baseView, cameraWorld))
+        return false;
+    const float forwardX = cameraWorld.m[2][0];
+    const float forwardZ = cameraWorld.m[2][2];
+    const float horizontalLength = std::sqrt(
+        forwardX * forwardX + forwardZ * forwardZ);
+    if (!std::isfinite(horizontalLength) || horizontalLength < 0.001f)
+        return false;
+
+    float targetYaw = std::atan2(forwardX / horizontalLength,
+        forwardZ / horizontalLength);
+    constexpr float pi = 3.14159265358979323846f;
+    if (g_cameraModForwardAxisSign8 == 0)
+    {
+        const float oppositeYaw = NormalizeHeadingRadians(targetYaw + pi);
+        g_cameraModForwardAxisSign8 =
+            std::fabs(NormalizeHeadingRadians(oppositeYaw - currentYaw)) <
+            std::fabs(NormalizeHeadingRadians(targetYaw - currentYaw))
+                ? -1 : 1;
+    }
+    if (g_cameraModForwardAxisSign8 < 0)
+        targetYaw = NormalizeHeadingRadians(targetYaw + pi);
+
+    *playerOutput = player;
+    *headingOutput = targetYaw;
+    *cameraModYawOutput = cameraModYawDegrees;
+    return true;
+}
+
+static bool SetHeatherHeading(BYTE* player, float targetYaw)
+{
+    BYTE* executable = reinterpret_cast<BYTE*>(GetModuleHandleA(nullptr));
+    if (!executable || !player)
+        return false;
+    using SetCharacterYawFn = void(__cdecl*)(void*, float);
+    const auto setCharacterYaw = reinterpret_cast<SetCharacterYawFn>(
+        executable + (0x004737F0u - 0x00400000u));
+    __try
+    {
+        setCharacterYaw(player, NormalizeHeadingRadians(targetYaw));
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+    return true;
+}
+
+static LONG EncodeFloatBits(float value)
+{
+    LONG bits = 0;
+    static_assert(sizeof(bits) == sizeof(value), "float/LONG size mismatch");
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+static float DecodeFloatBits(LONG bits)
+{
+    float value = 0.0f;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+bool D3D9Hook_IsGameplayInputActive()
+{
+    // Event mode 5 is SH3's playable update. Pair it with a recently observed
+    // immersive frame so stale state cannot route menu input into locomotion.
+    return g_cameraModEventGameplayReady8 && g_previousImmersiveFrame8;
+}
+
+bool D3D9Hook_ApplyCameraRelativeMovementHeading(float localRight,
+    float localForward)
+{
+    const float magnitudeSquared = localRight * localRight +
+        localForward * localForward;
+    if (!g_enableCameraRelativeStrafe8 ||
+        !D3D9Hook_IsGameplayInputActive() ||
+        !std::isfinite(magnitudeSquared) || magnitudeSquared < 0.01f)
+    {
+        InterlockedExchange(&g_cameraModPendingMovementActive8, 0);
+        return false;
+    }
+
+    // DirectInput is polled before SH3 has necessarily submitted this frame's
+    // view transform. Consume the last camera heading validated by the render
+    // path rather than requiring transient render state in the input callback.
+    if (InterlockedCompareExchange(
+            &g_cameraModLastRenderHeadingValid8, 0, 0) == 0)
+    {
+        InterlockedExchange(&g_cameraModPendingMovementActive8, 0);
+        return false;
+    }
+
+    const float cameraHeading = DecodeFloatBits(InterlockedCompareExchange(
+        &g_cameraModLastRenderHeadingBits8, 0, 0));
+    if (!std::isfinite(cameraHeading))
+    {
+        InterlockedExchange(&g_cameraModPendingMovementActive8, 0);
+        return false;
+    }
+
+    const float movementOffset = std::atan2(localRight, localForward);
+    const float movementHeading = NormalizeHeadingRadians(
+        cameraHeading + movementOffset);
+    InterlockedExchange(&g_cameraModPendingMovementHeadingBits8,
+        EncodeFloatBits(movementHeading));
+    InterlockedExchange(&g_cameraModPendingLocalRightBits8,
+        EncodeFloatBits(localRight));
+    InterlockedExchange(&g_cameraModPendingLocalForwardBits8,
+        EncodeFloatBits(localForward));
+    // Publish active last so the native movement-vector hook never consumes a
+    // partial sample when input and rendering happen on different threads.
+    InterlockedExchange(&g_cameraModPendingMovementActive8, 1);
+    return true;
+}
+
+static void __cdecl hk_SH3_AdjustMovementVector(float* first, float* second)
+{
+    BYTE* player = nullptr;
+    float originalX = 0.0f;
+    float originalZ = 0.0f;
+    float rotatedX = 0.0f;
+    float rotatedZ = 0.0f;
+    bool rotated = false;
+    if (g_enableCameraRelativeStrafe8 &&
+        InterlockedCompareExchange(
+            &g_cameraModPendingMovementActive8, 0, 0) != 0 &&
+        g_previousImmersiveFrame8)
+    {
+        BYTE* executable = reinterpret_cast<BYTE*>(GetModuleHandleA(nullptr));
+        BYTE** playerAddress = executable
+            ? reinterpret_cast<BYTE**>(executable +
+                (0x0712C100u - 0x00400000u))
+            : nullptr;
+        player = IsWritableMemoryRange(playerAddress,
+            sizeof(*playerAddress)) ? *playerAddress : nullptr;
+        if (IsWritableMemoryRange(player, 0x124u))
+        {
+            const std::uint16_t characterKind =
+                *reinterpret_cast<const std::uint16_t*>(player + 0x80u);
+            const float requestedHeading = DecodeFloatBits(
+                InterlockedCompareExchange(
+                    &g_cameraModPendingMovementHeadingBits8, 0, 0));
+            originalX = *reinterpret_cast<const float*>(player + 0xF0u);
+            originalZ = *reinterpret_cast<const float*>(player + 0xF8u);
+            const float horizontalSpeed = std::sqrt(
+                originalX * originalX + originalZ * originalZ);
+            if (characterKind == 0x0100u &&
+                std::isfinite(requestedHeading) &&
+                std::isfinite(horizontalSpeed) && horizontalSpeed > 0.000001f)
+            {
+                // SH3 has already selected the normal forward locomotion state
+                // and calculated its full native speed. Rotate that vector,
+                // preserving its length, before slope/collision adjustment and
+                // position integration. This avoids the stock 90/180-degree
+                // turn-speed penalties for lateral and backward stick input.
+                rotatedX = std::sin(requestedHeading) * horizontalSpeed;
+                rotatedZ = std::cos(requestedHeading) * horizontalSpeed;
+                *reinterpret_cast<float*>(player + 0xF0u) = rotatedX;
+                *reinterpret_cast<float*>(player + 0xF8u) = rotatedZ;
+                rotated = true;
+            }
+        }
+    }
+
+    o_SH3_AdjustMovementVector(first, second);
+
+    if (rotated)
+    {
+        const LONG count = InterlockedIncrement(
+            &g_cameraModMovementVectorLogCount8);
+        if (count <= 12 || count % 1800 == 0)
+        {
+            const float localRight = DecodeFloatBits(InterlockedCompareExchange(
+                &g_cameraModPendingLocalRightBits8, 0, 0));
+            const float localForward = DecodeFloatBits(InterlockedCompareExchange(
+                &g_cameraModPendingLocalForwardBits8, 0, 0));
+            const float originalLength = std::sqrt(
+                originalX * originalX + originalZ * originalZ);
+            const float rotatedLength = std::sqrt(
+                rotatedX * rotatedX + rotatedZ * rotatedZ);
+            Log("Camera-relative movement vector %d: stick right/forward "
+                "x1000 %d/%d, native/rotated speed x1000000 %d/%d",
+                count,
+                static_cast<int>(std::lround(localRight * 1000.0f)),
+                static_cast<int>(std::lround(localForward * 1000.0f)),
+                static_cast<int>(std::lround(originalLength * 1000000.0f)),
+                static_cast<int>(std::lround(rotatedLength * 1000000.0f)));
+        }
+    }
+}
+
+static bool SynchronizeHeatherHeadingToCameraModView(
+    const D3DMATRIX& baseView)
+{
+    if (!g_enableCameraRelativeStrafe8)
+        return false;
+
+    BYTE* player = nullptr;
+    float targetYaw = 0.0f;
+    float cameraModYawDegrees = 0.0f;
+    if (!GetHeatherAndCameraModHeading(baseView, &player, &targetYaw,
+        &cameraModYawDegrees))
+        return false;
+
+    InterlockedExchange(&g_cameraModLastRenderHeadingBits8,
+        EncodeFloatBits(targetYaw));
+    InterlockedExchange(&g_cameraModLastRenderHeadingValid8, 1);
+
+    const float currentYaw = NormalizeHeadingRadians(
+        *reinterpret_cast<const float*>(player + 0x14u));
+    const float delta = NormalizeHeadingRadians(targetYaw - currentYaw);
+    if (std::fabs(delta) < 0.0005f)
+        return true;
+
+    // Locomotion temporarily points Heather along the requested stick vector.
+    // Once simulation has completed, align the rendered body and flashlight
+    // with Camera Mod. The next movement sample writes both current and
+    // previous simulation headings before native forward locomotion runs.
+    if (!SetHeatherHeading(player, targetYaw))
+        return false;
+
+    const LONG count = InterlockedIncrement(&g_cameraModHeadingSyncLogCount8);
+    if (count == 1 || count % 1800 == 0)
+    {
+        constexpr float radiansToDegrees = 57.2957795130823208768f;
+        Log("Camera-relative render heading sync %d: Heather %.1f -> %.1f "
+            "degrees, Camera Mod yaw %.1f degrees",
+            count, currentYaw * radiansToDegrees,
+            targetYaw * radiansToDegrees, cameraModYawDegrees);
+    }
     return true;
 }
 
@@ -7051,7 +7386,6 @@ static void UpdateCameraModRightStickTurn()
     if (!g_enableCameraModRightStickTurn8 ||
         GetModuleHandleA("OTSMod.dll") == nullptr)
     {
-        InterlockedExchange(&g_cameraModCharacterAlignEndTick8, 0);
         g_cameraModSnapTurnLatched8 = false;
         g_cameraModSmoothTurnActive8 = false;
         g_cameraModLastControllerTime8 = 0;
@@ -7084,17 +7418,7 @@ static void UpdateCameraModRightStickTurn()
         g_cameraModSnapTurnLatched8 = false;
         if (magnitude <= g_cameraModSmoothTurnDeadzone8)
         {
-            // Camera Mod rotates only its detached view. Once continuous
-            // turning stops, use the same short, proven alignment pulse as
-            // snap turn exactly once. Applying it every frame would create
-            // unwanted forward movement while the stick is held.
-            if (g_cameraModSmoothTurnActive8)
-            {
-                g_cameraModSmoothTurnActive8 = false;
-                InterlockedExchange(&g_cameraModCharacterAlignEndTick8,
-                    static_cast<LONG>(GetTickCount() +
-                        g_cameraModCharacterAlignMilliseconds8));
-            }
+            g_cameraModSmoothTurnActive8 = false;
             return;
         }
         if (previousControllerTime == 0 ||
@@ -7162,21 +7486,13 @@ static void UpdateCameraModRightStickTurn()
     if (!ApplyCameraModYawDelta(yawDelta, &cameraModYaw))
         return;
 
-    // Camera Mod rotates only its detached camera. A short forward pulse uses
-    // the mod's proven 2D movement path so the game can align Heather without
-    // writing to an unverified player-orientation address.
-    InterlockedExchange(&g_cameraModCharacterAlignEndTick8,
-        static_cast<LONG>(GetTickCount() +
-            g_cameraModCharacterAlignMilliseconds8));
-
     const LONG count = InterlockedIncrement(&g_cameraModSnapTurnCount8);
     if (count <= 16 || count % 100 == 0)
     {
-        Log("Camera Mod snap turn %d: %s, Camera Mod yaw x10 %d, "
-            "Heather alignment pulse %u ms",
+        Log("Camera Mod snap turn %d: %s, Camera Mod yaw x10 %d; "
+            "direct Heather heading sync enabled",
             count, axis < 0.0f ? "left" : "right",
-            static_cast<int>(std::lround(cameraModYaw * 10.0f)),
-            g_cameraModCharacterAlignMilliseconds8);
+            static_cast<int>(std::lround(cameraModYaw * 10.0f)));
     }
 }
 
@@ -10134,17 +10450,22 @@ static void CaptureLeftHandDesktopWeaponDepth8()
 
 static void UpdateLeftHandSceneLighting8()
 {
-    if (!g_device8)
+    if (!g_device8 || !g_leftHandPoseProfile8.adaptiveLighting)
         return;
 
     // Reading a D3D8 render target synchronizes the GPU. Keep the surface
-    // deliberately tiny, but update often enough that entering a differently
-    // lit room or switching the flashlight does not lag behind the player.
-    static LONG lastSampleFrame = -1000;
-    const LONG presentFrame = InterlockedCompareExchange(&c_present8, 0, 0);
-    if (presentFrame - lastSampleFrame < 5)
+    // deliberately tiny and use a configurable wall-clock interval. Sampling
+    // is capped at 60 Hz because the game cannot provide more than one fresh
+    // desktop scene per rendered frame.
+    static ULONGLONG lastSampleTick = 0;
+    const ULONGLONG now = GetTickCount64();
+    const ULONGLONG sampleIntervalMilliseconds = (std::max)(1ull,
+        1000ull / static_cast<ULONGLONG>(
+            g_leftHandPoseProfile8.lightingUpdateHz));
+    if (lastSampleTick != 0 && now - lastSampleTick <
+        sampleIntervalMilliseconds)
         return;
-    lastSampleFrame = presentFrame;
+    lastSampleTick = now;
 
     IDirect3DSurface8* backBuffer = nullptr;
     if (FAILED(D3D8Slot<PFN8_GetBackBuffer>(g_device8, 16)(g_device8, 0,
@@ -10300,6 +10621,19 @@ static void UpdateLeftHandSceneLighting8()
     }
     g_leftHandSceneLightScale8 = brightness;
     g_leftHandSceneLightValid8 = true;
+    if (!g_loggedLeftHandSceneLighting8)
+    {
+        g_loggedLeftHandSceneLighting8 = true;
+        Log("LeftHand: environment lighting adaptation active at %d Hz; "
+            "RGB x1000 %d/%d/%d",
+            g_leftHandPoseProfile8.lightingUpdateHz,
+            static_cast<int>(std::lround(
+                g_leftHandSceneLightColor8[0] * 1000.0f)),
+            static_cast<int>(std::lround(
+                g_leftHandSceneLightColor8[1] * 1000.0f)),
+            static_cast<int>(std::lround(
+                g_leftHandSceneLightColor8[2] * 1000.0f)));
+    }
 }
 
 static bool LoadLeftHandTexture8(IDirect3DDevice8* device,
@@ -10835,7 +11169,8 @@ static bool DrawLeftHandEye8(std::uint32_t eye, const D3DMATRIX& world)
     // receive the game's fixed-function lights directly. Modulate geometric
     // shading with the color and brightness sampled from that finished scene.
     constexpr float lightDirection[3] = { 0.25f, -0.35f, 0.90f };
-    const bool flashlightActive = InputBridge_IsFlashlightEnabled();
+    const bool flashlightActive = g_leftHandPoseProfile8.adaptiveLighting &&
+        InputBridge_IsFlashlightEnabled();
     if (flashlightActive && !g_loggedLeftHandFlashlight8)
     {
         g_loggedLeftHandFlashlight8 = true;
@@ -11147,10 +11482,10 @@ static bool RenderLeftHandStereo8()
     D3DMATRIX world = {};
     BuildLeftHandWorldMatrix8(orientation, position, &world);
 
-    // Do not read the desktop backbuffer here. CopyRects followed by LockRect
-    // forces a GPU-to-CPU synchronization and used to introduce a visible
-    // hitch every five frames. Location lighting now comes from SH3's live
-    // post-process state, while the flashlight uses its captured projection.
+    // Sample the untouched desktop scene before switching to the native eye
+    // targets and drawing the hand. Frequency and the complete adaptive-light
+    // path are controlled by the hot-reloaded [LeftHand] INI settings.
+    UpdateLeftHandSceneLighting8();
 
     IDirect3DSurface8* originalColor = nullptr;
     IDirect3DSurface8* originalDepth = nullptr;
@@ -11675,6 +12010,27 @@ static bool BuildUiOverlayVertices(const D3D8ViewportLocal& sourceViewport,
     const float left = (targetWidth - sourceWidth * scale) * 0.5f;
     const float top = (targetHeight - sourceHeight * scale) * 0.5f;
 
+    // The host samples each native eye texture through that eye's asymmetric
+    // OpenXR projection rectangle. Preserve its scale correction, but move the
+    // layer centre back to the centre of each source eye. The host crop then
+    // places the left copy toward the nose on the right and the right copy
+    // toward the nose on the left, giving the subtitles a comfortable finite
+    // convergence instead of pushing the copies apart.
+    float eyeRects[2][4] = {};
+    if (!Interop8_ReadProjectionUvRects(eyeRects))
+        return false;
+    const float* rect = eyeRects[eye];
+    const float rectWidth = rect[2] - rect[0];
+    const float rectHeight = rect[3] - rect[1];
+    if (!std::isfinite(rect[0]) || !std::isfinite(rect[1]) ||
+        !std::isfinite(rect[2]) || !std::isfinite(rect[3]) ||
+        rectWidth <= 0.01f || rectHeight <= 0.01f ||
+        rect[0] < -0.25f || rect[1] < -0.25f ||
+        rect[2] > 1.25f || rect[3] > 1.25f)
+    {
+        return false;
+    }
+
     for (UINT index = 0; index < vertexCount; ++index)
     {
         std::uint8_t* vertex = transformed->data() +
@@ -11689,21 +12045,24 @@ static bool BuildUiOverlayVertices(const D3D8ViewportLocal& sourceViewport,
         const float finalY =
             ((y - static_cast<float>(sourceViewport.Y)) * scale + top) /
             targetHeight;
-        // Keep subtitles monocular (right eye only), but do not apply the
-        // runtime-specific asymmetric projection crop here.  Reverb/SteamVR
-        // runtimes can report a different crop and otherwise move the whole
-        // subtitle layer above the eye texture.  A common full-target layout
-        // is stable across runtimes.  Scale it slightly toward the centre and
-        // lower it so long lines remain visible and easier to read.
+        // Scale long lines toward the centre and keep them slightly lowered.
+        // Re-centre the asymmetric projection rectangle, then add a small
+        // nasal shift per eye so both copies meet between the eyes.
         constexpr float subtitleScale = 0.78f;
-        constexpr float subtitleCentreX = 0.58f;
+        constexpr float subtitleCentreX = 0.50f;
         constexpr float subtitleCentreY = 0.52f;
+        constexpr float subtitleInwardShift = 0.006f;
         const float subtitleX = subtitleCentreX +
             (finalX - 0.5f) * subtitleScale;
         const float subtitleY = subtitleCentreY +
             (finalY - 0.5f) * subtitleScale;
-        x = targetWidth * subtitleX;
-        y = targetHeight * subtitleY;
+        const float rectCentreX = (rect[0] + rect[2]) * 0.5f;
+        const float projectionRecentre = 0.5f - rectCentreX;
+        const float inwardShift = eye == 0 ? subtitleInwardShift :
+            -subtitleInwardShift;
+        x = targetWidth * (rect[0] + subtitleX * rectWidth +
+            projectionRecentre + inwardShift);
+        y = targetHeight * (rect[1] + subtitleY * rectHeight);
         std::memcpy(vertex + 0, &x, sizeof(x));
         std::memcpy(vertex + 4, &y, sizeof(y));
     }
@@ -11748,8 +12107,11 @@ static bool DuplicateUiPrimitiveUPForStereo(DWORD primitiveType,
         return false;
     }
 
+    std::vector<std::uint8_t> transformedLeft;
     std::vector<std::uint8_t> transformedRight;
     if (!BuildUiOverlayVertices(sourceViewport, vertices, vertexCount, stride,
+            0, &transformedLeft) ||
+        !BuildUiOverlayVertices(sourceViewport, vertices, vertexCount, stride,
             1, &transformedRight))
     {
         LogUiStereoOverlayFailure8("BuildUiOverlayVertices for UP draw");
@@ -11764,9 +12126,9 @@ static bool DuplicateUiPrimitiveUPForStereo(DWORD primitiveType,
         return false;
     }
 
-    // Deliberately do not draw subtitles into the left eye.  A monocular
-    // subtitle cannot acquire contradictory binocular disparity.
-    const bool leftComplete = true;
+    const bool leftComplete = SetUiOverlayViewport() &&
+        SUCCEEDED(o_D3D8_DrawPrimitiveUP(g_device8, primitiveType,
+            primitiveCount, transformedLeft.data(), stride));
     bool rightComplete = false;
     if (SwitchStereoPairEye(1) && SetUiOverlayViewport())
     {
@@ -11782,8 +12144,9 @@ static bool DuplicateUiPrimitiveUPForStereo(DWORD primitiveType,
         {
             g_loggedUiStereoOverlay8 = true;
             Log("Stereo UI overlay enabled: FVF 0x%08X, source viewport "
-                "%ux%u, native target %ux%u, right-eye-only scaled safe "
-                "layout", g_currentVertexShader8, sourceViewport.Width,
+                "%ux%u, native target %ux%u, centre-converged both-eye "
+                "layout", g_currentVertexShader8,
+                sourceViewport.Width,
                 sourceViewport.Height, g_stereoTargetWidth8,
                 g_stereoTargetHeight8);
         }
@@ -12788,8 +13151,11 @@ static bool DuplicateUiPrimitiveForStereo(DWORD primitiveType,
     D3D8Slot<PFNV8_Unlock>(vertexBuffer, 12)(vertexBuffer);
     D3D8Slot<PFNV8_Release>(vertexBuffer, 2)(vertexBuffer);
 
+    std::vector<std::uint8_t> transformedLeft;
     std::vector<std::uint8_t> transformedRight;
     if (!BuildUiOverlayVertices(sourceViewport, source.data(), vertexCount,
+            stride, 0, &transformedLeft) ||
+        !BuildUiOverlayVertices(sourceViewport, source.data(), vertexCount,
             stride, 1, &transformedRight))
     {
         return false;
@@ -12800,7 +13166,9 @@ static bool DuplicateUiPrimitiveForStereo(DWORD primitiveType,
     if (!BeginUiStereoPairPass(&originalColor, &originalDepth))
         return false;
 
-    const bool leftComplete = true;
+    const bool leftComplete = SetUiOverlayViewport() &&
+        SUCCEEDED(o_D3D8_DrawPrimitiveUP(g_device8, primitiveType,
+            primitiveCount, transformedLeft.data(), stride));
     bool rightComplete = false;
     if (SwitchStereoPairEye(1) && SetUiOverlayViewport())
     {
@@ -12817,7 +13185,7 @@ static bool DuplicateUiPrimitiveForStereo(DWORD primitiveType,
             g_loggedUiStereoOverlay8 = true;
             Log("Stereo UI vertex-buffer overlay enabled: shader/FVF "
                 "0x%08X, atlas 512x512, source viewport %ux%u, native "
-                "target %ux%u, right-eye-only scaled safe layout",
+                "target %ux%u, centre-converged both-eye layout",
                 g_currentVertexShader8,
                 sourceViewport.Width, sourceViewport.Height,
                 g_stereoTargetWidth8, g_stereoTargetHeight8);
@@ -12840,8 +13208,11 @@ static bool DuplicateUiIndexedPrimitiveUPForStereo(DWORD primitiveType,
         return false;
     }
 
+    std::vector<std::uint8_t> transformedLeft;
     std::vector<std::uint8_t> transformedRight;
     if (!BuildUiOverlayVertices(sourceViewport, vertices, vertexCount, stride,
+            0, &transformedLeft) ||
+        !BuildUiOverlayVertices(sourceViewport, vertices, vertexCount, stride,
             1, &transformedRight))
     {
         return false;
@@ -12852,7 +13223,10 @@ static bool DuplicateUiIndexedPrimitiveUPForStereo(DWORD primitiveType,
     if (!BeginUiStereoPairPass(&originalColor, &originalDepth))
         return false;
 
-    const bool leftComplete = true;
+    const bool leftComplete = SetUiOverlayViewport() &&
+        SUCCEEDED(o_D3D8_DrawIndexedPrimitiveUP(g_device8, primitiveType,
+            minIndex, vertexCount, primitiveCount, indices, indexFormat,
+            transformedLeft.data(), stride));
     bool rightComplete = false;
     if (SwitchStereoPairEye(1) && SetUiOverlayViewport())
     {
@@ -12869,8 +13243,9 @@ static bool DuplicateUiIndexedPrimitiveUPForStereo(DWORD primitiveType,
         {
             g_loggedUiStereoOverlay8 = true;
             Log("Stereo indexed UI overlay enabled: FVF 0x%08X, source "
-                "viewport %ux%u, native target %ux%u, right-eye-only "
-                "scaled safe layout", g_currentVertexShader8,
+                "viewport %ux%u, native target %ux%u, centre-converged "
+                "both-eye layout",
+                g_currentVertexShader8,
                 sourceViewport.Width, sourceViewport.Height,
                 g_stereoTargetWidth8, g_stereoTargetHeight8);
         }
@@ -12941,6 +13316,13 @@ static HRESULT WINAPI hk_D3D8_SetTransform(IDirect3DDevice8* device, DWORD state
         if (g_enableExperimentalColumnViewHeadRotation8 &&
             ApplyHeadRotationToColumnView(*matrix, vrView))
         {
+            const LONG presentFrame = InterlockedCompareExchange(
+                &c_present8, 0, 0);
+            if (g_cameraModHeadingSyncPresent8 != presentFrame)
+            {
+                SynchronizeHeatherHeadingToCameraModView(*matrix);
+                g_cameraModHeadingSyncPresent8 = presentFrame;
+            }
             const HRESULT result = o_D3D8_SetTransform(device, state, &vrView);
             if (SUCCEEDED(result))
             {
@@ -12954,6 +13336,13 @@ static HRESULT WINAPI hk_D3D8_SetTransform(IDirect3DDevice8* device, DWORD state
         if (g_enableExperimentalHeadRotation8 &&
             ApplyHeadRotationToMainCamera(*matrix, vrView))
         {
+            const LONG presentFrame = InterlockedCompareExchange(
+                &c_present8, 0, 0);
+            if (g_cameraModHeadingSyncPresent8 != presentFrame)
+            {
+                SynchronizeHeatherHeadingToCameraModView(*matrix);
+                g_cameraModHeadingSyncPresent8 = presentFrame;
+            }
             const HRESULT result = o_D3D8_SetTransform(device, state, &vrView);
             if (SUCCEEDED(result))
             {
@@ -13145,6 +13534,11 @@ static HRESULT WINAPI hk_D3D8_Present(IDirect3DDevice8* device, const RECT* src,
         Log(immersive
             ? "Stereo scene state reset before entering gameplay"
             : "Stereo scene state reset after leaving gameplay");
+        if (!immersive)
+        {
+            InterlockedExchange(&g_cameraModPendingMovementActive8, 0);
+            InterlockedExchange(&g_cameraModLastRenderHeadingValid8, 0);
+        }
         g_previousImmersiveFrame8 = immersive;
     }
     UpdateRoomscaleMovement(immersive);
@@ -13500,6 +13894,7 @@ static HRESULT WINAPI hk_D3D8_Reset(IDirect3DDevice8* device, void* presentParam
     g_flashlightProjectionSeenFrame8 = -1000;
     g_flashlightProjectionStrength8 = 0.0f;
     g_loggedLeftHandFlashlight8 = false;
+    g_loggedLeftHandSceneLighting8 = false;
     g_haveLatchedFrameHeadPose8 = false;
     g_haveLatchedFrameControllerState8 = false;
     g_haveLastCoherentControllerPair8 = false;
@@ -13993,6 +14388,9 @@ bool D3D9Hook_Install()
                 (finalSlash + 1)), "Silent_Hill_3_PC_Fix.ini");
     const bool useDirectX12 = GetPrivateProfileIntA("DirectX", "UseDirectX12",
         0, executablePath) != 0;
+    const bool enableMulticoreRendering = ReadIniIntSetting("Performance",
+        "MulticoreRendering", 1) != 0;
+    Interop8_SetMulticoreRendering(enableMulticoreRendering);
     g_enableFixedStep90Test8 = ReadFixedStep90Setting();
     g_enableThirteenAGFrameRateFix8 = ReadThirteenAGFrameRateFixSetting();
     g_enableProxyPresentationUnlock90Hz8 = ReadProxyPresentationUnlockSetting();
@@ -14012,6 +14410,16 @@ bool D3D9Hook_Install()
         "EnableCullingGuardband", 1) != 0;
     g_enableGamePostProcess8 = ReadGamePostProcessSetting();
     g_stereoReplayWorldOnly8 = ReadStereoReplayWorldOnlySetting();
+    g_enableFirearmHaptics8 = ReadIniIntSetting("MotionControls",
+        "FirearmHaptics", 1) != 0;
+    const int firearmHapticsDurationMs = std::clamp(ReadIniIntSetting(
+        "MotionControls", "FirearmHapticsDurationMs", 80), 10, 500);
+    const int firearmHapticsAmplitudePercent = std::clamp(ReadIniIntSetting(
+        "MotionControls", "FirearmHapticsAmplitudePercent", 50), 1, 100);
+    g_firearmHapticsDurationSeconds8 =
+        static_cast<float>(firearmHapticsDurationMs) * 0.001f;
+    g_firearmHapticsAmplitude8 =
+        static_cast<float>(firearmHapticsAmplitudePercent) * 0.01f;
     g_enableWeaponRenderProbe8 =
         ReadIniIntSetting("MotionControls", "WeaponRenderProbe", 0) != 0;
     g_enableWeaponPosePrototype8 = ReadIniIntSetting("MotionControls",
@@ -14048,11 +14456,14 @@ bool D3D9Hook_Install()
         g_enableFrameCoherentTrackedMeshes8 ? "enabled" : "disabled");
     if (g_leftHandPoseProfile8.enabled)
     {
-        Log("LeftHand: enabled from sh3vr_weapons.ini (scale %d%%, local position %d/%d/%d)",
+        Log("LeftHand: enabled from sh3vr_weapons.ini (scale %d%%, local "
+            "position %d/%d/%d, adaptive lighting %s at %d Hz)",
             static_cast<int>(std::lround(g_leftHandPoseProfile8.scale * 100.0f)),
             static_cast<int>(g_leftHandPoseProfile8.position[0]),
             static_cast<int>(g_leftHandPoseProfile8.position[1]),
-            static_cast<int>(g_leftHandPoseProfile8.position[2]));
+            static_cast<int>(g_leftHandPoseProfile8.position[2]),
+            g_leftHandPoseProfile8.adaptiveLighting ? "enabled" : "disabled",
+            g_leftHandPoseProfile8.lightingUpdateHz);
     }
     g_enableRoomscale8 =
         ReadIniIntSetting("Roomscale", "Enable", 1) != 0;
@@ -14070,6 +14481,11 @@ bool D3D9Hook_Install()
     g_cameraModImmersiveFrameStreak8 = 0;
     g_enableCameraModRightStickTurn8 =
         ReadInputSetting("EnableCameraModRightStick", 1) != 0;
+    g_enableCameraRelativeStrafe8 =
+        ReadInputSetting("CameraRelativeStrafe", 1) != 0;
+    InterlockedExchange(&g_cameraModPendingMovementActive8, 0);
+    InterlockedExchange(&g_cameraModLastRenderHeadingValid8, 0);
+    g_cameraModMovementVectorLogCount8 = 0;
     g_cameraModTurnMode8 = std::clamp(
         ReadInputSetting("CameraModTurnMode", 0), 0, 1);
     g_enableHeadTrackedFlashlight8 =
@@ -14093,12 +14509,6 @@ bool D3D9Hook_Install()
     cameraModSmoothSpeed = std::clamp(cameraModSmoothSpeed, 30, 360);
     g_cameraModSmoothTurnDegreesPerSecond8 =
         static_cast<float>(cameraModSmoothSpeed);
-    int cameraModCharacterAlignMilliseconds =
-        ReadInputSetting("CameraModCharacterAlignMilliseconds", 34);
-    cameraModCharacterAlignMilliseconds = std::clamp(
-        cameraModCharacterAlignMilliseconds, 16, 100);
-    g_cameraModCharacterAlignMilliseconds8 =
-        static_cast<DWORD>(cameraModCharacterAlignMilliseconds);
     if (g_enableFullPassStereo8)
     {
         // The full-scene path is deliberately mutually exclusive with the
@@ -14187,16 +14597,23 @@ bool D3D9Hook_Install()
     Log("Loaded [Stereo] ReplayWorldOnly=%s; per-draw replay shader "
         "filter %s", g_stereoReplayWorldOnly8 ? "1" : "0",
         g_stereoReplayWorldOnly8 ? "world shader 0x2D only" : "full allowlist");
+    Log("Loaded [Performance] MulticoreRendering=%s; D3D8 compatibility "
+        "stereo memory transfer %s", enableMulticoreRendering ? "1" : "0",
+        enableMulticoreRendering ? "uses two CPU cores" : "is single-threaded");
+    Log("Loaded [MotionControls] FirearmHaptics=%s; right-controller "
+        "amplitude %d%%, duration %d ms", g_enableFirearmHaptics8 ? "1" : "0",
+        firearmHapticsAmplitudePercent, firearmHapticsDurationMs);
     Log("Loaded [Roomscale] fixed internal tracking scale %.1f game units "
         "per meter", g_worldScale8);
     Log("Loaded [Input] Camera Mod right-stick turn=%s; mode %s; snap "
         "activation %d%%, angle %d degrees; smooth speed %d deg/s, "
-        "deadzone %d%%; Heather alignment pulse %d ms",
+        "deadzone %d%%; CameraRelativeStrafe=%s with equal-speed native "
+        "movement-vector rotation and render-time Heather heading alignment",
         g_enableCameraModRightStickTurn8 ? "1" : "0",
         g_cameraModTurnMode8 == 1 ? "Smooth" : "Snap",
         cameraModSnapActivation, cameraModSnapDegrees,
         cameraModSmoothSpeed, cameraModSmoothDeadzone,
-        cameraModCharacterAlignMilliseconds);
+        g_enableCameraRelativeStrafe8 ? "1" : "0");
     Log("Loaded [Input] HeadTrackedFlashlight=%s; SH3 flashlight projection "
         "c80-c82 follows the headset",
         g_enableHeadTrackedFlashlight8 ? "1" : "0");
@@ -14224,6 +14641,34 @@ bool D3D9Hook_Install()
     LateHooks();
 
     InstallCameraModDemoGuard();
+
+    if (g_enableCameraRelativeStrafe8)
+    {
+        HMODULE executable = GetModuleHandleA(nullptr);
+        BYTE* movementVectorTarget = reinterpret_cast<BYTE*>(executable) +
+            0x000D83B0u;
+        static const BYTE expectedMovementVectorPrologue[] = {
+            0x51, 0xA1, 0x00, 0xC1, 0x12, 0x07, 0x8B, 0x88,
+            0x00, 0x01, 0x00, 0x00, 0x53, 0x56, 0x51, 0xE8
+        };
+        if (std::memcmp(movementVectorTarget, expectedMovementVectorPrologue,
+                sizeof(expectedMovementVectorPrologue)) != 0)
+        {
+            Log("Camera-relative movement-vector hook disabled: unsupported "
+                "SH3.EXE layout at RVA 0x000D83B0");
+        }
+        else if (HookOne("SH3 movement vector RVA 0x000D83B0",
+            movementVectorTarget, &hk_SH3_AdjustMovementVector,
+            reinterpret_cast<void**>(&o_SH3_AdjustMovementVector)))
+        {
+            if (MH_EnableHook(movementVectorTarget) == MH_OK)
+                Log("Camera-relative equal-speed SH3 movement-vector hook "
+                    "enabled");
+            else
+                Log("ERROR: failed to enable camera-relative SH3 "
+                    "movement-vector hook");
+        }
+    }
 
     if (g_enableRuntimeDiagnostics8 || g_enableCompositeDuplicateTest8 ||
         g_enableStereoSurfaceProbe8 || g_enableSynchronizedStereo8 ||

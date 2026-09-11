@@ -18,6 +18,7 @@
 // =============================================================================
 
 #include <windows.h>
+#include "parallel_copy.h"
 #include "shared_frame.h"
 
 extern void Log(const char* format, ...);
@@ -128,6 +129,9 @@ static DWORD              g_format = 0;
 static bool               g_initialised = false;
 static bool               g_broken = false;
 static Sh3VrHeadPose       g_frameRenderPose = {};
+static Sh3VrParallelCopyWorker g_stereoCopyWorker;
+static bool               g_multicoreRendering = true;
+static bool               g_multicoreCopyLogged = false;
 
 static HANDLE            g_section = nullptr;
 static HANDLE            g_frameEvent = nullptr;
@@ -755,23 +759,19 @@ static bool SharedFrame_CopyNativeStereoPair(const BYTE* sources[2],
     InterlockedExchange(readyMask, 0);
     InterlockedIncrement(pairSequence);
 
-    for (UINT eye = 0; eye < 2; ++eye)
+    BYTE* destinations[2] = {
+        g_slotBase,
+        g_slotBase + static_cast<SIZE_T>(SH3VR_SLOT_BYTES)
+    };
+    const bool copiedOnTwoCores = g_stereoCopyWorker.CopyPair(
+        destinations[0], destPitch, sources[0], sourcePitches[0],
+        destinations[1], destPitch, sources[1], sourcePitches[1],
+        destPitch, height, g_multicoreRendering);
+    if (copiedOnTwoCores && !g_multicoreCopyLogged)
     {
-        BYTE* dest = g_slotBase + static_cast<SIZE_T>(eye) *
-            SH3VR_SLOT_BYTES;
-        if (sourcePitches[eye] == static_cast<INT>(destPitch))
-        {
-            memcpy(dest, sources[eye], byteCount);
-        }
-        else
-        {
-            for (UINT y = 0; y < height; ++y)
-            {
-                memcpy(dest + static_cast<SIZE_T>(y) * destPitch,
-                    sources[eye] + static_cast<SIZE_T>(y) *
-                        sourcePitches[eye], destPitch);
-            }
-        }
+        g_multicoreCopyLogged = true;
+        Log("Multicore rendering active: native D3D8 eye copies use the "
+            "render thread and one Windows thread-pool worker");
     }
 
     InterlockedExchange(readyMask, 3);
@@ -1522,6 +1522,13 @@ void Interop8_OnDeviceReset()
     Log("Interop8_OnDeviceReset: staging surface will be rebuilt");
 }
 
+void Interop8_SetMulticoreRendering(bool enabled)
+{
+    g_multicoreRendering = enabled;
+    if (!enabled)
+        g_multicoreCopyLogged = false;
+}
+
 void Interop8_Shutdown()
 {
     if (g_staging)
@@ -1541,6 +1548,8 @@ void Interop8_Shutdown()
     g_nativeStereoHeight = 0;
     g_nativeStereoFormat = 0;
 
+    g_stereoCopyWorker.Shutdown();
+
     SharedFrame_Shutdown();
 
     g_initialised = false;
@@ -1548,5 +1557,6 @@ void Interop8_Shutdown()
     g_frameCounter = 0;
     g_stereoPairOpen = false;
     g_stereoPairCounter = 0;
+    g_multicoreCopyLogged = false;
     Log("Interop8_Shutdown: producer stopped");
 }
