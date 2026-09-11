@@ -1,13 +1,14 @@
-**Silent Hill 3 VR Mod**
+
+<img width="1201" height="233" alt="SH3VR LOGO WHITE" src="https://github.com/user-attachments/assets/61613126-f076-46d6-b200-966a48ea1418" />
 
 A mod for *Silent Hill 3* that brings fully working VR mode into the game.
 
-**WARNING: You must install Silent Hill 3 PC Fix by Steam006 to play this mod.**
+**WARNING: You must install Silent Hill 3 PC Fix by Steam006 and ZealotTormund's Camera Mod to play this mod.**
 
 ### Current status
 Tested on **Meta Quest 3** through **Virtual Desktop**. The mod also includes
 SteamVR/OpenXR support with automatic runtime detection and Touch/Index/Vive
-controller bindings. See [SteamVR setup and testing](docs/steamvr.md).
+controller bindings.
 
 Use `SH3VRConfig.exe` next to `sh3.exe` to configure VR resolution, refresh
 rate, input, graphics, safe performance options, and motion-weapon calibration.
