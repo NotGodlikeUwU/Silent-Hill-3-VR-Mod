@@ -21,6 +21,7 @@ You MUST install [Silent Hill 3 PC Fix by Steam006](https://community.pcgamingwi
 IF you wanna change Smooth Turn to Snap Turn, change `CameraModTurnMode=1` to `CameraModTurnMode=0` in `sh3vr.ini`.
 
 **Features in the current build:**
+- Pre-Release 1.0.1 configuration tool (09.13.2026)
 - Unlocked 90 FPS
 - 6-DOF stereo rendering
 - Controller input (mapped for Quest 3 controllers)
@@ -33,6 +34,7 @@ IF you wanna change Smooth Turn to Snap Turn, change `CameraModTurnMode=1` to `C
 - Working UI and subtitles
 - Fully playable in the first person
 - Smooth Turn and Snap Turn camera
+- Optional experimental shooting while walking or running
 
 ### Known Issues & Limitations
 - Some textures or models might be invisible in certain locations of the game
@@ -78,9 +80,13 @@ The repository contains `sh3vr.ini.example` and `sh3vr_weapons.ini.example` temp
 
 ### Configuration tool
 
-The bundled `SH3VRConfig.exe` is **Pre-Release 1.0** (09.11.2026). It edits
+The bundled `SH3VRConfig.exe` is **Pre-Release 1.0.1** (09.13.2026). It edits
 only the supported, safe subset of `sh3vr.ini` plus the motion calibration
 values in `sh3vr_weapons.ini`; unknown settings and comments are preserved.
+
+The `ShootWhileRunning` option is disabled by default. When enabled, it allows
+firearm attacks during locomotion. When disabled, the mod also blocks the
+game's contextual A-button attack path while aiming and moving.
 
 The source tree also contains the controller integration, tracked weapon implementation, and left-hand assets used by the release package.
 
