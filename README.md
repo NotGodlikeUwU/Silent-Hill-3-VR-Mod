@@ -22,7 +22,7 @@ You MUST install [Silent Hill 3 PC Fix by Steam006](https://community.pcgamingwi
 - Pre-Release 1.0.1 configuration tool (09.13.2026)
 - Unlocked 90 FPS
 - 6-DOF stereo rendering
-- Controller input (mapped for Quest 3 controllers)
+- Controller input
 - First Person using ZealotTormund's Camera mod
 - Roomscale
 - Player Height adaptation to Heather's height
