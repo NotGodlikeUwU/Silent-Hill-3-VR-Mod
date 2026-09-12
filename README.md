@@ -18,8 +18,6 @@ credits, and project/dependency links.
 ### Installing
 You MUST install [Silent Hill 3 PC Fix by Steam006](https://community.pcgamingwiki.com/files/file/1331-silent-hill-3-pc-fix-by-steam006/) and [Silent Hill 3 Camera Mod](https://github.com/zealottormunds/sh3cammod). Download the [Release](https://github.com/NotGodlikeUwU/Silent-Hill-3-VR-Mod/releases/tag/Beta_0.1.6), then copy its contents next to `sh3.exe`. The package includes `dinput8.dll`, `sh3vr_host64.exe`, `SH3VRConfig.exe`, `sh3vr.ini`, `sh3vr_weapons.ini`, and the `sh3vr_assets` folder. If you see gray screen in VR, copy contents from `GRAY SCREEN FIX` folder to the game .exe with OVERWRITE. Run `SH3VRConfig.exe` to adjust the mod or `sh3.exe` to play.
 
-IF you wanna change Smooth Turn to Snap Turn, change `CameraModTurnMode=1` to `CameraModTurnMode=0` in `sh3vr.ini`.
-
 **Features in the current build:**
 - Pre-Release 1.0.1 configuration tool (09.13.2026)
 - Unlocked 90 FPS
@@ -68,7 +66,6 @@ The repository contains `sh3vr.ini.example` and `sh3vr_weapons.ini.example` temp
 | **Left Menu Button** | Cancel / Pause |
 
 ### Roadmap
-- Fixes for missing shadows and blood effects
 - Various bug fixes
 
 ### Building from source
