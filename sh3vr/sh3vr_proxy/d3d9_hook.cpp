@@ -279,6 +279,8 @@ typedef HRESULT(STDMETHODCALLTYPE* PFN_DXGI_Present)(IDXGISwapChain*, UINT,
 typedef void(__cdecl* PFN_SH3_RenderFrame)();
 typedef void(__cdecl* PFN_SH3_AdjustMovementVector)(float* first,
     float* second);
+typedef void(__cdecl* PFN_SH3_AddPositionVector)(float* position,
+    const float* delta);
 typedef HRESULT(WINAPI* PFN8_CreateRenderTarget)(IDirect3DDevice8*, UINT, UINT,
     DWORD, DWORD, BOOL, IDirect3DSurface8**);
 typedef HRESULT(WINAPI* PFN8_CreateDepthStencilSurface)(IDirect3DDevice8*, UINT,
@@ -322,6 +324,7 @@ static PFN8_Clear            o_D3D8_Clear = nullptr;
 static PFN_D3D8_Reset        o_D3D8_Reset = nullptr;
 static PFN_D3D8_SetTransform o_D3D8_SetTransform = nullptr;
 static PFN8_SetRenderTarget o_D3D8_SetRenderTarget = nullptr;
+static PFN8_CopyRects o_D3D8_CopyRects = nullptr;
 static PFN8_SetViewport o_D3D8_SetViewport = nullptr;
 static PFN_D3D8_SetVertexShader o_D3D8_SetVertexShader = nullptr;
 static PFN_D3D8_SetTexture o_D3D8_SetTexture = nullptr;
@@ -358,6 +361,7 @@ static PFN_SH3_RenderFrame o_SH3_PrepareFrame = nullptr;
 static PFN_SH3_RenderFrame o_SH3_RenderComposite = nullptr;
 static PFN_SH3_RenderFrame o_SH3_PostFrame = nullptr;
 static PFN_SH3_AdjustMovementVector o_SH3_AdjustMovementVector = nullptr;
+static PFN_SH3_AddPositionVector o_SH3_AddPositionVector = nullptr;
 
 // -----------------------------------------------------------------------------
 //  State
@@ -439,6 +443,9 @@ static float g_perDrawOriginalViewProjection8[16] = {};
 static float g_perDrawGameViewProjection8[16] = {};
 static bool g_havePerDrawStereoMatrices8 = false;
 static bool g_havePerDrawGameMatrix8 = false;
+static bool g_currentViewProjectionBasisValid8 = false;
+static float g_currentViewProjectionDeterminant8 = 0.0f;
+static DWORD g_currentViewProjectionHash8 = 0;
 
 struct BatchedFogDraw8
 {
@@ -521,7 +528,21 @@ static bool DescribeRenderTargetTexture8(IDirect3DBaseTexture8* texture,
     UINT* width, UINT* height, DWORD* usage);
 static bool IsPrimarySceneDrawSamplingRenderTargetTexture8(DWORD* stage,
     UINT* width, UINT* height);
+static bool TextureUsesCopiedOffscreenTarget8(
+    IDirect3DBaseTexture8* texture);
+struct PlanarReflectionTextureSuppression8
+{
+    DWORD stageMask;
+    IDirect3DBaseTexture8* textures[8];
+};
+static bool BeginPlanarReflectionTextureSuppression8(
+    IDirect3DDevice8* device, bool indexed, DWORD primitiveType,
+    UINT primitiveCount, PlanarReflectionTextureSuppression8* suppression);
+static void EndPlanarReflectionTextureSuppression8(IDirect3DDevice8* device,
+    PlanarReflectionTextureSuppression8* suppression);
 static void RememberOffscreenRenderTarget8(IDirect3DSurface8* color);
+static void ResetRecentOffscreenRenderTargets8();
+static void ResetCopiedOffscreenTargets8();
 static bool DuplicateUiPrimitiveUPForStereo(DWORD primitiveType,
     UINT primitiveCount, const void* vertices, UINT stride);
 static bool DuplicateGamePostProcessPrimitiveUPForStereo(
@@ -657,10 +678,34 @@ static bool g_loggedScreenSpaceState8[32] = {};
 static LONG g_screenSpaceStateLogCount8 = 0;
 static IDirect3DBaseTexture8* g_currentTextures8[8] = {};
 static bool g_currentTextureIsRenderTarget8[8] = {};
+static bool g_currentTextureCopiedFromOffscreen8[8] = {};
 static UINT g_currentTextureWidths8[8] = {};
 static UINT g_currentTextureHeights8[8] = {};
+// SH3's planar water reflection is rendered into a texture and then sampled by
+// the buffered water-surface draw. In VR that texture follows the desktop
+// camera instead of either eye. Keep the water geometry, blending, ripples and
+// depth intact, but remove only that incompatible reflected-scene texture.
+// SH3 copies the reflected view out of its off-screen render surface before
+// binding it, so the sampled texture itself does not retain D3DUSAGE_RENDERTARGET.
+// Track that copy chain and remove only the copied scene texture from the
+// stereo-replayed water draw.
+static bool g_disablePlanarReflections8 = false;
+static bool g_loggedPlanarReflectionSuppression8 = false;
+static bool g_loggedPlanarWaterMaterialSuppression8 = false;
+static bool g_loggedPlanarWaterBaseSuppression8 = false;
+struct PlanarWaterMeshSignature8
+{
+    UINT_PTR vertexBuffer;
+    UINT startVertex;
+    UINT primitiveCount;
+};
+static PlanarWaterMeshSignature8 g_planarWaterMeshes8[64] = {};
+static UINT g_planarWaterMeshCount8 = 0;
 static IDirect3DSurface8* g_recentOffscreenTargets8[32] = {};
 static LONG g_recentOffscreenTargetCount8 = 0;
+static IDirect3DSurface8* g_copiedOffscreenTargets8[64] = {};
+static LONG g_copiedOffscreenTargetCount8 = 0;
+static LONG g_loggedOffscreenCopyCount8 = 0;
 struct UiTraceRecord8
 {
     DWORD shader;
@@ -767,8 +812,15 @@ static volatile LONG g_cameraModPendingMovementHeadingBits8 = 0;
 static volatile LONG g_cameraModPendingLocalRightBits8 = 0;
 static volatile LONG g_cameraModPendingLocalForwardBits8 = 0;
 static volatile LONG g_cameraModPendingMovementActive8 = 0;
+static volatile LONG g_cameraModRunRequested8 = 0;
+static volatile LONG g_heatherDamageRecoveryUntilTick8 = 0;
 static LONG g_cameraModMovementVectorLogCount8 = 0;
+static LONG g_cameraModPositionIntegrationLogCount8 = 0;
+static volatile LONG g_cameraModLastMovementCallerRva8 = 0;
 static int g_cameraModForwardAxisSign8 = 0;
+static float g_cameraModLastAxisYawDegrees8 = 0.0f;
+static bool g_cameraModLastAxisYawValid8 = false;
+static bool g_loggedCameraHeadingSource8 = false;
 static bool g_autoLoadCameraModFirstPerson8 = true;
 static bool g_cameraModAutoLoadDone8 = false;
 // Rendering alone does not identify gameplay: native demos render stereo too.
@@ -937,6 +989,45 @@ static D3D8ShaderConstantGroup
     g_shaderConstantGroups8[SH3VR_MAX_SHADER_CONSTANT_GROUPS] = {};
 static int g_shaderConstantGroupCount8 = 0;
 static DWORD g_currentVertexShader8 = 0;
+
+// Reflection implementations vary between rooms and none of the previously
+// observed RTT/mirrored-camera signatures is present in Sewer. Capture a
+// bounded aggregate of the buffered draws immediately after each gameplay
+// entry. This is diagnostics only: no draw or render state is modified.
+struct SceneDrawSignature8
+{
+    DWORD shader;
+    DWORD primitiveType;
+    UINT primitiveCount;
+    UINT vertexCount;
+    DWORD callerRva;
+    DWORD viewProjectionHash;
+    int viewDeterminantX1000;
+    DWORD textureMask;
+    DWORD renderTargetTextureMask;
+    DWORD firstTextureStage;
+    UINT firstTextureWidth;
+    UINT firstTextureHeight;
+    DWORD alphaBlendEnable;
+    DWORD sourceBlend;
+    DWORD destinationBlend;
+    DWORD zWriteEnable;
+    bool indexed;
+    bool replaySelected;
+    bool cameraBasisValid;
+    UINT occurrences;
+    UINT firstSequence;
+};
+
+static constexpr UINT SH3VR_MAX_SCENE_DRAW_SIGNATURES8 = 512u;
+static SceneDrawSignature8
+    g_sceneDrawSignatures8[SH3VR_MAX_SCENE_DRAW_SIGNATURES8] = {};
+static UINT g_sceneDrawSignatureCount8 = 0;
+static UINT g_sceneDrawSequence8 = 0;
+static UINT g_sceneDrawTraceSerial8 = 0;
+static int g_sceneDrawTraceFramesRemaining8 = 0;
+static bool g_sceneDrawTraceOverflow8 = false;
+static bool g_enableSceneDrawTrace8 = false;
 static bool g_loggedWorldDrawStack8 = false;
 static bool g_loggedUpDrawStack8 = false;
 static LONG g_vertexShaderChangesThisFrame8 = 0;
@@ -1035,6 +1126,7 @@ static WeaponPoseBaselineCache8
     g_weaponPoseBaselineCaches8[SH3VR_WEAPON_PROFILE_COUNT8] = {};
 static int g_activeWeaponPoseProfile8 = -1;
 static volatile LONG g_activeWeaponPoseSeenPresent8 = -1000;
+static DWORD g_nonPlayerWeaponDrawLoggedMask8 = 0;
 static LONG g_firearmReticleRenderedPresent8 = -1;
 static bool g_firearmReticleLogged8 = false;
 static LONG g_muzzleFlashRenderedPresent8 = -1;
@@ -1043,6 +1135,9 @@ static volatile LONG g_muzzleFlashUntilTick8 = 0;
 static volatile LONG g_muzzleFlashLastActivityTick8 = 0;
 static volatile LONG g_muzzleFlashLastPulseTick8 = 0;
 static volatile LONG g_muzzleFlashLastPulseProfile8 = -1;
+static volatile LONG g_firearmTriggerHeld8 = 0;
+static volatile LONG g_firearmTriggerGeneration8 = 0;
+static volatile LONG g_firearmLastPulseTriggerGeneration8 = -1;
 static bool g_muzzleFlashLogged8 = false;
 static LONG g_muzzleSmokeRenderedPresent8 = -1;
 static volatile LONG g_muzzleSmokeProfile8 = -1;
@@ -2035,6 +2130,35 @@ static bool ReadProcessBytes(const BYTE* address, BYTE* output, SIZE_T size)
         &bytesRead) != FALSE && bytesRead == size;
 }
 
+static int ReadHeatherWeaponPoseProfile8()
+{
+    const BYTE* game = reinterpret_cast<const BYTE*>(GetModuleHandleA(nullptr));
+    if (!game)
+        return -1;
+
+    // This is the same compact native player-weapon byte used by the input
+    // bridge.  Mesh dimensions alone are not an ownership test: Memory of
+    // Alessa renders the normal Heather weapon models through the same model
+    // caller, so accepting every matching mesh attaches the boss weapon to the
+    // right controller and repeatedly changes the active motion profile.
+    std::uint8_t weapon = 0xFFu;
+    if (!ReadProcessBytes(game + 0x06D2C656u, &weapon, sizeof(weapon)))
+        return -1;
+
+    switch (weapon)
+    {
+    case 0u: return 5; // Handgun
+    case 1u: return 6; // Shotgun
+    case 2u: return 7; // Submachine Gun
+    case 3u: return 4; // Stun Gun
+    case 4u: return 0; // Knife
+    case 5u: return 1; // Steel Pipe
+    case 6u: return 3; // Katana
+    case 7u: return 2; // Maul
+    default: return -1;
+    }
+}
+
 static void UpdateGamePostProcessState8()
 {
     float scale[3] = { 1.0f, 1.0f, 1.0f };
@@ -2628,9 +2752,7 @@ static void __cdecl hk_SH3_RenderComposite()
     g_renderEye8 = 0;
     g_applyStereoEyeOffset8 = duplicatePass && synchronizedPass;
     g_forceWaterFullSceneStereo8 = false;
-    g_recentOffscreenTargetCount8 = 0;
-    std::memset(g_recentOffscreenTargets8, 0,
-        sizeof(g_recentOffscreenTargets8));
+    ResetRecentOffscreenRenderTargets8();
     o_SH3_RenderComposite();
 
     // At this point the full gameplay composite has configured its real D3D8
@@ -4346,6 +4468,297 @@ static bool ShouldReplayStereoDraw(DWORD shader, bool indexed,
     return true;
 }
 
+static DWORD HashViewProjection8(const float values[16])
+{
+    if (!values)
+        return 0;
+    const BYTE* bytes = reinterpret_cast<const BYTE*>(values);
+    DWORD hash = 2166136261u;
+    for (std::size_t index = 0; index < 16u * sizeof(float); ++index)
+    {
+        hash ^= bytes[index];
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+static bool SameSceneDrawSignature8(const SceneDrawSignature8& left,
+    const SceneDrawSignature8& right)
+{
+    return left.shader == right.shader &&
+        left.primitiveType == right.primitiveType &&
+        left.primitiveCount == right.primitiveCount &&
+        left.vertexCount == right.vertexCount &&
+        left.callerRva == right.callerRva &&
+        left.viewProjectionHash == right.viewProjectionHash &&
+        left.viewDeterminantX1000 == right.viewDeterminantX1000 &&
+        left.textureMask == right.textureMask &&
+        left.renderTargetTextureMask == right.renderTargetTextureMask &&
+        left.firstTextureStage == right.firstTextureStage &&
+        left.firstTextureWidth == right.firstTextureWidth &&
+        left.firstTextureHeight == right.firstTextureHeight &&
+        left.alphaBlendEnable == right.alphaBlendEnable &&
+        left.sourceBlend == right.sourceBlend &&
+        left.destinationBlend == right.destinationBlend &&
+        left.zWriteEnable == right.zWriteEnable &&
+        left.indexed == right.indexed &&
+        left.replaySelected == right.replaySelected &&
+        left.cameraBasisValid == right.cameraBasisValid;
+}
+
+static void CaptureSceneDrawSignature8(IDirect3DDevice8* device,
+    bool indexed, DWORD primitiveType, UINT primitiveCount, UINT vertexCount,
+    const void* caller)
+{
+    if (g_sceneDrawTraceFramesRemaining8 <= 0 || !device)
+        return;
+
+    SceneDrawSignature8 candidate = {};
+    candidate.shader = g_currentVertexShader8;
+    candidate.primitiveType = primitiveType;
+    candidate.primitiveCount = primitiveCount;
+    candidate.vertexCount = vertexCount;
+    candidate.viewProjectionHash = g_currentViewProjectionHash8;
+    candidate.cameraBasisValid = g_currentViewProjectionBasisValid8;
+    candidate.viewDeterminantX1000 = candidate.cameraBasisValid
+        ? static_cast<int>(std::lround(
+            g_currentViewProjectionDeterminant8 * 1000.0f)) : 0;
+    candidate.indexed = indexed;
+    candidate.replaySelected = ShouldReplayStereoDraw(
+        g_currentVertexShader8, indexed, primitiveType, primitiveCount, true);
+    candidate.firstTextureStage = 0xFFFFFFFFu;
+    candidate.occurrences = 1;
+    candidate.firstSequence = ++g_sceneDrawSequence8;
+
+    HMODULE gameModule = GetModuleHandleA(nullptr);
+    const UINT_PTR callerAddress = reinterpret_cast<UINT_PTR>(caller);
+    const UINT_PTR gameBase = reinterpret_cast<UINT_PTR>(gameModule);
+    candidate.callerRva = static_cast<DWORD>(gameModule &&
+        callerAddress >= gameBase ? callerAddress - gameBase : 0);
+
+    for (DWORD stage = 0; stage < _countof(g_currentTextures8); ++stage)
+    {
+        if (!g_currentTextures8[stage])
+            continue;
+        candidate.textureMask |= 1u << stage;
+        if (g_currentTextureIsRenderTarget8[stage])
+            candidate.renderTargetTextureMask |= 1u << stage;
+        if (candidate.firstTextureStage == 0xFFFFFFFFu)
+        {
+            candidate.firstTextureStage = stage;
+            candidate.firstTextureWidth = g_currentTextureWidths8[stage];
+            candidate.firstTextureHeight = g_currentTextureHeights8[stage];
+        }
+    }
+
+    void** deviceVtable = *reinterpret_cast<void***>(device);
+    const auto getRenderState = reinterpret_cast<PFN8_GetRenderState>(
+        deviceVtable[VT8_GetRenderState]);
+    if (getRenderState)
+    {
+        getRenderState(device, 27u, &candidate.alphaBlendEnable);
+        getRenderState(device, 19u, &candidate.sourceBlend);
+        getRenderState(device, 20u, &candidate.destinationBlend);
+        getRenderState(device, 14u, &candidate.zWriteEnable);
+    }
+
+    for (UINT index = 0; index < g_sceneDrawSignatureCount8; ++index)
+    {
+        if (SameSceneDrawSignature8(g_sceneDrawSignatures8[index], candidate))
+        {
+            ++g_sceneDrawSignatures8[index].occurrences;
+            return;
+        }
+    }
+
+    if (g_sceneDrawSignatureCount8 >= SH3VR_MAX_SCENE_DRAW_SIGNATURES8)
+    {
+        g_sceneDrawTraceOverflow8 = true;
+        return;
+    }
+    g_sceneDrawSignatures8[g_sceneDrawSignatureCount8++] = candidate;
+}
+
+static void FlushSceneDrawTrace8(const char* reason)
+{
+    if (g_sceneDrawTraceSerial8 == 0 ||
+        (g_sceneDrawSignatureCount8 == 0 &&
+            g_sceneDrawTraceFramesRemaining8 <= 0))
+    {
+        g_sceneDrawTraceFramesRemaining8 = 0;
+        return;
+    }
+
+    Log("=== Scene-entry buffered draw trace %u: %s, signatures %u, "
+        "draws %u%s ===", g_sceneDrawTraceSerial8,
+        reason ? reason : "complete", g_sceneDrawSignatureCount8,
+        g_sceneDrawSequence8, g_sceneDrawTraceOverflow8 ? ", CAP REACHED" : "");
+    for (UINT index = 0; index < g_sceneDrawSignatureCount8; ++index)
+    {
+        const SceneDrawSignature8& record = g_sceneDrawSignatures8[index];
+        Log("Scene draw %u.%u: seq %u, %s, shader/FVF 0x%08X, type %u, "
+            "primitives %u, vertices %u, caller RVA 0x%08X, VP 0x%08X, "
+            "basis %s detx1000 %d, textures 0x%02X RTT 0x%02X, first "
+            "stage %u %ux%u, alpha %u src/dst %u/%u zwrite %u, replay %s, "
+            "count %u",
+            g_sceneDrawTraceSerial8, index + 1, record.firstSequence,
+            record.indexed ? "DrawIndexedPrimitive" : "DrawPrimitive",
+            record.shader, static_cast<unsigned>(record.primitiveType),
+            record.primitiveCount, record.vertexCount, record.callerRva,
+            record.viewProjectionHash,
+            record.cameraBasisValid ? "valid" : "invalid",
+            record.viewDeterminantX1000, record.textureMask,
+            record.renderTargetTextureMask, record.firstTextureStage,
+            record.firstTextureWidth, record.firstTextureHeight,
+            record.alphaBlendEnable, record.sourceBlend,
+            record.destinationBlend, record.zWriteEnable,
+            record.replaySelected ? "yes" : "no", record.occurrences);
+    }
+    Log("=== Scene-entry buffered draw trace %u end ===",
+        g_sceneDrawTraceSerial8);
+    g_sceneDrawTraceFramesRemaining8 = 0;
+}
+
+static void StartSceneDrawTrace8(LONG presentFrame)
+{
+    if (!g_enableSceneDrawTrace8)
+        return;
+    if (g_sceneDrawTraceFramesRemaining8 > 0)
+        FlushSceneDrawTrace8("interrupted by another gameplay entry");
+    std::memset(g_sceneDrawSignatures8, 0,
+        sizeof(g_sceneDrawSignatures8));
+    g_sceneDrawSignatureCount8 = 0;
+    g_sceneDrawSequence8 = 0;
+    g_sceneDrawTraceOverflow8 = false;
+    g_sceneDrawTraceFramesRemaining8 = 3;
+    ++g_sceneDrawTraceSerial8;
+    Log("Scene-entry buffered draw trace %u armed at Present %d for the "
+        "next 3 gameplay frames", g_sceneDrawTraceSerial8, presentFrame);
+}
+
+static void AdvanceSceneDrawTrace8()
+{
+    if (g_sceneDrawTraceFramesRemaining8 <= 0)
+        return;
+    --g_sceneDrawTraceFramesRemaining8;
+    if (g_sceneDrawTraceFramesRemaining8 == 0)
+        FlushSceneDrawTrace8("complete");
+}
+
+static bool IsPlanarWaterMaterialDraw8(IDirect3DDevice8* device,
+    DWORD primitiveType, UINT primitiveCount, const void* caller)
+{
+    if (!device || !caller || g_currentVertexShader8 != 0x0000002Fu ||
+        primitiveType != D3DPT_TRIANGLESTRIP || primitiveCount < 3u)
+    {
+        return false;
+    }
+
+    HMODULE gameModule = GetModuleHandleA(nullptr);
+    const UINT_PTR callerAddress = reinterpret_cast<UINT_PTR>(caller);
+    const UINT_PTR gameBase = reinterpret_cast<UINT_PTR>(gameModule);
+    const UINT_PTR callerRva = gameModule && callerAddress >= gameBase
+        ? callerAddress - gameBase : 0;
+    if (callerRva != 0x00059061u)
+        return false;
+
+    DWORD textureMask = 0;
+    for (DWORD stage = 0; stage < _countof(g_currentTextures8); ++stage)
+    {
+        if (g_currentTextures8[stage])
+            textureMask |= 1u << stage;
+    }
+    if ((textureMask & 0x0Bu) != 0x0Bu)
+        return false;
+
+    DWORD alphaBlendEnable = TRUE;
+    void** deviceVtable = *reinterpret_cast<void***>(device);
+    const auto getRenderState = reinterpret_cast<PFN8_GetRenderState>(
+        deviceVtable[VT8_GetRenderState]);
+    if (!getRenderState || FAILED(getRenderState(device, 27u,
+        &alphaBlendEnable)))
+    {
+        return false;
+    }
+
+    // In ordinary rooms shader 0x2F is the alpha-blended emissive/sign pass.
+    // Sewer water is the only observed version submitted opaque after its
+    // matching 0x2D base mesh. The opaque pass carries the flat-camera
+    // reflection; omitting only its extra eye replay leaves the base water,
+    // depth, ripples, world geometry, and desktop render untouched.
+    return alphaBlendEnable == FALSE;
+}
+
+static UINT_PTR CurrentVertexBufferIdentity8(IDirect3DDevice8* device)
+{
+    if (!device)
+        return 0;
+    IDirect3DVertexBuffer8* vertexBuffer = nullptr;
+    UINT stride = 0;
+    void** deviceVtable = *reinterpret_cast<void***>(device);
+    const auto getStreamSource = reinterpret_cast<PFN8_GetStreamSource>(
+        deviceVtable[VT8_GetStreamSource]);
+    if (!getStreamSource || FAILED(getStreamSource(device, 0, &vertexBuffer,
+        &stride)) || !vertexBuffer)
+    {
+        return 0;
+    }
+    const UINT_PTR identity = reinterpret_cast<UINT_PTR>(vertexBuffer);
+    void** bufferVtable = *reinterpret_cast<void***>(vertexBuffer);
+    reinterpret_cast<PFNV8_Release>(bufferVtable[2])(vertexBuffer);
+    return identity;
+}
+
+static void RememberPlanarWaterMesh8(UINT_PTR vertexBuffer,
+    UINT startVertex, UINT primitiveCount)
+{
+    if (!vertexBuffer)
+        return;
+    for (UINT index = 0; index < g_planarWaterMeshCount8; ++index)
+    {
+        const PlanarWaterMeshSignature8& signature =
+            g_planarWaterMeshes8[index];
+        if (signature.vertexBuffer == vertexBuffer &&
+            signature.startVertex == startVertex &&
+            signature.primitiveCount == primitiveCount)
+        {
+            return;
+        }
+    }
+    if (g_planarWaterMeshCount8 >= _countof(g_planarWaterMeshes8))
+        return;
+    g_planarWaterMeshes8[g_planarWaterMeshCount8++] = {
+        vertexBuffer, startVertex, primitiveCount
+    };
+}
+
+static bool IsKnownPlanarWaterBaseMesh8(UINT_PTR vertexBuffer,
+    UINT startVertex, UINT primitiveCount)
+{
+    if (!vertexBuffer || g_currentVertexShader8 != 0x0000002Du)
+        return false;
+    for (UINT index = 0; index < g_planarWaterMeshCount8; ++index)
+    {
+        const PlanarWaterMeshSignature8& signature =
+            g_planarWaterMeshes8[index];
+        if (signature.vertexBuffer == vertexBuffer &&
+            signature.startVertex == startVertex &&
+            signature.primitiveCount == primitiveCount)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void ResetPlanarWaterMeshes8()
+{
+    std::memset(g_planarWaterMeshes8, 0, sizeof(g_planarWaterMeshes8));
+    g_planarWaterMeshCount8 = 0;
+    g_loggedPlanarWaterMaterialSuppression8 = false;
+    g_loggedPlanarWaterBaseSuppression8 = false;
+}
+
 static bool IsHeavySceneDynamicReplayDraw(DWORD shader, bool indexed,
     DWORD primitiveType, UINT primitiveCount, bool vertexBufferDraw)
 {
@@ -4441,6 +4854,8 @@ static HRESULT WINAPI hk_D3D8_SetTexture(IDirect3DDevice8* device,
         DWORD usage = 0;
         g_currentTextureIsRenderTarget8[stage] =
             DescribeRenderTargetTexture8(texture, &width, &height, &usage);
+        g_currentTextureCopiedFromOffscreen8[stage] =
+            TextureUsesCopiedOffscreenTarget8(texture);
         g_currentTextureWidths8[stage] = width;
         g_currentTextureHeights8[stage] = height;
     }
@@ -4898,6 +5313,10 @@ static HRESULT WINAPI hk_D3D8_SetVertexShaderConstant(IDirect3DDevice8* device,
     if (g_enableViewProjectionHeadRotation8 && data &&
         startRegister == 2 && registerCount == 4 && g_haveProjection8)
     {
+        g_currentViewProjectionBasisValid8 = false;
+        g_currentViewProjectionDeterminant8 = 0.0f;
+        g_currentViewProjectionHash8 = HashViewProjection8(
+            static_cast<const float*>(data));
         float vrViewProjection[16] = {};
         if (ApplyHeadRotationToViewProjection(static_cast<const float*>(data),
             vrViewProjection))
@@ -4959,6 +5378,8 @@ static HRESULT WINAPI hk_D3D8_DrawPrimitive(IDirect3DDevice8* device,
     CaptureD3D8ShaderDraw(false, primitiveCount);
     LogFirstStereoDrawForShader("DrawPrimitive", primitiveType, primitiveCount,
         false, true, caller);
+    CaptureSceneDrawSignature8(device, false, primitiveType, primitiveCount,
+        0, caller);
     LogMotionWeaponDrawCapture8(device, "DrawPrimitive", primitiveType,
         primitiveCount, false, startVertex, 0, 0, 0, caller);
     const bool lightCompositeCandidate =
@@ -5071,6 +5492,8 @@ static HRESULT WINAPI hk_D3D8_DrawIndexedPrimitive(IDirect3DDevice8* device,
     CaptureD3D8ShaderDraw(true, primitiveCount);
     LogFirstStereoDrawForShader("DrawIndexedPrimitive", primitiveType,
         primitiveCount, true, true, caller);
+    CaptureSceneDrawSignature8(device, true, primitiveType, primitiveCount,
+        vertexCount, caller);
     LogMotionWeaponDrawCapture8(device, "DrawIndexedPrimitive", primitiveType,
         primitiveCount, true, minIndex, vertexCount, startIndex, 0, caller);
 
@@ -5087,8 +5510,53 @@ static HRESULT WINAPI hk_D3D8_DrawIndexedPrimitive(IDirect3DDevice8* device,
         primitiveType == 5u &&
         callerRva == 0x0005F518u &&
         g_weaponPoseConstantsShader8 == g_currentVertexShader8;
-    const int weaponProfileIndex = weaponDrawShape
+    const int signatureProfileIndex = weaponDrawShape
         ? FindWeaponPoseProfile8(vertexCount, primitiveCount) : -1;
+    const LONG weaponPresent = InterlockedCompareExchange(&c_present8, 0, 0);
+    const LONG activeWeaponSeenPresent = InterlockedCompareExchange(
+        &g_activeWeaponPoseSeenPresent8, 0, 0);
+    const int activeWeaponProfileIndex = g_activeWeaponPoseProfile8;
+    const int heatherWeaponProfileIndex = signatureProfileIndex >= 0
+        ? ReadHeatherWeaponPoseProfile8() : -1;
+    // The native selected-weapon byte is transient around menus, loading and
+    // some animations, so it must never reject the first real Heather draw.
+    // Once a profile is active, keep accepting that mesh while it remains
+    // visible.  A different mesh may take ownership only after the active one
+    // has disappeared and the native player state confirms a real switch.
+    // This keeps Memory of Alessa's matching weapon models from stealing the
+    // controller pose without disabling Motion control for Heather.
+    const bool sameAsActiveWeapon = signatureProfileIndex >= 0 &&
+        signatureProfileIndex == activeWeaponProfileIndex;
+    const bool activeWeaponRecentlyVisible =
+        activeWeaponProfileIndex >= 0 &&
+        weaponPresent - activeWeaponSeenPresent >= 0 &&
+        weaponPresent - activeWeaponSeenPresent <= 2;
+    const bool confirmedHeatherWeaponSwitch = signatureProfileIndex >= 0 &&
+        signatureProfileIndex == heatherWeaponProfileIndex &&
+        !activeWeaponRecentlyVisible;
+    const int weaponProfileIndex = signatureProfileIndex >= 0 &&
+        (activeWeaponProfileIndex < 0 || sameAsActiveWeapon ||
+            confirmedHeatherWeaponSwitch)
+        ? signatureProfileIndex : -1;
+    if (signatureProfileIndex >= 0 && weaponProfileIndex < 0)
+    {
+        const DWORD profileBit = 1u << signatureProfileIndex;
+        if ((g_nonPlayerWeaponDrawLoggedMask8 & profileBit) == 0)
+        {
+            g_nonPlayerWeaponDrawLoggedMask8 |= profileBit;
+            const char* activeWeaponName = activeWeaponProfileIndex >= 0 &&
+                activeWeaponProfileIndex < SH3VR_WEAPON_PROFILE_COUNT8
+                ? g_weaponPoseProfiles8[activeWeaponProfileIndex].displayName
+                : "none";
+            const char* nativeWeaponName = heatherWeaponProfileIndex >= 0 &&
+                heatherWeaponProfileIndex < SH3VR_WEAPON_PROFILE_COUNT8
+                ? g_weaponPoseProfiles8[heatherWeaponProfileIndex].displayName
+                : "unknown";
+            Log("MotionControls: ignored competing %s draw; active %s, native player state %s",
+                g_weaponPoseProfiles8[signatureProfileIndex].displayName,
+                activeWeaponName, nativeWeaponName);
+        }
+    }
     if (weaponProfileIndex >= 0)
         ActivateWeaponPoseProfile8(weaponProfileIndex);
     const bool weaponCandidate = weaponProfileIndex >= 0;
@@ -5508,6 +5976,17 @@ static HRESULT WINAPI hk_D3D8_DrawIndexedPrimitiveUP(IDirect3DDevice8* device,
 static float Dot3(const float* a, const float* b)
 {
     return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+static float CameraBasisDeterminant8(const D3DMATRIX& matrix)
+{
+    return
+        matrix.m[0][0] * (matrix.m[1][1] * matrix.m[2][2] -
+            matrix.m[1][2] * matrix.m[2][1]) -
+        matrix.m[0][1] * (matrix.m[1][0] * matrix.m[2][2] -
+            matrix.m[1][2] * matrix.m[2][0]) +
+        matrix.m[0][2] * (matrix.m[1][0] * matrix.m[2][1] -
+            matrix.m[1][1] * matrix.m[2][0]);
 }
 
 static bool IsMainCameraView(const D3DMATRIX& matrix)
@@ -6349,23 +6828,36 @@ bool D3D9Hook_GetActiveFirearmAimRay(float muzzleWorld[4],
 // attack asks for the ray many times during its animation, so those weapons
 // only start a flash after a quiet gap. The SMG intentionally emits a short
 // pulse at a controlled cadence while its native attack remains active.
+void D3D9Hook_SetFirearmTriggerState(bool held)
+{
+    const LONG next = held ? 1 : 0;
+    const LONG previous = InterlockedExchange(&g_firearmTriggerHeld8, next);
+    if (held && previous == 0)
+        InterlockedIncrement(&g_firearmTriggerGeneration8);
+}
+
 void D3D9Hook_NotifyFirearmDischarge()
 {
+    if (InterlockedCompareExchange(&g_firearmTriggerHeld8, 0, 0) == 0)
+        return;
+
     const int profileIndex = g_activeWeaponPoseProfile8;
     if (profileIndex < 4 || profileIndex >= SH3VR_WEAPON_PROFILE_COUNT8)
         return;
 
     const DWORD now = GetTickCount();
-    const DWORD previousActivity = static_cast<DWORD>(InterlockedExchange(
-        &g_muzzleFlashLastActivityTick8, static_cast<LONG>(now)));
     const DWORD previousPulse = static_cast<DWORD>(
         InterlockedCompareExchange(&g_muzzleFlashLastPulseTick8, 0, 0));
     const int previousProfile = static_cast<int>(InterlockedCompareExchange(
         &g_muzzleFlashLastPulseProfile8, -1, -1));
+    const LONG triggerGeneration = InterlockedCompareExchange(
+        &g_firearmTriggerGeneration8, 0, 0);
+    const LONG previousPulseGeneration = InterlockedCompareExchange(
+        &g_firearmLastPulseTriggerGeneration8, -1, -1);
 
     const bool automaticWeapon = profileIndex == 7;
     const bool newAttack = previousProfile != profileIndex ||
-        previousActivity == 0u || now - previousActivity >= 120u;
+        previousPulseGeneration != triggerGeneration;
     const bool automaticPulse = automaticWeapon &&
         (previousProfile != profileIndex || previousPulse == 0u ||
             now - previousPulse >= 70u);
@@ -6384,6 +6876,8 @@ void D3D9Hook_NotifyFirearmDischarge()
     InterlockedExchange(&g_muzzleFlashLastPulseTick8,
         static_cast<LONG>(now));
     InterlockedExchange(&g_muzzleFlashLastPulseProfile8, profileIndex);
+    InterlockedExchange(&g_firearmLastPulseTriggerGeneration8,
+        triggerGeneration);
     if (g_enableFirearmHaptics8)
     {
         Interop8_RequestHaptics(SH3VR_HAPTIC_RIGHT_HAND,
@@ -6542,6 +7036,53 @@ static float NormalizeHeadingRadians(float angle)
     return angle;
 }
 
+static float DecodeFloatBits(LONG bits);
+bool D3D9Hook_GetRelativeHeadYawRadians(float* yawRadians);
+
+static bool GetMotionCombatTrackedHeading8(float* headingOutput)
+{
+    if (!headingOutput || !g_haveMotionCombatView8)
+        return false;
+
+    D3DMATRIX cameraWorld = {};
+    if (!InvertD3D8Matrix(g_motionCombatView8, cameraWorld))
+        return false;
+
+    const bool rowVectorView = IsMainCameraView(g_motionCombatView8);
+    float forwardX = rowVectorView
+        ? cameraWorld.m[2][0] : cameraWorld.m[0][2];
+    float forwardZ = cameraWorld.m[2][2];
+
+    // D3D perspective matrices explicitly identify whether visible camera
+    // forward is +Z (left handed) or -Z (right handed). Unlike comparing the
+    // view axis with Heather, this remains unambiguous when a save starts in a
+    // room whose native camera is placed in front of the character.
+    const float projectionForward = std::fabs(g_lastProjection8.m[2][3]) >=
+        0.5f ? g_lastProjection8.m[2][3] : g_lastProjection8.m[3][2];
+    if (projectionForward < 0.0f)
+    {
+        forwardX = -forwardX;
+        forwardZ = -forwardZ;
+    }
+
+    const float horizontalLength = std::sqrt(
+        forwardX * forwardX + forwardZ * forwardZ);
+    if (!std::isfinite(horizontalLength) || horizontalLength < 0.001f)
+        return false;
+
+    *headingOutput = NormalizeHeadingRadians(std::atan2(
+        forwardX / horizontalLength, forwardZ / horizontalLength));
+    if (!g_loggedCameraHeadingSource8)
+    {
+        g_loggedCameraHeadingSource8 = true;
+        Log("Camera-relative heading source: centre-eye shader camera, "
+            "matrix %s, projection forward %sZ",
+            rowVectorView ? "row-vector" : "column-vector",
+            projectionForward < 0.0f ? "-" : "+");
+    }
+    return true;
+}
+
 static bool GetHeatherAndCameraModHeading(const D3DMATRIX& baseView,
     BYTE** playerOutput, float* headingOutput, float* cameraModYawOutput)
 {
@@ -6584,6 +7125,7 @@ static bool GetHeatherAndCameraModHeading(const D3DMATRIX& baseView,
     float targetYaw = std::atan2(forwardX / horizontalLength,
         forwardZ / horizontalLength);
     constexpr float pi = 3.14159265358979323846f;
+    constexpr float degreesToRadians = 0.01745329251994329577f;
     if (g_cameraModForwardAxisSign8 == 0)
     {
         const float oppositeYaw = NormalizeHeadingRadians(targetYaw + pi);
@@ -6594,6 +7136,65 @@ static bool GetHeatherAndCameraModHeading(const D3DMATRIX& baseView,
     }
     if (g_cameraModForwardAxisSign8 < 0)
         targetYaw = NormalizeHeadingRadians(targetYaw + pi);
+    // SH3 character forward is opposite the +Z basis recovered from the D3D
+    // camera view. Keep this correction common to locomotion, interactions,
+    // and the character-mounted flashlight.
+    targetYaw = NormalizeHeadingRadians(targetYaw + pi);
+
+    // Some SH3 rooms expose the otherwise valid Camera Mod view with its
+    // horizontal forward axis reversed. A process-wide sign calibrated in the
+    // first room therefore makes both locomotion and interaction facing 180
+    // degrees wrong after entering one of those rooms. Predict the next base
+    // heading from Camera Mod's own yaw delta and select whichever of the two
+    // matrix-forward interpretations is continuous with that prediction.
+    // This adapts to room changes while preserving intentional smooth/snap
+    // turns, including a configured 180-degree snap.
+    if (g_cameraModLastAxisYawValid8 &&
+        InterlockedCompareExchange(
+            &g_cameraModLastRenderHeadingValid8, 0, 0) != 0)
+    {
+        float yawDeltaDegrees = cameraModYawDegrees -
+            g_cameraModLastAxisYawDegrees8;
+        while (yawDeltaDegrees > 180.0f)
+            yawDeltaDegrees -= 360.0f;
+        while (yawDeltaDegrees < -180.0f)
+            yawDeltaDegrees += 360.0f;
+
+        const float previousHeading = DecodeFloatBits(
+            InterlockedCompareExchange(
+                &g_cameraModLastRenderHeadingBits8, 0, 0));
+        const float expectedHeading = NormalizeHeadingRadians(
+            previousHeading + yawDeltaDegrees * degreesToRadians);
+        const float oppositeTarget = NormalizeHeadingRadians(targetYaw + pi);
+        const float currentError = std::fabs(NormalizeHeadingRadians(
+            targetYaw - expectedHeading));
+        const float oppositeError = std::fabs(NormalizeHeadingRadians(
+            oppositeTarget - expectedHeading));
+        constexpr float axisFlipHysteresis = 0.20f;
+        if (std::isfinite(previousHeading) &&
+            oppositeError + axisFlipHysteresis < currentError)
+        {
+            g_cameraModForwardAxisSign8 = -g_cameraModForwardAxisSign8;
+            targetYaw = oppositeTarget;
+            Log("Camera-relative room axis changed: horizontal forward "
+                "sign corrected for locomotion and interactions");
+        }
+    }
+    g_cameraModLastAxisYawDegrees8 = cameraModYawDegrees;
+    g_cameraModLastAxisYawValid8 = true;
+
+    // Shader-camera head rotation is the authoritative direction actually
+    // shown in the headset. Remove only the relative HMD yaw here because the
+    // input bridge applies that yaw to the stick immediately before publishing
+    // the movement request. This avoids applying head rotation twice.
+    float combatTrackedHeading = 0.0f;
+    float relativeHeadYaw = 0.0f;
+    if (GetMotionCombatTrackedHeading8(&combatTrackedHeading) &&
+        D3D9Hook_GetRelativeHeadYawRadians(&relativeHeadYaw))
+    {
+        targetYaw = NormalizeHeadingRadians(
+            combatTrackedHeading + relativeHeadYaw);
+    }
 
     *playerOutput = player;
     *headingOutput = targetYaw;
@@ -6688,20 +7289,58 @@ bool D3D9Hook_ApplyCameraRelativeMovementHeading(float localRight,
     return true;
 }
 
+void D3D9Hook_SetCameraRelativeRun(bool runRequested)
+{
+    const LONG requested = runRequested ? 1 : 0;
+    const LONG previous = InterlockedExchange(
+        &g_cameraModRunRequested8, requested);
+    if (previous != requested)
+        Log("Camera-relative run state: %s", runRequested ? "on" : "off");
+}
+
+static bool IsHeatherDamageRecoveryActive8()
+{
+    const DWORD untilTick = static_cast<DWORD>(InterlockedCompareExchange(
+        &g_heatherDamageRecoveryUntilTick8, 0, 0));
+    return untilTick != 0 &&
+        static_cast<LONG>(untilTick - GetTickCount()) > 0;
+}
+
+void D3D9Hook_NotifyHeatherDamage()
+{
+    // SH3 applies one knockdown hit as a sequence of HP changes. Extending
+    // this deadline from every change covers the complete fall/get-up state
+    // and a short settling interval without touching global simulation time.
+    constexpr DWORD recoveryQuietMilliseconds = 1200u;
+    InterlockedExchange(&g_heatherDamageRecoveryUntilTick8,
+        static_cast<LONG>(GetTickCount() + recoveryQuietMilliseconds));
+}
+
 static void __cdecl hk_SH3_AdjustMovementVector(float* first, float* second)
 {
+    constexpr LONG normalMovementCallerRva = 0x000D4018;
+    constexpr LONG aimingMovementCallerRva = 0x000EAE91;
+    BYTE* executable = reinterpret_cast<BYTE*>(GetModuleHandleA(nullptr));
+    const BYTE* returnAddress = reinterpret_cast<const BYTE*>(_ReturnAddress());
+    const LONG callerRva = executable && returnAddress >= executable
+        ? static_cast<LONG>(returnAddress - executable)
+        : -1;
     BYTE* player = nullptr;
     float originalX = 0.0f;
     float originalZ = 0.0f;
+    float effectiveSpeed = 0.0f;
     float rotatedX = 0.0f;
     float rotatedZ = 0.0f;
+    float adjustedX = 0.0f;
+    float adjustedZ = 0.0f;
+    bool speedFloorApplied = false;
+    bool simulationHeadingAligned = false;
     bool rotated = false;
     if (g_enableCameraRelativeStrafe8 &&
         InterlockedCompareExchange(
             &g_cameraModPendingMovementActive8, 0, 0) != 0 &&
-        g_previousImmersiveFrame8)
+        g_previousImmersiveFrame8 && !IsHeatherDamageRecoveryActive8())
     {
-        BYTE* executable = reinterpret_cast<BYTE*>(GetModuleHandleA(nullptr));
         BYTE** playerAddress = executable
             ? reinterpret_cast<BYTE**>(executable +
                 (0x0712C100u - 0x00400000u))
@@ -6715,21 +7354,77 @@ static void __cdecl hk_SH3_AdjustMovementVector(float* first, float* second)
             const float requestedHeading = DecodeFloatBits(
                 InterlockedCompareExchange(
                     &g_cameraModPendingMovementHeadingBits8, 0, 0));
+            // Track SH3's separate normal and aiming locomotion callers. Both
+            // now consume the world-space heading normalized at input time.
+            const float movementHeading = requestedHeading;
+            InterlockedExchange(&g_cameraModLastMovementCallerRva8,
+                callerRva);
             originalX = *reinterpret_cast<const float*>(player + 0xF0u);
             originalZ = *reinterpret_cast<const float*>(player + 0xF8u);
             const float horizontalSpeed = std::sqrt(
                 originalX * originalX + originalZ * originalZ);
             if (characterKind == 0x0100u &&
                 std::isfinite(requestedHeading) &&
-                std::isfinite(horizontalSpeed) && horizontalSpeed > 0.000001f)
+                std::isfinite(horizontalSpeed))
             {
-                // SH3 has already selected the normal forward locomotion state
-                // and calculated its full native speed. Rotate that vector,
-                // preserving its length, before slope/collision adjustment and
-                // position integration. This avoids the stock 90/180-degree
-                // turn-speed penalties for lateral and backward stick input.
-                rotatedX = std::sin(requestedHeading) * horizontalSpeed;
-                rotatedZ = std::cos(requestedHeading) * horizontalSpeed;
+                // The collision/integration path validates movement against
+                // Heather's simulation heading. The stick vector already
+                // contains Camera Mod + physical HMD yaw, so leaving Heather
+                // at the render-only Camera Mod heading makes selected rooms
+                // reject the vector and produces a running-in-place animation.
+                // Align both current and previous simulation yaw before the
+                // game's normal slope/collision work. The render hook restores
+                // the Camera Mod heading after simulation for the visible body.
+                simulationHeadingAligned = SetHeatherHeading(player,
+                    movementHeading);
+                if (simulationHeadingAligned)
+                {
+                    *reinterpret_cast<float*>(player + 0xE4u) =
+                        NormalizeHeadingRadians(movementHeading);
+                }
+
+                // This is a pre-integration velocity. In affected rooms the
+                // ordinary locomotion caller reaches this point with an exact
+                // zero vector even though W is active; aiming uses the second
+                // caller and produces the expected frame-scaled 0.013333
+                // vector. Recreate SH3's native formula (frame time times its
+                // ordinary 1.2 movement factor) when the room-specific path
+                // fails, then let the original slope/collision and x500
+                // position integration run unchanged.
+                // Keep SH3's global simulation and animation timing entirely
+                // untouched. This value is only the local VR movement-vector
+                // interval; walk/run multipliers compensate for its 90 Hz
+                // cadence before the stock collision path consumes it.
+                float frameSeconds = *reinterpret_cast<volatile float*>(
+                    0x070E67ACu);
+                if (!std::isfinite(frameSeconds) || frameSeconds < 0.001f ||
+                    frameSeconds > 0.1f)
+                {
+                    frameSeconds = 1.0f / 90.0f;
+                }
+                constexpr float ordinaryMovementFactor = 1.8f;
+                constexpr float runningMovementFactor = 3.6f;
+                const bool runRequested = InterlockedCompareExchange(
+                    &g_cameraModRunRequested8, 0, 0) != 0;
+                const float minimumWalkingPreIntegration = std::clamp(
+                    frameSeconds * (runRequested
+                        ? runningMovementFactor : ordinaryMovementFactor),
+                    0.008f, 0.050f);
+                // The affected SH3 path leaves its locomotion factor at zero.
+                // Position recovery alone moves Heather but does not advance
+                // the native gait/footstep state. Restore the same walk/run
+                // factor consumed by the surrounding stock routine so sound
+                // and animation events continue normally.
+                *reinterpret_cast<float*>(player + 0x11Cu) = runRequested
+                    ? runningMovementFactor : ordinaryMovementFactor;
+                effectiveSpeed = (std::max)(horizontalSpeed,
+                    minimumWalkingPreIntegration);
+                speedFloorApplied = effectiveSpeed > horizontalSpeed;
+
+                // Rotate only the direction before slope/collision adjustment
+                // and position integration. Faster native states are preserved.
+                rotatedX = std::sin(movementHeading) * effectiveSpeed;
+                rotatedZ = std::cos(movementHeading) * effectiveSpeed;
                 *reinterpret_cast<float*>(player + 0xF0u) = rotatedX;
                 *reinterpret_cast<float*>(player + 0xF8u) = rotatedZ;
                 rotated = true;
@@ -6741,6 +7436,8 @@ static void __cdecl hk_SH3_AdjustMovementVector(float* first, float* second)
 
     if (rotated)
     {
+        adjustedX = *reinterpret_cast<const float*>(player + 0xF0u);
+        adjustedZ = *reinterpret_cast<const float*>(player + 0xF8u);
         const LONG count = InterlockedIncrement(
             &g_cameraModMovementVectorLogCount8);
         if (count <= 12 || count % 1800 == 0)
@@ -6753,19 +7450,103 @@ static void __cdecl hk_SH3_AdjustMovementVector(float* first, float* second)
                 originalX * originalX + originalZ * originalZ);
             const float rotatedLength = std::sqrt(
                 rotatedX * rotatedX + rotatedZ * rotatedZ);
+            const float adjustedLength = std::sqrt(
+                adjustedX * adjustedX + adjustedZ * adjustedZ);
             Log("Camera-relative movement vector %d: stick right/forward "
-                "x1000 %d/%d, native/rotated speed x1000000 %d/%d",
+                "x1000 %d/%d, native/effective/rotated/adjusted speed "
+                "x1000000 %d/%d/%d/%d, integration x500, floor %s, "
+                "simulation heading %s, run %s, caller RVA 0x%08X (%s)",
                 count,
                 static_cast<int>(std::lround(localRight * 1000.0f)),
                 static_cast<int>(std::lround(localForward * 1000.0f)),
                 static_cast<int>(std::lround(originalLength * 1000000.0f)),
-                static_cast<int>(std::lround(rotatedLength * 1000000.0f)));
+                static_cast<int>(std::lround(effectiveSpeed * 1000000.0f)),
+                static_cast<int>(std::lround(rotatedLength * 1000000.0f)),
+                static_cast<int>(std::lround(adjustedLength * 1000000.0f)),
+                speedFloorApplied ? "applied" : "native",
+                simulationHeadingAligned ? "aligned" : "unchanged",
+                InterlockedCompareExchange(&g_cameraModRunRequested8,
+                    0, 0) != 0 ? "requested" : "off",
+                static_cast<unsigned>(callerRva),
+                callerRva == normalMovementCallerRva ? "normal" :
+                    (callerRva == aimingMovementCallerRva ? "aiming" :
+                        "unknown"));
+        }
+    }
+}
+
+static void __cdecl hk_SH3_AddPositionVector(float* position,
+    const float* delta)
+{
+    constexpr LONG normalIntegrationCallerRva = 0x000D4053;
+    constexpr LONG aimingIntegrationCallerRva = 0x000EAECC;
+    BYTE* executable = reinterpret_cast<BYTE*>(GetModuleHandleA(nullptr));
+    const BYTE* returnAddress = reinterpret_cast<const BYTE*>(_ReturnAddress());
+    const LONG callerRva = executable && returnAddress >= executable
+        ? static_cast<LONG>(returnAddress - executable)
+        : -1;
+
+    const bool movementActive = g_enableCameraRelativeStrafe8 &&
+        InterlockedCompareExchange(
+            &g_cameraModPendingMovementActive8, 0, 0) != 0;
+    const bool movementIntegrationCall =
+        callerRva == normalIntegrationCallerRva ||
+        callerRva == aimingIntegrationCallerRva;
+    if (!movementActive || !movementIntegrationCall)
+    {
+        o_SH3_AddPositionVector(position, delta);
+        return;
+    }
+
+    BYTE* player = nullptr;
+    if (executable)
+    {
+        BYTE** playerAddress = reinterpret_cast<BYTE**>(executable +
+            (0x0712C100u - 0x00400000u));
+        player = IsWritableMemoryRange(playerAddress,
+            sizeof(*playerAddress)) ? *playerAddress : nullptr;
+    }
+
+    const bool validPosition = IsWritableMemoryRange(position,
+        sizeof(float) * 4u);
+    const bool validDelta = delta &&
+        IsWritableMemoryRange(const_cast<float*>(delta), sizeof(float) * 3u);
+    const float beforeX = validPosition ? position[0] : 0.0f;
+    const float beforeZ = validPosition ? position[2] : 0.0f;
+    const float deltaX = validDelta ? delta[0] : 0.0f;
+    const float deltaZ = validDelta ? delta[2] : 0.0f;
+
+    o_SH3_AddPositionVector(position, delta);
+
+    if (movementActive)
+    {
+        const LONG count = InterlockedIncrement(
+            &g_cameraModPositionIntegrationLogCount8);
+        if (count <= 24 || count % 1800 == 0)
+        {
+            const bool sameObject = reinterpret_cast<BYTE*>(position) == player;
+            const float afterX = validPosition ? position[0] : 0.0f;
+            const float afterZ = validPosition ? position[2] : 0.0f;
+            Log("Camera-relative position integration %d: caller RVA "
+                "0x%08X, target %s, delta x/z x1000 %d/%d, position "
+                "before/after x/z x1000 %d/%d -> %d/%d, movement caller "
+                "RVA 0x%08X",
+                count, static_cast<unsigned>(callerRva),
+                sameObject ? "Heather" : "other",
+                static_cast<int>(std::lround(deltaX * 1000.0f)),
+                static_cast<int>(std::lround(deltaZ * 1000.0f)),
+                static_cast<int>(std::lround(beforeX * 1000.0f)),
+                static_cast<int>(std::lround(beforeZ * 1000.0f)),
+                static_cast<int>(std::lround(afterX * 1000.0f)),
+                static_cast<int>(std::lround(afterZ * 1000.0f)),
+                static_cast<unsigned>(InterlockedCompareExchange(
+                    &g_cameraModLastMovementCallerRva8, 0, 0)));
         }
     }
 }
 
 static bool SynchronizeHeatherHeadingToCameraModView(
-    const D3DMATRIX& baseView)
+    const D3DMATRIX& baseView, const D3DMATRIX& trackedView)
 {
     if (!g_enableCameraRelativeStrafe8)
         return false;
@@ -6777,13 +7558,46 @@ static bool SynchronizeHeatherHeadingToCameraModView(
         &cameraModYawDegrees))
         return false;
 
+    // Publish the untracked Camera Mod basis for locomotion because the input
+    // bridge already applies relative HMD yaw to the stick. Use the final VR
+    // view separately for Heather-facing systems such as interactions and the
+    // stock character-mounted flashlight, avoiding double head rotation in
+    // movement while still updating those systems when the player stands.
     InterlockedExchange(&g_cameraModLastRenderHeadingBits8,
         EncodeFloatBits(targetYaw));
     InterlockedExchange(&g_cameraModLastRenderHeadingValid8, 1);
 
+    // Do not rotate Heather or write locomotion state while SH3 owns a damage
+    // knockdown/get-up animation. Keeping the last camera heading published
+    // lets input resume seamlessly after the native recovery completes.
+    if (IsHeatherDamageRecoveryActive8())
+        return true;
+
+    float bodyTargetYaw = targetYaw;
+    if (!GetMotionCombatTrackedHeading8(&bodyTargetYaw))
+    {
+        D3DMATRIX trackedCameraWorld = {};
+        if (InvertD3D8Matrix(trackedView, trackedCameraWorld))
+        {
+            const float forwardX = trackedCameraWorld.m[2][0];
+            const float forwardZ = trackedCameraWorld.m[2][2];
+            const float horizontalLength = std::sqrt(
+                forwardX * forwardX + forwardZ * forwardZ);
+            if (std::isfinite(horizontalLength) && horizontalLength >= 0.001f)
+            {
+                bodyTargetYaw = std::atan2(forwardX / horizontalLength,
+                    forwardZ / horizontalLength);
+                constexpr float pi = 3.14159265358979323846f;
+                if (g_cameraModForwardAxisSign8 < 0)
+                    bodyTargetYaw = NormalizeHeadingRadians(bodyTargetYaw + pi);
+                bodyTargetYaw = NormalizeHeadingRadians(bodyTargetYaw + pi);
+            }
+        }
+    }
+
     const float currentYaw = NormalizeHeadingRadians(
         *reinterpret_cast<const float*>(player + 0x14u));
-    const float delta = NormalizeHeadingRadians(targetYaw - currentYaw);
+    const float delta = NormalizeHeadingRadians(bodyTargetYaw - currentYaw);
     if (std::fabs(delta) < 0.0005f)
         return true;
 
@@ -6791,17 +7605,19 @@ static bool SynchronizeHeatherHeadingToCameraModView(
     // Once simulation has completed, align the rendered body and flashlight
     // with Camera Mod. The next movement sample writes both current and
     // previous simulation headings before native forward locomotion runs.
-    if (!SetHeatherHeading(player, targetYaw))
+    if (!SetHeatherHeading(player, bodyTargetYaw))
         return false;
 
     const LONG count = InterlockedIncrement(&g_cameraModHeadingSyncLogCount8);
     if (count == 1 || count % 1800 == 0)
     {
         constexpr float radiansToDegrees = 57.2957795130823208768f;
-        Log("Camera-relative render heading sync %d: Heather %.1f -> %.1f "
-            "degrees, Camera Mod yaw %.1f degrees",
-            count, currentYaw * radiansToDegrees,
-            targetYaw * radiansToDegrees, cameraModYawDegrees);
+        Log("Camera-relative render heading sync %d: Heather x10 %d -> %d "
+            "degrees, Camera Mod yaw x10 %d",
+            count,
+            static_cast<int>(std::lround(currentYaw * radiansToDegrees * 10.0f)),
+            static_cast<int>(std::lround(bodyTargetYaw * radiansToDegrees * 10.0f)),
+            static_cast<int>(std::lround(cameraModYawDegrees * 10.0f)));
     }
     return true;
 }
@@ -7961,6 +8777,10 @@ static bool ApplyHeadRotationToViewProjection(const float gameViewProjection[16]
     if (!IsColumnVectorCameraView(cameraView))
         return false;
 
+    const float cameraDeterminant = CameraBasisDeterminant8(cameraView);
+    g_currentViewProjectionBasisValid8 = true;
+    g_currentViewProjectionDeterminant8 = cameraDeterminant;
+
     float relativeOrientation[4] = {};
     float relativePosition[3] = {};
     if (!ReadRelativeHeadPose(relativeOrientation, relativePosition))
@@ -8973,6 +9793,32 @@ typedef HRESULT(STDMETHODCALLTYPE* PFN8_TextureGetLevelDesc)(
     IDirect3DBaseTexture8*, UINT, D3D8SurfaceDescLocal*);
 typedef HRESULT(STDMETHODCALLTYPE* PFN8_TextureGetSurfaceLevel)(
     IDirect3DBaseTexture8*, UINT, IDirect3DSurface8**);
+typedef ULONG(STDMETHODCALLTYPE* PFN8_BaseTextureAddRef)(
+    IDirect3DBaseTexture8*);
+typedef ULONG(STDMETHODCALLTYPE* PFN8_BaseTextureRelease)(
+    IDirect3DBaseTexture8*);
+
+static void ResetCopiedOffscreenTargets8()
+{
+    for (LONG index = 0; index < g_copiedOffscreenTargetCount8; ++index)
+    {
+        if (g_copiedOffscreenTargets8[index])
+            ReleaseD3D8Surface(g_copiedOffscreenTargets8[index]);
+    }
+    std::memset(g_copiedOffscreenTargets8, 0,
+        sizeof(g_copiedOffscreenTargets8));
+    g_copiedOffscreenTargetCount8 = 0;
+    std::memset(g_currentTextureCopiedFromOffscreen8, 0,
+        sizeof(g_currentTextureCopiedFromOffscreen8));
+}
+
+static void ResetRecentOffscreenRenderTargets8()
+{
+    g_recentOffscreenTargetCount8 = 0;
+    std::memset(g_recentOffscreenTargets8, 0,
+        sizeof(g_recentOffscreenTargets8));
+    ResetCopiedOffscreenTargets8();
+}
 
 static void RememberOffscreenRenderTarget8(IDirect3DSurface8* color)
 {
@@ -8987,6 +9833,129 @@ static void RememberOffscreenRenderTarget8(IDirect3DSurface8* color)
             return;
     }
     g_recentOffscreenTargets8[g_recentOffscreenTargetCount8++] = color;
+}
+
+static bool IsRecentOffscreenRenderTarget8(IDirect3DSurface8* surface)
+{
+    if (!surface)
+        return false;
+    for (LONG index = 0; index < g_recentOffscreenTargetCount8; ++index)
+    {
+        if (g_recentOffscreenTargets8[index] == surface)
+            return true;
+    }
+    return false;
+}
+
+static void RememberCopiedOffscreenTarget8(IDirect3DSurface8* surface)
+{
+    if (!surface)
+        return;
+    for (LONG index = 0; index < g_copiedOffscreenTargetCount8; ++index)
+    {
+        if (g_copiedOffscreenTargets8[index] == surface)
+            return;
+    }
+    if (g_copiedOffscreenTargetCount8 >=
+        static_cast<LONG>(_countof(g_copiedOffscreenTargets8)))
+    {
+        return;
+    }
+    D3D8Slot<PFNS8_AddRef>(surface, 1)(surface);
+    g_copiedOffscreenTargets8[g_copiedOffscreenTargetCount8++] = surface;
+}
+
+static bool TextureUsesCopiedOffscreenTarget8(
+    IDirect3DBaseTexture8* texture)
+{
+    if (!texture || g_copiedOffscreenTargetCount8 <= 0)
+        return false;
+
+    IDirect3DSurface8* levelSurface = nullptr;
+    bool matches = false;
+    __try
+    {
+        if (FAILED(D3D8Slot<PFN8_TextureGetSurfaceLevel>(texture, 15)(
+            texture, 0, &levelSurface)) || !levelSurface)
+        {
+            return false;
+        }
+        for (LONG index = 0; index < g_copiedOffscreenTargetCount8; ++index)
+        {
+            if (g_copiedOffscreenTargets8[index] == levelSurface)
+            {
+                matches = true;
+                break;
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        matches = false;
+    }
+    if (levelSurface)
+        ReleaseD3D8Surface(levelSurface);
+    return matches;
+}
+
+static HRESULT WINAPI hk_D3D8_CopyRects(IDirect3DDevice8* device,
+    IDirect3DSurface8* source, const RECT* sourceRects, UINT rectangleCount,
+    IDirect3DSurface8* destination, const POINT* destinationPoints)
+{
+    const HRESULT result = o_D3D8_CopyRects(device, source, sourceRects,
+        rectangleCount, destination, destinationPoints);
+    if (FAILED(result) || !source || !destination)
+        return result;
+
+    D3D8SurfaceDescLocal sourceDesc = {};
+    D3D8SurfaceDescLocal destinationDesc = {};
+    if (FAILED(D3D8Slot<PFNS8_GetDesc>(source, 8)(source, &sourceDesc)) ||
+        FAILED(D3D8Slot<PFNS8_GetDesc>(destination, 8)(destination,
+            &destinationDesc)))
+    {
+        return result;
+    }
+
+    const bool primaryDescription = g_gameRenderTargetDescriptorValid8 &&
+        sourceDesc.Width == g_gameRenderTargetWidth8 &&
+        sourceDesc.Height == g_gameRenderTargetHeight8 &&
+        sourceDesc.Format == g_gameRenderTargetFormat8;
+    const bool copiedFromOffscreen =
+        IsRecentOffscreenRenderTarget8(source) ||
+        ((sourceDesc.Usage & 0x00000001u) != 0 && !primaryDescription);
+    const bool largeSceneCopy = sourceDesc.Width >= 512u &&
+        sourceDesc.Height >= 512u && destinationDesc.Width >= 512u &&
+        destinationDesc.Height >= 512u;
+    if (!copiedFromOffscreen || !largeSceneCopy)
+        return result;
+
+    RememberCopiedOffscreenTarget8(destination);
+    for (DWORD stage = 0; stage < _countof(g_currentTextures8); ++stage)
+    {
+        if (g_currentTextures8[stage] &&
+            TextureUsesCopiedOffscreenTarget8(g_currentTextures8[stage]))
+        {
+            g_currentTextureCopiedFromOffscreen8[stage] = true;
+        }
+    }
+
+    const LONG logOrdinal = InterlockedIncrement(&g_loggedOffscreenCopyCount8);
+    if (logOrdinal <= 16)
+    {
+        HMODULE gameModule = GetModuleHandleA(nullptr);
+        const UINT_PTR callerAddress = reinterpret_cast<UINT_PTR>(
+            _ReturnAddress());
+        const UINT_PTR gameBase = reinterpret_cast<UINT_PTR>(gameModule);
+        const UINT_PTR callerRva = gameModule && callerAddress >= gameBase
+            ? callerAddress - gameBase : 0;
+        Log("Off-screen scene copy tracked %d: %ux%u usage 0x%08X -> "
+            "%ux%u usage 0x%08X, rects %u, caller RVA 0x%08X",
+            logOrdinal, sourceDesc.Width, sourceDesc.Height, sourceDesc.Usage,
+            destinationDesc.Width, destinationDesc.Height,
+            destinationDesc.Usage, rectangleCount,
+            static_cast<unsigned>(callerRva));
+    }
+    return result;
 }
 
 static bool TextureUsesRecentOffscreenTarget8(
@@ -9097,6 +10066,117 @@ static bool IsPrimarySceneDrawSamplingRenderTargetTexture8(DWORD* stage,
     if (height)
         *height = g_currentTextureHeights8[matchingStage];
     return true;
+}
+
+static bool BeginPlanarReflectionTextureSuppression8(
+    IDirect3DDevice8* device, bool indexed, DWORD primitiveType,
+    UINT primitiveCount, PlanarReflectionTextureSuppression8* suppression)
+{
+    if (!suppression)
+        return false;
+    suppression->stageMask = 0;
+    std::memset(suppression->textures, 0, sizeof(suppression->textures));
+
+    if (!g_disablePlanarReflections8 || !device ||
+        (!g_viewProjectionAppliedThisFrame8 && !g_previousImmersiveFrame8 &&
+            !g_fullSceneStereoReplayActive8) ||
+        !ShouldReplayStereoDraw(g_currentVertexShader8, indexed,
+            primitiveType, primitiveCount, true))
+    {
+        return false;
+    }
+
+    bool primarySceneTarget = g_fullSceneStereoReplayActive8 &&
+        g_fullScenePrimaryTargetBound8;
+    if (!g_fullSceneStereoReplayActive8)
+    {
+        IDirect3DSurface8* target = nullptr;
+        if (SUCCEEDED(D3D8Slot<PFN8_GetRenderTarget>(device, 32)(device,
+            &target)) && target)
+        {
+            // Water can be the first selected buffered pass after SH3 changes
+            // targets, before IsPrimaryGameRenderTarget has locked the world
+            // surface for this frame. The backbuffer descriptor is stable at
+            // that point and is the same discriminator used by the original
+            // Sewer RTT detector.
+            primarySceneTarget = MatchesPrimaryGameRenderTargetDescription(
+                target);
+            ReleaseD3D8Surface(target);
+        }
+    }
+    if (!primarySceneTarget)
+        return false;
+
+    DWORD firstStage = 0;
+    UINT firstWidth = 0;
+    UINT firstHeight = 0;
+    UINT suppressedCount = 0;
+    for (DWORD stage = 0; stage < _countof(g_currentTextures8); ++stage)
+    {
+        IDirect3DBaseTexture8* texture = g_currentTextures8[stage];
+        if (!texture || (!g_currentTextureIsRenderTarget8[stage] &&
+            !g_currentTextureCopiedFromOffscreen8[stage] &&
+            !TextureUsesRecentOffscreenTarget8(texture) &&
+            !TextureUsesCopiedOffscreenTarget8(texture)))
+        {
+            continue;
+        }
+        // The flashlight/light-map target is 256x256. Sewer reflection and
+        // the equivalent water effects use a large scene target; suppressing
+        // only those keeps head-tracked lighting and small emissive passes.
+        if (g_currentTextureWidths8[stage] < 512u &&
+            g_currentTextureHeights8[stage] < 512u)
+        {
+            continue;
+        }
+
+        D3D8Slot<PFN8_BaseTextureAddRef>(texture, 1)(texture);
+        if (SUCCEEDED(o_D3D8_SetTexture(device, stage, nullptr)))
+        {
+            suppression->stageMask |= 1u << stage;
+            suppression->textures[stage] = texture;
+            if (suppressedCount == 0)
+            {
+                firstStage = stage;
+                firstWidth = g_currentTextureWidths8[stage];
+                firstHeight = g_currentTextureHeights8[stage];
+            }
+            ++suppressedCount;
+        }
+        else
+        {
+            D3D8Slot<PFN8_BaseTextureRelease>(texture, 2)(texture);
+        }
+    }
+
+    if (suppressedCount != 0 && !g_loggedPlanarReflectionSuppression8)
+    {
+        g_loggedPlanarReflectionSuppression8 = true;
+        Log("Planar water reflections disabled: removed %u render-target "
+            "texture stage(s), first stage %u (%ux%u), %s, %u primitives",
+            suppressedCount, static_cast<unsigned>(firstStage), firstWidth,
+            firstHeight, indexed ? "DrawIndexedPrimitive" : "DrawPrimitive",
+            primitiveCount);
+    }
+    return suppressedCount != 0;
+}
+
+static void EndPlanarReflectionTextureSuppression8(IDirect3DDevice8* device,
+    PlanarReflectionTextureSuppression8* suppression)
+{
+    if (!device || !suppression || suppression->stageMask == 0)
+        return;
+
+    for (DWORD stage = 0; stage < _countof(suppression->textures); ++stage)
+    {
+        if ((suppression->stageMask & (1u << stage)) == 0)
+            continue;
+        IDirect3DBaseTexture8* texture = suppression->textures[stage];
+        o_D3D8_SetTexture(device, stage, texture);
+        D3D8Slot<PFN8_BaseTextureRelease>(texture, 2)(texture);
+        suppression->textures[stage] = nullptr;
+    }
+    suppression->stageMask = 0;
 }
 
 static bool IsLikelyUiAtlasDraw8()
@@ -9510,6 +10590,7 @@ static void ReleaseD3D8Surface(IDirect3DSurface8*& surface)
 static void ReleaseStereoRenderTargets()
 {
     ResetBatchedFog8();
+    ResetRecentOffscreenRenderTargets8();
     ReleaseD3D8Surface(g_stereoRightDepth8);
     ReleaseD3D8Surface(g_stereoRightColor8);
     ReleaseD3D8Surface(g_stereoLeftDepth8);
@@ -13320,7 +14401,7 @@ static HRESULT WINAPI hk_D3D8_SetTransform(IDirect3DDevice8* device, DWORD state
                 &c_present8, 0, 0);
             if (g_cameraModHeadingSyncPresent8 != presentFrame)
             {
-                SynchronizeHeatherHeadingToCameraModView(*matrix);
+                SynchronizeHeatherHeadingToCameraModView(*matrix, vrView);
                 g_cameraModHeadingSyncPresent8 = presentFrame;
             }
             const HRESULT result = o_D3D8_SetTransform(device, state, &vrView);
@@ -13340,7 +14421,7 @@ static HRESULT WINAPI hk_D3D8_SetTransform(IDirect3DDevice8* device, DWORD state
                 &c_present8, 0, 0);
             if (g_cameraModHeadingSyncPresent8 != presentFrame)
             {
-                SynchronizeHeatherHeadingToCameraModView(*matrix);
+                SynchronizeHeatherHeadingToCameraModView(*matrix, vrView);
                 g_cameraModHeadingSyncPresent8 = presentFrame;
             }
             const HRESULT result = o_D3D8_SetTransform(device, state, &vrView);
@@ -13424,6 +14505,10 @@ static HRESULT WINAPI hk_D3D8_Present(IDirect3DDevice8* device, const RECT* src,
     ApplyProxyFrameTimeState90Hz();
 
     const LONG frame = InterlockedIncrement(&c_present8);
+    // Draw hooks collect the frame which ended at this Present. Tracing is
+    // armed only after an immersive entry, so this never consumes the entry
+    // frame which caused the transition itself.
+    AdvanceSceneDrawTrace8();
     UpdateGamePostProcessState8();
     PollNativeEyeAsyncCopy();
     const bool use90FpsTiming = Apply90FpsTimingPatch();
@@ -13498,6 +14583,8 @@ static HRESULT WINAPI hk_D3D8_Present(IDirect3DDevice8* device, const RECT* src,
     const bool immersive = g_viewProjectionAppliedThisFrame8;
     if (immersive != g_previousImmersiveFrame8)
     {
+        if (!immersive && g_sceneDrawTraceFramesRemaining8 > 0)
+            FlushSceneDrawTrace8("gameplay ended before 3 frames");
         // A save/room load replaces shader objects and may leave a loading or
         // menu frame between two gameplay scenes. Do not carry partially
         // filled eye targets, an overflow fallback, or a cached intermediate
@@ -13518,11 +14605,9 @@ static HRESULT WINAPI hk_D3D8_Present(IDirect3DDevice8* device, const RECT* src,
         g_fullSceneStereoReplayActive8 = false;
         g_fullScenePrimaryTargetBound8 = false;
         g_forceWaterFullSceneStereo8 = false;
+        ResetRecentOffscreenRenderTargets8();
         g_holdPreviousNativeEyeFrame8 = false;
         g_transientEffectPresentPreviousFrame8 = false;
-        g_recentOffscreenTargetCount8 = 0;
-        std::memset(g_recentOffscreenTargets8, 0,
-            sizeof(g_recentOffscreenTargets8));
         ReleaseD3D8Surface(g_stereoReplayTarget8);
         if (g_stereoReplayTargetContainer8)
         {
@@ -13531,9 +14616,26 @@ static HRESULT WINAPI hk_D3D8_Present(IDirect3DDevice8* device, const RECT* src,
         }
         g_stereoReplayTargetFrame8 = -1;
         g_primaryTargetRefreshFrame8 = -1;
+        if (immersive)
+        {
+            // Weapon previews are rendered while the inventory/menu is still
+            // active and can otherwise leave their profile owning the Motion
+            // pose after a real weapon switch.  Release only the render-side
+            // owner at the gameplay boundary; the first weapon draw in the
+            // scene will reacquire it.  Continuous gameplay never crosses
+            // this boundary, so Memory of Alessa cannot steal the profile
+            // merely by drawing Heather-compatible weapon meshes.
+            SaveWeaponPoseBaselineCache8(g_activeWeaponPoseProfile8);
+            g_activeWeaponPoseProfile8 = -1;
+            InterlockedExchange(&g_activeWeaponPoseSeenPresent8, -1000);
+            g_nonPlayerWeaponDrawLoggedMask8 = 0;
+            ResetWeaponPoseProfileState8();
+        }
         Log(immersive
             ? "Stereo scene state reset before entering gameplay"
             : "Stereo scene state reset after leaving gameplay");
+        if (immersive)
+            StartSceneDrawTrace8(frame);
         if (!immersive)
         {
             InterlockedExchange(&g_cameraModPendingMovementActive8, 0);
@@ -13728,6 +14830,9 @@ static HRESULT WINAPI hk_D3D8_Present(IDirect3DDevice8* device, const RECT* src,
         (immersive && g_enableAlternatingStereo8
         ? g_renderEye8 : 0));
     g_viewProjectionAppliedThisFrame8 = false;
+    g_currentViewProjectionBasisValid8 = false;
+    g_currentViewProjectionDeterminant8 = 0.0f;
+    g_currentViewProjectionHash8 = 0;
     g_haveFlashlightViewPair8 = false;
     g_viewCallsThisFrame8 = 0;
     g_projectionCallsThisFrame8 = 0;
@@ -13884,6 +14989,9 @@ static HRESULT WINAPI hk_D3D8_Reset(IDirect3DDevice8* device, void* presentParam
     InterlockedExchange(&g_muzzleFlashLastActivityTick8, 0);
     InterlockedExchange(&g_muzzleFlashLastPulseTick8, 0);
     InterlockedExchange(&g_muzzleFlashLastPulseProfile8, -1);
+    InterlockedExchange(&g_firearmTriggerHeld8, 0);
+    InterlockedExchange(&g_firearmTriggerGeneration8, 0);
+    InterlockedExchange(&g_firearmLastPulseTriggerGeneration8, -1);
     g_muzzleFlashLogged8 = false;
     g_muzzleSmokeRenderedPresent8 = -1;
     InterlockedExchange(&g_muzzleSmokeProfile8, -1);
@@ -13906,9 +15014,10 @@ static HRESULT WINAPI hk_D3D8_Reset(IDirect3DDevice8* device, void* presentParam
         sizeof(g_currentTextureWidths8));
     std::memset(g_currentTextureHeights8, 0,
         sizeof(g_currentTextureHeights8));
-    std::memset(g_recentOffscreenTargets8, 0,
-        sizeof(g_recentOffscreenTargets8));
-    g_recentOffscreenTargetCount8 = 0;
+    ResetRecentOffscreenRenderTargets8();
+    g_forceWaterFullSceneStereo8 = false;
+    g_loggedWaterFullSceneStereo8 = false;
+    g_loggedWaterRttDetection8 = false;
     g_framePacingDeadline8 = 0;
     ReleaseStereoRenderTargets();
     Interop8_OnDeviceReset();
@@ -14484,12 +15593,20 @@ bool D3D9Hook_Install()
     g_enableCameraRelativeStrafe8 =
         ReadInputSetting("CameraRelativeStrafe", 1) != 0;
     InterlockedExchange(&g_cameraModPendingMovementActive8, 0);
+    InterlockedExchange(&g_cameraModRunRequested8, 0);
+    InterlockedExchange(&g_heatherDamageRecoveryUntilTick8, 0);
     InterlockedExchange(&g_cameraModLastRenderHeadingValid8, 0);
+    InterlockedExchange(&g_cameraModLastMovementCallerRva8, 0);
+    g_cameraModForwardAxisSign8 = 0;
+    g_cameraModLastAxisYawDegrees8 = 0.0f;
+    g_cameraModLastAxisYawValid8 = false;
+    g_loggedCameraHeadingSource8 = false;
     g_cameraModMovementVectorLogCount8 = 0;
+    g_cameraModPositionIntegrationLogCount8 = 0;
     g_cameraModTurnMode8 = std::clamp(
         ReadInputSetting("CameraModTurnMode", 0), 0, 1);
     g_enableHeadTrackedFlashlight8 =
-        ReadInputSetting("HeadTrackedFlashlight", 0) != 0;
+        ReadInputSetting("HeadTrackedFlashlight", 1) != 0;
     int cameraModSnapActivation =
         ReadInputSetting("CameraModSnapTurnActivation", 65);
     cameraModSnapActivation = std::clamp(cameraModSnapActivation, 20, 95);
@@ -14667,6 +15784,30 @@ bool D3D9Hook_Install()
             else
                 Log("ERROR: failed to enable camera-relative SH3 "
                     "movement-vector hook");
+        }
+
+        BYTE* addPositionTarget = reinterpret_cast<BYTE*>(executable) +
+            0x00075130u;
+        static const BYTE expectedAddPositionPrologue[] = {
+            0x8B, 0x44, 0x24, 0x04, 0x8B, 0x4C, 0x24, 0x08,
+            0xD9, 0x00, 0xD8, 0x01, 0xD9, 0x18
+        };
+        if (std::memcmp(addPositionTarget, expectedAddPositionPrologue,
+                sizeof(expectedAddPositionPrologue)) != 0)
+        {
+            Log("Camera-relative position-integration hook disabled: "
+                "unsupported SH3.EXE layout at RVA 0x00075130");
+        }
+        else if (HookOne("SH3 position integration RVA 0x00075130",
+            addPositionTarget, &hk_SH3_AddPositionVector,
+            reinterpret_cast<void**>(&o_SH3_AddPositionVector)))
+        {
+            if (MH_EnableHook(addPositionTarget) == MH_OK)
+                Log("Camera-relative SH3 position-integration diagnostics "
+                    "enabled");
+            else
+                Log("ERROR: failed to enable camera-relative SH3 "
+                    "position-integration diagnostics");
         }
     }
 

@@ -28,6 +28,7 @@ extern bool D3D9Hook_GetRelativeHeadYawRadians(float* yawRadians);
 extern bool D3D9Hook_IsGameplayInputActive();
 extern bool D3D9Hook_ApplyCameraRelativeMovementHeading(float localRight,
     float localForward);
+extern void D3D9Hook_SetCameraRelativeRun(bool runRequested);
 extern bool D3D9Hook_GetMeleeWeaponHitbox(std::uint8_t gameWeapon,
     float gripWorld[4], float tipWorld[4], float* radiusGameUnits);
 extern bool D3D9Hook_GetFirearmAimRay(std::uint8_t gameWeapon,
@@ -35,6 +36,8 @@ extern bool D3D9Hook_GetFirearmAimRay(std::uint8_t gameWeapon,
 extern bool D3D9Hook_GetActiveFirearmAimRay(float muzzleWorld[4],
     float rayEndWorld[4]);
 extern void D3D9Hook_NotifyFirearmDischarge();
+extern void D3D9Hook_SetFirearmTriggerState(bool held);
+extern void D3D9Hook_NotifyHeatherDamage();
 extern void Interop8_RequestHaptics(std::uint32_t handMask, float amplitude,
     float durationSeconds, float frequency);
 
@@ -57,6 +60,7 @@ static volatile LONG g_cameraModStrafeLogged = 0;
 static GetKeyStateFn g_originalGetKeyState = nullptr;
 static GetAsyncKeyStateFn g_originalGetAsyncKeyState = nullptr;
 static bool g_rightTriggerAutoAim = true;
+static bool g_enableShootWhileRunning = false;
 static bool g_enableRightHandAim = false;
 static float g_aimMouseCountsPerDegree = 6.0f;
 static bool g_rightHandAimActive = false;
@@ -64,6 +68,7 @@ static std::int64_t g_rightHandAimLastDisplayTime = 0;
 static float g_rightHandAimVirtualYaw = 0.0f;
 static float g_rightHandAimVirtualPitch = 0.0f;
 static LONG g_rightHandAimLogCount = 0;
+static LONG g_shootWhileRunningActionBlockLogCount = 0;
 static bool g_enableMeleeMotion = true;
 static float g_meleeSwingSpeedMetersPerSecond = 2.80f;
 static float g_meleeSwingMinTravelMeters = 0.30f;
@@ -106,6 +111,11 @@ static float g_meleePendingCurrentTipWorld[4] = {};
 static float g_meleePendingRadiusGameUnits = 0.0f;
 static std::uint8_t g_meleePendingWeapon = 0;
 static DWORD g_meleePendingCollisionUntilTick = 0;
+// SH3 cannot reliably transition the Steel Pipe, Katana or Maul from the
+// forced camera-relative run path into their heavy melee actions. Briefly
+// release locomotion before the synthetic press and keep it released for the
+// native attack animation.
+static volatile LONG g_meleeLocomotionSuspendUntilTick = 0;
 // The PS2-derived character layout is not valid for the PC executable. Keep
 // this legacy read-only probe disabled unless a developer is investigating a
 // specific build; it can otherwise scan a large amount of unrelated memory.
@@ -117,6 +127,7 @@ static void* g_damageHapticsPlayer = nullptr;
 static float g_damageHapticsLastHealth = 0.0f;
 static bool g_damageHapticsHealthValid = false;
 static DWORD g_damageHapticsLastPollTick = 0;
+static DWORD g_damageHapticsPulseUntilTick = 0;
 static volatile LONG g_weaponScanStarted = 0;
 static volatile LONG g_gameFlashlightEnabled = 0;
 static volatile LONG g_gameFlashlightInputStateKnown = 0;
@@ -411,6 +422,36 @@ static bool TickIsBefore(DWORD now, DWORD end)
     return end != 0 && static_cast<LONG>(end - now) > 0;
 }
 
+static void ExpirePendingNativeMeleeReplacement(DWORD now)
+{
+    if (InterlockedCompareExchange(&g_meleePendingCollision, 0, 0) == 0 ||
+        TickIsBefore(now, g_meleePendingCollisionUntilTick))
+    {
+        return;
+    }
+
+    if (InterlockedExchange(&g_meleePendingCollision, 0) != 0)
+    {
+        Log("MotionControls: pending native melee replacement expired: "
+            "weapon %u", static_cast<unsigned>(g_meleePendingWeapon));
+    }
+}
+
+static bool IsMeleeLocomotionSuspended()
+{
+    const DWORD now = GetTickCount();
+    const DWORD untilTick = static_cast<DWORD>(InterlockedCompareExchange(
+        &g_meleeLocomotionSuspendUntilTick, 0, 0));
+    if (TickIsBefore(now, untilTick))
+        return true;
+    if (untilTick != 0)
+    {
+        InterlockedCompareExchange(&g_meleeLocomotionSuspendUntilTick, 0,
+            static_cast<LONG>(untilTick));
+    }
+    return false;
+}
+
 struct MenuAxisRepeatState
 {
     int direction;
@@ -582,9 +623,6 @@ static bool ReadNativePlayerWeaponContext(std::uint8_t* weapon,
 
 static void UpdateDamageHaptics()
 {
-    if (!g_enableDamageHaptics)
-        return;
-
     const DWORD now = GetTickCount();
     if (g_damageHapticsLastPollTick != 0 &&
         now - g_damageHapticsLastPollTick < 8u)
@@ -632,6 +670,22 @@ static void UpdateDamageHaptics()
     g_damageHapticsLastHealth = health;
     if (damage < minimumDamage)
         return;
+
+    // A single knockdown changes HP over many consecutive simulation ticks.
+    // Keep the movement/render hooks out of SH3's native damage recovery for
+    // the whole sequence, but do not restart a multi-second haptic pulse for
+    // every fractional HP update.
+    D3D9Hook_NotifyHeatherDamage();
+    if (!g_enableDamageHaptics)
+        return;
+
+    if (g_damageHapticsPulseUntilTick != 0 &&
+        static_cast<LONG>(g_damageHapticsPulseUntilTick - now) > 0)
+    {
+        return;
+    }
+    g_damageHapticsPulseUntilTick = now + static_cast<DWORD>(
+        g_damageHapticsDurationSeconds * 1000.0f);
 
     Interop8_RequestHaptics(SH3VR_HAPTIC_LEFT_HAND |
         SH3VR_HAPTIC_RIGHT_HAND, g_damageHapticsAmplitude,
@@ -722,25 +776,19 @@ static void __cdecl HookedNativeAddBattleCollision(
 
     Sh3NativeBattleCollision collision = *source;
     const DWORD now = GetTickCount();
+    ExpirePendingNativeMeleeReplacement(now);
     if (InterlockedCompareExchange(&g_meleePendingCollision, 0, 0) != 0)
     {
-        if (!TickIsBefore(now, g_meleePendingCollisionUntilTick))
+        std::uint8_t weapon = 0;
+        void* player = nullptr;
+        const bool playerMelee = ReadNativeMeleeContext(&weapon, &player);
+        const bool nativeMeleeCollision = collision.kind == 2u ||
+            collision.kind == 3u;
+        if (playerMelee && weapon == g_meleePendingWeapon &&
+            collision.attacker == static_cast<std::uint32_t>(
+                reinterpret_cast<std::uintptr_t>(player)) &&
+            nativeMeleeCollision)
         {
-            InterlockedExchange(&g_meleePendingCollision, 0);
-            Log("MotionControls: pending native melee replacement expired");
-        }
-        else
-        {
-            std::uint8_t weapon = 0;
-            void* player = nullptr;
-            const bool playerMelee = ReadNativeMeleeContext(&weapon, &player);
-            const bool nativeMeleeCollision = collision.kind == 2u ||
-                collision.kind == 3u;
-            if (playerMelee && weapon == g_meleePendingWeapon &&
-                collision.attacker == static_cast<std::uint32_t>(
-                    reinterpret_cast<std::uintptr_t>(player)) &&
-                nativeMeleeCollision)
-            {
                 std::memcpy(collision.previousGrip,
                     g_meleePendingPreviousGripWorld,
                     sizeof(collision.previousGrip));
@@ -767,7 +815,6 @@ static void __cdecl HookedNativeAddBattleCollision(
                     static_cast<unsigned>(weapon),
                     static_cast<unsigned>(collision.battleId),
                     static_cast<unsigned>(collision.kind));
-            }
         }
     }
 
@@ -884,6 +931,7 @@ static bool InstallNativeFirearmRayHook()
 
 static void UpdateMeleeSwing(const Sh3VrControllerState& controller)
 {
+    ExpirePendingNativeMeleeReplacement(GetTickCount());
     std::uint8_t gameWeapon = 0;
     void* player = nullptr;
     const bool haveNativeMelee = ReadNativeMeleeContext(&gameWeapon, &player);
@@ -1062,7 +1110,14 @@ static void UpdateMeleeSwing(const Sh3VrControllerState& controller)
                 netTravel = std::sqrt(netX * netX + netY * netY +
                     netZ * netZ);
             }
+            const bool heavyMeleeWeapon = gameWeapon >= 5u &&
+                gameWeapon <= 7u;
+            const bool heavyMeleeSequenceActive = heavyMeleeWeapon &&
+                (IsMeleeLocomotionSuspended() ||
+                    InterlockedCompareExchange(
+                        &g_meleePendingCollision, 0, 0) != 0);
             if (g_meleeSwingArmed && cooldownElapsed &&
+                !heavyMeleeSequenceActive &&
                 speed >= requiredSpeed &&
                 g_meleeSwingTravelMeters >= requiredTravel &&
                 netTravel >= requiredNetTravel)
@@ -1084,9 +1139,32 @@ static void UpdateMeleeSwing(const Sh3VrControllerState& controller)
                 // Let the game enqueue and process its normal attack. The
                 // weapon mesh remains controller-driven, while damage, stun,
                 // sounds and enemy reactions stay entirely native.
-                g_meleeAimPulseUntilTick = now + 950u;
-                g_meleeAttackPulseStartTick = now + 35u;
-                g_meleeAttackPulseUntilTick = now + 240u;
+                if (heavyMeleeWeapon)
+                {
+                    // These weapons use SH3's stationary heavy-attack state.
+                    // Release W/run first, then issue one bounded press;
+                    // otherwise forced locomotion can prevent clBattleAddQue
+                    // and repeated swings can latch the action state.
+                    constexpr DWORD heavySequenceMilliseconds = 1200u;
+                    InterlockedExchange(&g_meleeLocomotionSuspendUntilTick,
+                        static_cast<LONG>(now + heavySequenceMilliseconds));
+                    g_meleeAimPulseUntilTick = now +
+                        heavySequenceMilliseconds;
+                    g_meleeAttackPulseStartTick = now + 120u;
+                    g_meleeAttackPulseUntilTick = now + 420u;
+                    const char* heavyWeaponName = gameWeapon == 5u
+                        ? "Steel Pipe" : (gameWeapon == 6u
+                            ? "Katana" : "Maul");
+                    Log("MotionControls: %s attack released locomotion for "
+                        "%u ms before native heavy-melee processing",
+                        heavyWeaponName, heavySequenceMilliseconds);
+                }
+                else
+                {
+                    g_meleeAimPulseUntilTick = now + 950u;
+                    g_meleeAttackPulseStartTick = now + 35u;
+                    g_meleeAttackPulseUntilTick = now + 240u;
+                }
                 if (!nativeArmed)
                     Log("MotionControls: native melee replacement hook is "
                         "unavailable; using the attack pulse only");
@@ -1380,11 +1458,35 @@ static bool ControllerPressesVirtualKey(
     const bool cameraModMenuChord = leftStickPressed && rightStickPressed;
     const bool cameraModLoaded = IsCameraModLoaded();
     const bool gameplayInputActive = D3D9Hook_IsGameplayInputActive();
+    const bool meleeLocomotionSuspended = gameplayInputActive &&
+        IsMeleeLocomotionSuspended();
+    D3D9Hook_SetCameraRelativeRun(gameplayInputActive &&
+        !meleeLocomotionSuspended &&
+        (buttons & (SH3VR_BUTTON_LEFT_GRIP |
+            SH3VR_BUTTON_LEFT_STICK)) != 0);
     const MenuNavigationPulse menuNavigation = GetMenuNavigationPulse(
         controller.thumbstick[0][0], controller.thumbstick[0][1],
         gameplayInputActive);
     float moveX = controller.thumbstick[0][0];
     float moveY = controller.thumbstick[0][1];
+    if (meleeLocomotionSuspended)
+    {
+        moveX = 0.0f;
+        moveY = 0.0f;
+    }
+    const bool locomotionRequested = gameplayInputActive &&
+        (std::fabs(moveX) > movementThreshold ||
+            std::fabs(moveY) > movementThreshold);
+    const bool firearmTriggerAllowed =
+        (buttons & SH3VR_BUTTON_RIGHT_TRIGGER) != 0 &&
+        (g_enableShootWhileRunning || !locomotionRequested);
+    const bool actionAttackBlocked = !g_enableShootWhileRunning &&
+        gameplayInputActive && locomotionRequested &&
+        (buttons & (SH3VR_BUTTON_LEFT_TRIGGER |
+            SH3VR_BUTTON_RIGHT_TRIGGER)) != 0;
+    const bool actionButtonAllowed =
+        (buttons & SH3VR_BUTTON_A) != 0 && !actionAttackBlocked;
+    D3D9Hook_SetFirearmTriggerState(firearmTriggerAllowed);
     float headYaw = 0.0f;
     if (gameplayInputActive && cameraModLoaded &&
         D3D9Hook_GetRelativeHeadYawRadians(&headYaw))
@@ -1404,7 +1506,7 @@ static bool ControllerPressesVirtualKey(
     switch (virtualKey)
     {
     case VK_LBUTTON:
-        return (buttons & SH3VR_BUTTON_RIGHT_TRIGGER) != 0 ||
+        return firearmTriggerAllowed ||
             IsMeleeAttackPulseActive();
     case VK_RBUTTON:
         return (buttons & SH3VR_BUTTON_LEFT_TRIGGER) != 0 ||
@@ -1417,11 +1519,12 @@ static bool ControllerPressesVirtualKey(
         return rightStickPressed && !cameraModMenuChord;
     case VK_SHIFT:
     case VK_LSHIFT:
-        return (buttons & SH3VR_BUTTON_LEFT_GRIP) != 0 ||
-            (leftStickPressed && !cameraModMenuChord);
+        return !meleeLocomotionSuspended &&
+            ((buttons & SH3VR_BUTTON_LEFT_GRIP) != 0 ||
+                (leftStickPressed && !cameraModMenuChord));
     case VK_SPACE:
     case VK_RETURN:
-        return (buttons & SH3VR_BUTTON_A) != 0;
+        return actionButtonAllowed;
     case VK_ESCAPE:
         return (buttons & (SH3VR_BUTTON_B | SH3VR_BUTTON_MENU)) != 0;
     case 'I':
@@ -1500,20 +1603,47 @@ static HRESULT InjectControllerState(void* device, DWORD stateBytes,
         return result;
 
     if (InterlockedCompareExchange(&g_controllerInputLogged, 1, 0) == 0)
-        Log("InputBridge: live Quest Touch input is being injected");
+        Log("InputBridge: live OpenXR controller input is being injected");
 
     const std::uint32_t buttons = controller.buttons;
+    UpdateMeleeSwing(controller);
+    constexpr float attackMovementThreshold = 0.35f;
+    const bool gameplayInputActive = D3D9Hook_IsGameplayInputActive();
+    const bool meleeLocomotionSuspended = gameplayInputActive &&
+        IsMeleeLocomotionSuspended();
+    const bool locomotionRequested =
+        std::fabs(controller.thumbstick[0][0]) > attackMovementThreshold ||
+        std::fabs(controller.thumbstick[0][1]) > attackMovementThreshold;
+    const bool firearmTriggerAllowed =
+        (buttons & SH3VR_BUTTON_RIGHT_TRIGGER) != 0 &&
+        (g_enableShootWhileRunning || !locomotionRequested);
+    const bool actionAttackBlocked = !g_enableShootWhileRunning &&
+        gameplayInputActive && locomotionRequested &&
+        (buttons & (SH3VR_BUTTON_LEFT_TRIGGER |
+            SH3VR_BUTTON_RIGHT_TRIGGER)) != 0;
+    const bool actionButtonAllowed =
+        (buttons & SH3VR_BUTTON_A) != 0 && !actionAttackBlocked;
+    if ((buttons & SH3VR_BUTTON_A) != 0 && actionAttackBlocked)
+    {
+        const LONG count = InterlockedIncrement(
+            &g_shootWhileRunningActionBlockLogCount);
+        if (count == 1)
+        {
+            Log("InputBridge: blocked contextual A-button attack while "
+                "moving because ShootWhileRunning=0");
+        }
+    }
+    D3D9Hook_SetFirearmTriggerState(firearmTriggerAllowed);
     if (device == InterlockedCompareExchangePointer(
         &g_mouseDevice, nullptr, nullptr))
     {
         if (stateBytes >= sizeof(DIMOUSESTATE))
         {
             DIMOUSESTATE* mouse = static_cast<DIMOUSESTATE*>(stateData);
-            UpdateMeleeSwing(controller);
             const bool meleeSwingPulse = IsMeleeAttackPulseActive();
             const bool meleeAimPulse = IsMeleeAimPulseActive();
             InjectRightHandAim(mouse, controller);
-            if ((buttons & SH3VR_BUTTON_RIGHT_TRIGGER) != 0 ||
+            if (firearmTriggerAllowed ||
                 meleeSwingPulse)
                 mouse->rgbButtons[0] |= 0x80;
             if ((buttons & SH3VR_BUTTON_LEFT_TRIGGER) != 0 ||
@@ -1539,18 +1669,26 @@ static HRESULT InjectControllerState(void* device, DWORD stateBytes,
     static std::uint32_t previousButtons = 0;
     const std::uint32_t pressedButtons = buttons & ~previousButtons;
     if (pressedButtons != 0)
-        Log("InputBridge: Quest button press mask 0x%08X", pressedButtons);
+        Log("InputBridge: OpenXR button press mask 0x%08X", pressedButtons);
     if ((pressedButtons & SH3VR_BUTTON_RIGHT_TRIGGER) != 0)
         RunWeaponCharacterScan();
     previousButtons = buttons;
 
     const bool cameraModLoaded = IsCameraModLoaded();
-    const bool gameplayInputActive = D3D9Hook_IsGameplayInputActive();
+    D3D9Hook_SetCameraRelativeRun(gameplayInputActive &&
+        !meleeLocomotionSuspended &&
+        (buttons & (SH3VR_BUTTON_LEFT_GRIP |
+            SH3VR_BUTTON_LEFT_STICK)) != 0);
     const MenuNavigationPulse menuNavigation = GetMenuNavigationPulse(
         controller.thumbstick[0][0], controller.thumbstick[0][1],
         gameplayInputActive);
     float moveX = controller.thumbstick[0][0];
     float moveY = controller.thumbstick[0][1];
+    if (meleeLocomotionSuspended)
+    {
+        moveX = 0.0f;
+        moveY = 0.0f;
+    }
     float headYaw = 0.0f;
     if (gameplayInputActive && cameraModLoaded &&
         D3D9Hook_GetRelativeHeadYawRadians(&headYaw))
@@ -1576,6 +1714,7 @@ static HRESULT InjectControllerState(void* device, DWORD stateBytes,
             gameplayInputActive && cameraModLoaded && movingWithLeftStick
                 ? moveY : 0.0f);
     const std::uint32_t roomscaleMovement = gameplayInputActive &&
+        !meleeLocomotionSuspended &&
         !movingWithLeftStick ? D3D9Hook_GetRoomscaleMovementMask()
             : SH3VR_ROOMSCALE_NONE;
     if (cameraRelativeForward &&
@@ -1628,11 +1767,11 @@ static HRESULT InjectControllerState(void* device, DWORD stateBytes,
             controller.thumbstick[1][0] > turnThreshold));
 
     SetVirtualKey(keys, stateBytes, DIK_SPACE,
-        (buttons & SH3VR_BUTTON_A) != 0);
+        actionButtonAllowed);
     SetVirtualKey(keys, stateBytes, DIK_RETURN,
-        (buttons & SH3VR_BUTTON_A) != 0);
+        actionButtonAllowed);
     SetVirtualKey(keys, stateBytes, DIK_NUMPADENTER,
-        (buttons & SH3VR_BUTTON_A) != 0);
+        actionButtonAllowed);
     SetVirtualKey(keys, stateBytes, DIK_ESCAPE,
         (buttons & (SH3VR_BUTTON_B | SH3VR_BUTTON_MENU)) != 0);
     SetVirtualKey(keys, stateBytes, DIK_I,
@@ -1654,8 +1793,9 @@ static HRESULT InjectControllerState(void* device, DWORD stateBytes,
     SetVirtualKey(keys, stateBytes, DIK_TAB,
         rightStickPressed && !cameraModMenuChord);
     SetVirtualKey(keys, stateBytes, DIK_LSHIFT,
-        (buttons & SH3VR_BUTTON_LEFT_GRIP) != 0 ||
-        (leftStickPressed && !cameraModMenuChord));
+        !meleeLocomotionSuspended &&
+        ((buttons & SH3VR_BUTTON_LEFT_GRIP) != 0 ||
+            (leftStickPressed && !cameraModMenuChord)));
     return result;
 }
 
@@ -1797,6 +1937,9 @@ void InputBridge_OnDirectInputCreated(IUnknown* pInterface)
 
     g_rightTriggerAutoAim = ReadMotionControlSetting(
         "RightTriggerAutoAim", true);
+    g_enableShootWhileRunning = ReadMotionControlSetting(
+        "ShootWhileRunning", false);
+    InterlockedExchange(&g_shootWhileRunningActionBlockLogCount, 0);
     g_enableRightHandAim = ReadMotionControlSetting(
         "EnableRightHandAim", false);
     g_enableWeaponScanDiagnostics = ReadMotionControlSetting(
@@ -1811,6 +1954,7 @@ void InputBridge_OnDirectInputCreated(IUnknown* pInterface)
         1, 100);
     g_damageHapticsDurationSeconds = static_cast<float>(
         damageHapticsDurationMs) * 0.001f;
+    g_damageHapticsPulseUntilTick = 0;
     g_damageHapticsAmplitude = static_cast<float>(
         damageHapticsAmplitudePercent) * 0.01f;
     g_enableMeleeMotion = ReadMotionControlSetting(
@@ -1856,6 +2000,8 @@ void InputBridge_OnDirectInputCreated(IUnknown* pInterface)
         knifeSwingCooldown);
     Log("InputBridge: [MotionControls] RightTriggerAutoAim=%s",
         g_rightTriggerAutoAim ? "1" : "0");
+    Log("InputBridge: [MotionControls] ShootWhileRunning=%s (experimental)",
+        g_enableShootWhileRunning ? "1" : "0");
     Log("InputBridge: [MotionControls] EnableRightHandAim=%s; "
         "AimMouseCountsPerDegree=%d", g_enableRightHandAim ? "1" : "0",
         aimMouseCountsPerDegree);

@@ -954,15 +954,16 @@ private:
             Log("Selected OpenXR runtime does not expose XR_KHR_D3D11_enable");
             return false;
         }
-        const char* extensions[2] = { XR_KHR_D3D11_ENABLE_EXTENSION_NAME,
-            XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME };
-        std::uint32_t extensionCount = 1;
+        const char* extensions[3] = {};
+        std::uint32_t extensionCount = 0;
+        extensions[extensionCount++] = XR_KHR_D3D11_ENABLE_EXTENSION_NAME;
         m_refreshRateExtensionEnabled = g_settings.requestRefreshRate &&
             g_settings.targetRefreshRate != 0 &&
             HasInstanceExtension(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
         if (m_refreshRateExtensionEnabled)
         {
-            extensionCount++;
+            extensions[extensionCount++] =
+                XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME;
             Log("OpenXR extension %s is available; %u Hz request is enabled",
                 XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME, g_settings.targetRefreshRate);
         }
@@ -971,6 +972,16 @@ private:
         {
             Log("OpenXR extension %s is unavailable; runtime refresh rate "
                 "will not be changed", XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
+        }
+        m_hpControllerExtensionEnabled = HasInstanceExtension(
+            XR_EXT_HP_MIXED_REALITY_CONTROLLER_EXTENSION_NAME);
+        if (m_hpControllerExtensionEnabled)
+        {
+            extensions[extensionCount++] =
+                XR_EXT_HP_MIXED_REALITY_CONTROLLER_EXTENSION_NAME;
+            Log("OpenXR extension %s is available; Reverb G2 controller "
+                "profile is enabled",
+                XR_EXT_HP_MIXED_REALITY_CONTROLLER_EXTENSION_NAME);
         }
         XrInstanceCreateInfo createInfo{ XR_TYPE_INSTANCE_CREATE_INFO };
         strcpy_s(createInfo.applicationInfo.applicationName, "Silent Hill 3 VR");
@@ -1212,8 +1223,9 @@ private:
 
     bool SuggestControllerBindings(const char* profile, int layout)
     {
-        // 0: Touch, 1: Index, 2: Vive wands. All feed the same game-side
-        // controller state, including both grip and aim poses for motion combat.
+        // 0: Touch, 1: Index, 2: Vive wands, 3: Microsoft WMR,
+        // 4: HP Reverb G2. All feed the same game-side controller state,
+        // including both grip and aim poses for motion combat.
         XrPath profilePath = XR_NULL_PATH;
         if (XR_FAILED(xrStringToPath(m_instance, profile, &profilePath)))
             return false;
@@ -1255,17 +1267,33 @@ private:
             bind(m_thumbstickAction, "/user/hand/right/input/thumbstick");
             bind(m_stickClickAction, "/user/hand/left/input/thumbstick/click");
             bind(m_stickClickAction, "/user/hand/right/input/thumbstick/click");
-            bind(m_squeezeAction, "/user/hand/left/input/squeeze/value");
-            bind(m_squeezeAction, "/user/hand/right/input/squeeze/value");
-            bind(m_buttonAAction, "/user/hand/right/input/a/click");
-            bind(m_buttonBAction, "/user/hand/right/input/b/click");
-            bind(m_buttonXAction, layout == 1 ? "/user/hand/left/input/a/click" :
-                "/user/hand/left/input/x/click");
-            bind(m_buttonYAction, layout == 1 ? "/user/hand/left/input/b/click" :
-                "/user/hand/left/input/y/click");
-            // Index system buttons belong to SteamVR, not applications.
-            if (layout == 0)
+            if (layout == 3)
+            {
+                // Original WMR controllers expose a digital squeeze and one
+                // clickable trackpad on each hand. Keep those bindings valid
+                // for the profile instead of requesting nonexistent ABXY paths.
+                bind(m_squeezeAction, "/user/hand/left/input/squeeze/click");
+                bind(m_squeezeAction, "/user/hand/right/input/squeeze/click");
+                bind(m_buttonXAction, "/user/hand/left/input/trackpad/click");
+                bind(m_buttonAAction, "/user/hand/right/input/trackpad/click");
                 bind(m_menuAction, "/user/hand/left/input/menu/click");
+            }
+            else
+            {
+                bind(m_squeezeAction, "/user/hand/left/input/squeeze/value");
+                bind(m_squeezeAction, "/user/hand/right/input/squeeze/value");
+                bind(m_buttonAAction, "/user/hand/right/input/a/click");
+                bind(m_buttonBAction, "/user/hand/right/input/b/click");
+                bind(m_buttonXAction, layout == 1
+                    ? "/user/hand/left/input/a/click"
+                    : "/user/hand/left/input/x/click");
+                bind(m_buttonYAction, layout == 1
+                    ? "/user/hand/left/input/b/click"
+                    : "/user/hand/left/input/y/click");
+                // Index system buttons belong to SteamVR, not applications.
+                if (layout == 0 || layout == 4)
+                    bind(m_menuAction, "/user/hand/left/input/menu/click");
+            }
         }
         if (!valid)
             return false;
@@ -1353,6 +1381,13 @@ private:
         accepted += SuggestControllerBindings("/interaction_profiles/oculus/touch_controller", 0);
         accepted += SuggestControllerBindings("/interaction_profiles/valve/index_controller", 1);
         accepted += SuggestControllerBindings("/interaction_profiles/htc/vive_controller", 2);
+        accepted += SuggestControllerBindings(
+            "/interaction_profiles/microsoft/motion_controller", 3);
+        if (m_hpControllerExtensionEnabled)
+        {
+            accepted += SuggestControllerBindings(
+                "/interaction_profiles/hp/mixed_reality_controller", 4);
+        }
         // An unsupported optional profile must not disable working Touch input.
         if (accepted == 0)
             return false;
@@ -1390,7 +1425,8 @@ private:
         }
 
         m_controllerInputInitialized = true;
-        Log("OpenXR controller actions initialized (Touch / Index / Vive)");
+        Log("OpenXR controller actions initialized (Touch / Index / Vive / "
+            "Microsoft WMR / HP Reverb G2)");
         return true;
     }
 
@@ -1618,6 +1654,36 @@ private:
                 state.buttons |= pad.currentState.y > 0.35f ? SH3VR_BUTTON_A :
                     pad.currentState.y < -0.35f ? SH3VR_BUTTON_Y : SH3VR_BUTTON_RIGHT_STICK;
             }
+        }
+        const auto stickBucket = [](float x, float y)
+        {
+            constexpr float diagnosticDeadzone = 0.25f;
+            if (std::fabs(x) < diagnosticDeadzone &&
+                std::fabs(y) < diagnosticDeadzone)
+            {
+                return 0;
+            }
+            if (std::fabs(x) > std::fabs(y))
+                return x < 0.0f ? 1 : 2;
+            return y < 0.0f ? 3 : 4;
+        };
+        const int leftBucket = stickBucket(state.thumbstick[0][0],
+            state.thumbstick[0][1]);
+        const int rightBucket = stickBucket(state.thumbstick[1][0],
+            state.thumbstick[1][1]);
+        if ((leftBucket != m_lastStickDiagnosticBucket[0] ||
+                rightBucket != m_lastStickDiagnosticBucket[1]) &&
+            m_stickDiagnosticCount < 32)
+        {
+            ++m_stickDiagnosticCount;
+            m_lastStickDiagnosticBucket[0] = leftBucket;
+            m_lastStickDiagnosticBucket[1] = rightBucket;
+            Log("OpenXR thumbstick state %d: left x/y=%d/%d, right x/y=%d/%d",
+                m_stickDiagnosticCount,
+                static_cast<int>(std::lround(state.thumbstick[0][0] * 1000.0f)),
+                static_cast<int>(std::lround(state.thumbstick[0][1] * 1000.0f)),
+                static_cast<int>(std::lround(state.thumbstick[1][0] * 1000.0f)),
+                static_cast<int>(std::lround(state.thumbstick[1][1] * 1000.0f)));
         }
         consumer.PublishControllerState(state);
     }
@@ -3340,6 +3406,8 @@ float4 DebugPsMain(DebugVertexOutput input) : SV_Target
     XrAction m_vivePadClickAction = XR_NULL_HANDLE;
     XrAction m_vivePadTouchAction = XR_NULL_HANDLE;
     bool m_profilesDirty = true;
+    std::array<int, 2> m_lastStickDiagnosticBucket = { -1, -1 };
+    int m_stickDiagnosticCount = 0;
     std::array<XrPath, 2> m_handPaths = { XR_NULL_PATH, XR_NULL_PATH };
     std::array<XrSpace, 2> m_gripSpaces = {
         XR_NULL_HANDLE, XR_NULL_HANDLE };
@@ -3367,6 +3435,7 @@ float4 DebugPsMain(DebugVertexOutput input) : SV_Target
     bool m_exitRequested = false;
     bool m_retryAllowed = true;
     bool m_refreshRateExtensionEnabled = false;
+    bool m_hpControllerExtensionEnabled = false;
     bool m_headLocateFailureLogged = false;
     PFN_xrEnumerateDisplayRefreshRatesFB m_enumerateRefreshRates = nullptr;
     PFN_xrGetDisplayRefreshRateFB m_getRefreshRate = nullptr;

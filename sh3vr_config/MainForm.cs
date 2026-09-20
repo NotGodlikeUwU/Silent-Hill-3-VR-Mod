@@ -45,7 +45,8 @@ namespace SH3VRConfig
             mainIniPath = Path.Combine(gameDirectory, "sh3vr.ini");
             weaponsIniPath = Path.Combine(gameDirectory, "sh3vr_weapons.ini");
             Text = "Silent Hill 3 VR Configuration Tool";
-            Icon = SystemIcons.Application;
+            Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath) ??
+                SystemIcons.Application;
             StartPosition = FormStartPosition.CenterScreen;
             MinimumSize = new Size(920, 680);
             ClientSize = new Size(990, 760);
@@ -155,6 +156,15 @@ namespace SH3VRConfig
                 30, 360, 5, 0, "Smooth-turn speed",
                 "Maximum smooth-turn speed in degrees per second. This value is ignored in Snap mode.");
 
+            var player = NewGroup("Player", 82);
+            panel.Controls.Add(player);
+            var playerGrid = NewGrid(1);
+            player.Controls.Add(playerGrid);
+            AddNumber(playerGrid, 0, "Player height (cm)", IniTarget.Main,
+                "Roomscale", "PlayerHeightCm", "165", 120, 220, 1, 0,
+                "Player height",
+                "Your real standing height in centimetres. The default is 165 cm because that is Heather's canonical height.");
+
             var damage = NewGroup("Damage Vibration", 160);
             panel.Controls.Add(damage);
             var damageGrid = NewGrid(3);
@@ -212,6 +222,14 @@ namespace SH3VRConfig
                 "PC Fix D3D12 backend", "Automatically enables the faster PC Fix D3D12 path when the compatible D3D9On12 component is available.");
             AddBoolean(grid, 1, "Multicore rendering transfers", IniTarget.Main, "Performance", "MulticoreRendering", "1",
                 "Multicore rendering", "Uses two CPU cores for compatible stereo memory transfers. Graphics API calls remain on the render thread.");
+
+            var experimental = NewGroup("Experimental", 82);
+            panel.Controls.Add(experimental);
+            var experimentalGrid = NewGrid(1);
+            experimental.Controls.Add(experimentalGrid);
+            AddBoolean(experimentalGrid, 0, "Allow shooting while running", IniTarget.Main,
+                "MotionControls", "ShootWhileRunning", "0", "Shooting while running",
+                "Experimental. Allows firearm attacks while Heather is walking or running.");
 
             var debug = NewGroup("Debug", 82);
             panel.Controls.Add(debug);
@@ -284,7 +302,7 @@ namespace SH3VRConfig
             var version = new Label {
                 AutoSize = true, Font = new Font("Segoe UI", 10F),
                 Margin = new Padding(0, 0, 0, 18),
-                Text = "Version: Pre-Release 1.0\r\nRelease date: 09.11.2026"
+                Text = "Version: Pre-Release 1.0.1\r\nRelease date: 09.13.2026"
             };
             content.Controls.Add(version);
 

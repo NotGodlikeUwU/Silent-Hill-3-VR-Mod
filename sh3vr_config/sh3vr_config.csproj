@@ -7,6 +7,7 @@
     <OutputType>WinExe</OutputType>
     <RootNamespace>SH3VRConfig</RootNamespace>
     <AssemblyName>SH3VRConfig</AssemblyName>
+    <ApplicationIcon>Assets\SH3VRConfig.ico</ApplicationIcon>
     <TargetFrameworkVersion>v4.8</TargetFrameworkVersion>
     <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
     <Deterministic>true</Deterministic>
@@ -30,6 +31,7 @@
   </ItemGroup>
   <ItemGroup>
     <EmbeddedResource Include="Assets\SH3VR_LOGO_BLACK.png" />
+    <Content Include="Assets\SH3VRConfig.ico" />
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
 </Project>

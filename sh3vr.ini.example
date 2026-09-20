@@ -78,9 +78,9 @@ Enable=1
 PlayerHeightCm=165
 
 [Input]
-; Experimental shader-based head-tracked flashlight. Disabled because the
-; visible flashlight follows Heather rather than the tested shader constants.
-HeadTrackedFlashlight=0
+; Experimental head-tracked flashlight. Keep disabled: changing Heather's
+; heading from the render hook is unsafe while a save enters gameplay.
+HeadTrackedFlashlight=1
 ; Apply horizontal turns to Camera Mod's own yaw while OTSMod.dll is loaded.
 ; This keeps stereo rendering and character-relative movement aligned.
 EnableCameraModRightStick=1
@@ -99,6 +99,9 @@ CameraModSmoothTurnDeadzone=20
 CameraRelativeStrafe=1
 
 [MotionControls]
+; Experimental: allow firearm attacks while the movement stick is active.
+; Effects and recoil still require a confirmed native SH3 firearm attack.
+ShootWhileRunning=0
 ; Hold the game's aim state automatically while the right trigger fires.
 ; The left trigger remains available as a separate manual aim control.
 RightTriggerAutoAim=1
